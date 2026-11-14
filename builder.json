@@ -1,0 +1,18 @@
+{
+  "project": "discord sp",
+  "platform": "ios",
+  "github": {
+    "owner": "Thangprot",
+    "repo": "spam-discord-app"
+  },
+  "provider": "github",
+  "codemagic": {},
+  "bitrise": {},
+  "ios": {},
+  "flutter": {
+    "watch": {}
+  },
+  "reactNative": {},
+  "kmp": {},
+  "mobai": {}
+}
