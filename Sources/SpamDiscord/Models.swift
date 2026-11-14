@@ -16,4 +16,11 @@ struct Channel: Codable, Identifiable, Hashable {
 }
 
 struct ParsedMessage: Identifiable, Hashable { let id = UUID(); let body: String }
-struct LogEntry: Identifiable { let id = UUID(); let text: String; let isSuccess: Bool }
+
+struct LogEntry: Identifiable { 
+    let id = UUID()
+    let text: String
+    let isSuccess: Bool
+    var isSendingState: Bool = false
+    let time = Date()
+}

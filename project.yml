@@ -7,7 +7,6 @@ settings:
   base:
     PRODUCT_BUNDLE_IDENTIFIER: com.tenban.spamdiscord
     SWIFT_VERSION: "5.0"
-    ENABLE_PREVIEWS: NO
 targets:
   SpamDiscord:
     type: application

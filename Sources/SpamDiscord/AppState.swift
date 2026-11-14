@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @MainActor
 class AppState: ObservableObject {
@@ -10,7 +11,10 @@ class AppState: ObservableObject {
     @Published var loginError: String?
     
     @Published var delaySeconds: Double = 2.0
+    @Published var useTag: Bool = true 
     @Published var targetUserId = ""
+    @Published var inputText = "" 
+    
     @Published var messages: [ParsedMessage] = []
     @Published var isSending = false
     @Published var currentIndex = 0
@@ -55,33 +59,65 @@ class AppState: ObservableObject {
         let acc = url.startAccessingSecurityScopedResource()
         defer { if acc { url.stopAccessingSecurityScopedResource() } }
         if let content = try? String(contentsOf: url, encoding: .utf8) {
-            messages = content.components(separatedBy: .newlines).compactMap {
-                let t = $0.trimmingCharacters(in: .whitespaces)
-                guard t.hasPrefix(">") && t.hasSuffix("#") else { return nil }
-                let body = String(t.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-                return body.isEmpty ? nil : ParsedMessage(body: body)
-            }
+            self.inputText = content 
+            parseDirectInput()
+        }
+    }
+    
+    func parseDirectInput() {
+        messages = inputText.components(separatedBy: .newlines).compactMap {
+            var t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            if t.hasPrefix(">") { t = String(t.dropFirst()).trimmingCharacters(in: .whitespaces) }
+            if t.hasSuffix("#") { t = String(t.dropLast()).trimmingCharacters(in: .whitespaces) }
+            return t.isEmpty ? nil : ParsedMessage(body: t)
         }
     }
     
     func startSending(channel: Channel) {
-        guard let client = client, !messages.isEmpty, !targetUserId.isEmpty else { return }
+        guard let client = client, !messages.isEmpty else { return }
+        if useTag && targetUserId.isEmpty { return }
+        
         isSending = true; isCancelled = false; currentIndex = 0; logs.removeAll()
+        
+        let mentionText = useTag ? " <@\(targetUserId)>" : ""
         
         Task {
             for (i, msg) in messages.enumerated() {
                 if isCancelled { break }
+                
+                logs.append(LogEntry(text: "Đang gửi: \(msg.body.prefix(20))...", isSuccess: true, isSendingState: true))
+                
                 do {
-                    try await client.sendMessage(channelId: channel.id, content: "\(msg.body) <@\(targetUserId)>")
-                    logs.append(LogEntry(text: "✅ [\(i+1)/\(messages.count)] Đã gửi", isSuccess: true))
-                } catch { logs.append(LogEntry(text: "❌ [\(i+1)] \(error.localizedDescription)", isSuccess: false)) }
+                    try await client.sendMessage(channelId: channel.id, content: "\(msg.body)\(mentionText)")
+                    // Xóa log tạm và thêm log thành công
+                    logs.removeLast() 
+                    logs.append(LogEntry(text: "Đã gửi: \(msg.body.prefix(20))...", isSuccess: true))
+                } catch { 
+                    logs.removeLast()
+                    logs.append(LogEntry(text: "Lỗi: \(error.localizedDescription)", isSuccess: false)) 
+                }
+                
                 currentIndex = i + 1
-                try? await Task.sleep(nanoseconds: UInt64(max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds) * 1_000_000_000))
+                
+                if i < messages.count - 1 {
+                    try? await Task.sleep(nanoseconds: UInt64(max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds) * 1_000_000_000))
+                }
             }
             isSending = false
         }
     }
     
-    func stopSending() { isCancelled = true }
-    func logout() { KeychainHelper.delete(key: "token"); token = ""; me = nil; guilds = []; channels = [] }
+    func stopSending() { 
+        isCancelled = true 
+        isSending = false
+    }
+    
+    func logout() { 
+        KeychainHelper.delete(key: "token")
+        token = ""; me = nil; guilds = []; channels = [] 
+    }
+    
+    func hideKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
 }
