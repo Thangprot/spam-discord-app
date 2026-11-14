@@ -215,6 +215,7 @@ class AppState: ObservableObject {
             let user = try await tempClient.validateToken()
             let newToken = TokenInfo(token: cleanToken, userId: user.id, username: user.globalName ?? user.username, avatarHash: user.avatar, isValid: true)
             tokens.append(newToken)
+            if activeToken == nil { setActiveToken(newToken) }
         } catch {
             let deadToken = TokenInfo(token: cleanToken, userId: "0", username: "Token Chết", avatarHash: nil, isValid: false)
             tokens.append(deadToken)
@@ -368,6 +369,32 @@ struct MainTabView: View {
 }
 
 // ==========================================
+// MARK: - EMPTY STATE VIEW (Thay thế cho ContentUnavailableView)
+// ==========================================
+struct EmptyStateView: View {
+    let title: String
+    let systemImage: String
+    let description: String
+    
+    var body: some View {
+        VStack(spacing: 15) {
+            Image(systemName: systemImage)
+                .font(.system(size: 50))
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(.title2).bold()
+            Text(description)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(UIColor.systemGroupedBackground))
+    }
+}
+
+// ==========================================
 // MARK: - TOKEN VIEWS
 // ==========================================
 struct TokenListView: View {
@@ -377,50 +404,52 @@ struct TokenListView: View {
     
     var body: some View {
         NavigationStack {
-            List {
+            Group {
                 if app.tokens.isEmpty {
-                    ContentUnavailableView("Chưa có Token", systemImage: "key.slash", description: Text("Vui lòng thêm token để sử dụng app."))
+                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash", description: "Vui lòng thêm token để sử dụng app.")
                 } else {
-                    Section(header: Text("Danh sách tài khoản")) {
-                        ForEach(app.tokens) { token in
-                            Button {
-                                app.setActiveToken(token)
-                            } label: {
-                                HStack(spacing: 12) {
-                                    if let url = token.avatarURL {
-                                        AsyncImage(url: url) { img in
-                                            img.resizable().scaledToFill()
-                                        } placeholder: {
-                                            Circle().fill(Color.gray.opacity(0.3))
+                    List {
+                        Section(header: Text("Danh sách tài khoản")) {
+                            ForEach(app.tokens) { token in
+                                Button {
+                                    app.setActiveToken(token)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        if let url = token.avatarURL {
+                                            AsyncImage(url: url) { img in
+                                                img.resizable().scaledToFill()
+                                            } placeholder: {
+                                                Circle().fill(Color.gray.opacity(0.3))
+                                            }
+                                            .frame(width: 45, height: 45)
+                                            .clipShape(Circle())
+                                        } else {
+                                            Image(systemName: "person.circle.fill")
+                                                .resizable().frame(width: 45, height: 45).foregroundStyle(.gray)
                                         }
-                                        .frame(width: 45, height: 45)
-                                        .clipShape(Circle())
-                                    } else {
-                                        Image(systemName: "person.circle.fill")
-                                            .resizable().frame(width: 45, height: 45).foregroundStyle(.gray)
+                                        
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(token.username).font(.headline)
+                                            Text(token.isValid ? "Live" : "Die")
+                                                .font(.caption).bold()
+                                                .foregroundStyle(token.isValid ? .green : .red)
+                                        }
+                                        
+                                        Spacer()
+                                        
+                                        if app.activeToken?.id == token.id {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundStyle(.indigo)
+                                                .font(.title3)
+                                        }
                                     }
-                                    
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(token.username).font(.headline)
-                                        Text(token.isValid ? "Live" : "Die")
-                                            .font(.caption).bold()
-                                            .foregroundStyle(token.isValid ? .green : .red)
-                                    }
-                                    
-                                    Spacer()
-                                    
-                                    if app.activeToken?.id == token.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.indigo)
-                                            .font(.title3)
-                                    }
+                                    .padding(.vertical, 4)
                                 }
-                                .padding(.vertical, 4)
+                                .buttonStyle(.plain)
+                                .disabled(!token.isValid)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(!token.isValid)
+                            .onDelete(perform: app.deleteToken)
                         }
-                        .onDelete(perform: app.deleteToken)
                     }
                 }
             }
@@ -498,7 +527,7 @@ struct SpamView: View {
         NavigationStack {
             Group {
                 if app.activeToken == nil {
-                    ContentUnavailableView("Chưa chọn Token", systemImage: "exclamationmark.triangle", description: Text("Vào tab Tokens để thêm và chọn tài khoản."))
+                    EmptyStateView(title: "Chưa chọn Token", systemImage: "exclamationmark.triangle", description: "Vào tab Tokens để thêm và chọn tài khoản.")
                 } else if app.isLoading {
                     ProgressView("Đang tải Server...")
                 } else {
