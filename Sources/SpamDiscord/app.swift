@@ -227,7 +227,13 @@ class AppState: ObservableObject {
         guard url.startAccessingSecurityScopedResource() else { return }
         defer { url.stopAccessingSecurityScopedResource() }
         
-        if let content = try? String(contentsOf: url, encoding: .utf8) {
+        var content = ""
+        // Thử đọc với UTF-8, nếu lỗi thử với các bảng mã khác (dành cho file từ Windows)
+        if let c = try? String(contentsOf: url, encoding: .utf8) { content = c }
+        else if let c = try? String(contentsOf: url, encoding: .utf16) { content = c }
+        else if let c = try? String(contentsOf: url, encoding: .isoLatin1) { content = c }
+        
+        if !content.isEmpty {
             let lines = content.components(separatedBy: .newlines)
             for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 await addToken(line)
@@ -282,10 +288,20 @@ class AppState: ObservableObject {
     func parseFile(url: URL) {
         guard url.startAccessingSecurityScopedResource() else { return }
         defer { url.stopAccessingSecurityScopedResource() }
-        if let content = try? String(contentsOf: url, encoding: .utf8) {
-            self.inputText = content
-            parseDirectInput()
+        
+        var content = ""
+        // FIX LỖI ĐỌC FILE: Thử nhiều bảng mã
+        if let c = try? String(contentsOf: url, encoding: .utf8) { content = c }
+        else if let c = try? String(contentsOf: url, encoding: .utf16) { content = c }
+        else if let c = try? String(contentsOf: url, encoding: .isoLatin1) { content = c }
+        
+        if content.isEmpty {
+            lastError = "Không thể đọc file. Vui lòng kiểm tra lại định dạng."
+            return
         }
+        
+        self.inputText = content
+        parseDirectInput()
     }
     
     func parseDirectInput() {
@@ -465,7 +481,7 @@ struct TokenListView: View {
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            .fileImporter(isPresented: $showImport, allowedContentTypes: [.plainText, .text], allowsMultipleSelection: false) { res in
+            .fileImporter(isPresented: $showImport, allowedContentTypes: [.plainText, .text, .item], allowsMultipleSelection: false) { res in
                 if case .success(let urls) = res, let url = urls.first {
                     Task { await app.addTokensFromFile(url: url) }
                 }
@@ -595,66 +611,149 @@ struct ChannelListView: View {
     }
 }
 
+// ==========================================
+// MARK: - NEW SEND VIEW (GIAO DIỆN ĐÃ ĐƯỢC LÀM LẠI)
+// ==========================================
 struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
     @State private var showImport = false
     
     var body: some View {
-        Form {
-            Section(header: Text("Cấu hình")) {
-                Toggle("Tag User ID", isOn: $app.useTag)
-                if app.useTag { TextField("Nhập User ID", text: $app.targetUserId).keyboardType(.numberPad) }
-                
-                Toggle("Thêm '>' ở đầu", isOn: $app.addPrefix)
-                Toggle("Thêm '#' ở đầu (sau >)", isOn: $app.addSuffix)
-                
-                VStack(alignment: .leading) {
-                    Text("Delay: \(String(format: "%.1f", app.delaySeconds)) giây").font(.subheadline)
-                    Slider(value: $app.delaySeconds, in: 0.1...5.0, step: 0.1)
+        ScrollView {
+            VStack(spacing: 20) {
+                // 1. Thông tin kênh
+                HStack {
+                    Image(systemName: "number.circle.fill")
+                        .font(.title)
+                        .foregroundStyle(.indigo)
+                    Text(channel.displayName)
+                        .font(.title2.bold())
+                    Spacer()
                 }
-            }
-            
-            Section(header: Text("Nội dung tin nhắn")) {
-                ZStack(alignment: .topTrailing) {
-                    TextEditor(text: $app.inputText)
-                        .frame(minHeight: 120)
-                        .onChange(of: app.inputText) { _ in app.parseDirectInput() }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
+                
+                // 2. Cấu hình gửi
+                VStack(alignment: .leading, spacing: 15) {
+                    Text("CẤU HÌNH").font(.caption).bold().foregroundStyle(.secondary)
                     
-                    if !app.inputText.isEmpty {
-                        Button(action: { app.inputText = ""; app.parseDirectInput() }) {
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.gray).padding(8)
+                    Toggle("Tag User ID", isOn: $app.useTag)
+                        .tint(.indigo)
+                    if app.useTag {
+                        TextField("Nhập User ID (dãy số)", text: $app.targetUserId)
+                            .keyboardType(.numberPad)
+                            .padding(10)
+                            .background(Color(UIColor.tertiarySystemBackground))
+                            .cornerRadius(8)
+                    }
+                    
+                    Divider()
+                    
+                    HStack {
+                        Toggle("Thêm '>'", isOn: $app.addPrefix).tint(.indigo)
+                        Toggle("Thêm '#'", isOn: $app.addSuffix).tint(.indigo)
+                    }
+                    
+                    Divider()
+                    
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Delay:")
+                            Spacer()
+                            Text("\(String(format: "%.1f", app.delaySeconds)) giây")
+                                .bold()
+                                .foregroundStyle(app.delaySeconds < 1.0 ? .red : .indigo)
+                        }
+                        Slider(value: $app.delaySeconds, in: 0.1...5.0, step: 0.1).tint(.indigo)
+                    }
+                }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
+                
+                // 3. Nội dung tin nhắn
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
+                        Spacer()
+                        Button(action: { showImport = true }) {
+                            Label("Import File", systemImage: "doc.badge.plus")
+                                .font(.caption).bold()
                         }
                     }
+                    
+                    ZStack(alignment: .topTrailing) {
+                        TextEditor(text: $app.inputText)
+                            .frame(minHeight: 150)
+                            .padding(8)
+                            .background(Color(UIColor.tertiarySystemBackground))
+                            .cornerRadius(10)
+                            .onChange(of: app.inputText) { _ in app.parseDirectInput() }
+                        
+                        if !app.inputText.isEmpty {
+                            Button(action: { app.inputText = ""; app.parseDirectInput() }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.gray)
+                                    .padding(12)
+                            }
+                        }
+                    }
+                    
+                    if !app.messages.isEmpty {
+                        Text("Đã nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
+                    }
                 }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
                 
-                Button("Import từ file .txt") { showImport = true }
-                
-                if !app.messages.isEmpty {
-                    Text("Đã nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
-                }
-            }
-            
-            Section {
+                // 4. Trạng thái và Nút bấm
                 if app.isSending {
-                    VStack(spacing: 12) {
-                        ProgressView().scaleEffect(1.5).padding(.top)
+                    VStack(spacing: 15) {
+                        ProgressView().scaleEffect(1.5).tint(.indigo).padding(.top)
                         Text("Đang gửi vô hạn...").font(.headline)
                         Text("Tổng đã gửi: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
-                        Text(app.currentMessageStr).font(.caption).foregroundStyle(.gray).lineLimit(1)
                         
-                        Button("DỪNG LẠI") { app.stopSending() }
-                            .buttonStyle(.borderedProminent).tint(.red).frame(maxWidth: .infinity)
+                        // Hiển thị tin nhắn đang gửi
+                        Text(app.currentMessageStr)
+                            .font(.caption)
+                            .foregroundStyle(.gray)
+                            .lineLimit(2)
+                            .padding(.horizontal)
+                            .multilineTextAlignment(.center)
+                        
+                        if let error = app.lastError {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
+                        
+                        Button(action: { app.stopSending() }) {
+                            Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
+                        }
+                        .background(Color.red)
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
                     }
-                    .padding(.vertical)
+                    .padding()
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(15)
                 } else {
-                    Button("BẮT ĐẦU GỬI") { app.startSending(channel: channel) }
-                        .buttonStyle(.borderedProminent).controlSize(.large).frame(maxWidth: .infinity)
-                        .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty))
+                    Button(action: { app.startSending(channel: channel) }) {
+                        Text("BẮT ĐẦU GỬI").bold().frame(maxWidth: .infinity).padding()
+                    }
+                    .background(Color.indigo)
+                    .foregroundStyle(.white)
+                    .cornerRadius(12)
+                    .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty))
+                    .opacity((app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty)) ? 0.5 : 1.0)
                 }
             }
+            .padding()
         }
+        .background(Color(UIColor.systemGroupedBackground))
         .navigationTitle("Gửi tin nhắn")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
         .fileImporter(isPresented: $showImport, allowedContentTypes: [.plainText, .text, .item], allowsMultipleSelection: false) { res in
             if case .success(let urls) = res, let url = urls.first { app.parseFile(url: url) }
