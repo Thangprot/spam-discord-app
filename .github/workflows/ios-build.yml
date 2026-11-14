@@ -7,23 +7,32 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15 # Sử dụng runner macOS với Xcode 15+
+    runs-on: macos-15 # Sử dụng runner macOS 15 mới nhất
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
     - name: Select Xcode version
-      run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+      run: |
+        # Tự động tìm Xcode 16 mới nhất trên máy ảo
+        XCODE_PATH=$(ls -d /Applications/Xcode_16*.app | head -n 1)/Contents/Developer
+        if [ -d "$XCODE_PATH" ]; then
+          echo "Selecting Xcode: $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+        else
+          echo "Xcode 16 not found, using default Xcode version"
+        fi
+        xcodebuild -version
 
     - name: Generate Xcode Project from Swift Package
       run: |
-        # Tạo một dự án Xcode tạm thời từ Package.swift
+        # Tạo dự án Xcode từ Package.swift
         swift package generate-xcodeproj
 
     - name: Build App (Unsigned)
       run: |
-        # Build ứng dụng với các cờ vô hiệu hóa ký code
+        # Build app và vô hiệu hóa ký code
         xcodebuild -project SpamDiscord.xcodeproj \
           -scheme SpamDiscord \
           -configuration Release \
@@ -37,7 +46,7 @@ jobs:
 
     - name: Package into IPA
       run: |
-        # Đóng gói file .app thành .ipa
+        # Đóng gói .app thành .ipa
         mkdir -p "$RUNNER_TEMP/Payload"
         cp -R "$RUNNER_TEMP/build/Build/Products/Release-iphoneos/SpamDiscord.app" "$RUNNER_TEMP/Payload/"
         cd "$RUNNER_TEMP" && zip -qry SpamDiscord-unsigned.ipa Payload
