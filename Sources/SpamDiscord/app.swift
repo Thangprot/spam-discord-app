@@ -6,28 +6,6 @@ import UniformTypeIdentifiers
 import UIKit
 
 // ==========================================
-// MARK: - COMPAT MODIFIER (iOS 16 ↔ 17+)
-// ==========================================
-struct OnChangeCompat<V: Equatable>: ViewModifier {
-    let value: V
-    let action: () -> Void
-
-    func body(content: Content) -> some View {
-        if #available(iOS 17.0, *) {
-            content.onChange(of: value) { _, _ in action() }
-        } else {
-            content.onChange(of: value) { _ in action() }
-        }
-    }
-}
-
-extension View {
-    func onChangeCompat<V: Equatable>(of value: V, perform action: @escaping () -> Void) -> some View {
-        modifier(OnChangeCompat(value: value, action: action))
-    }
-}
-
-// ==========================================
 // MARK: - MODELS
 // ==========================================
 struct DiscordUser: Codable {
@@ -204,6 +182,13 @@ class AppState: ObservableObject {
     @Published var currentMessageStr = ""
     @Published var lastError: String?
 
+    // ===== SHARE FILE STATE =====
+    @Published var pendingSharedFileURL: URL? = nil
+    @Published var showShareChoice: Bool = false
+    @Published var sharedFileError: String? = nil
+    /// 0 = Spam tab, 1 = Tokens tab — dùng để tự chuyển tab sau khi xử lý file
+    @Published var requestedTab: Int? = nil
+
     private var client: DiscordClient? { activeToken != nil ? DiscordClient(token: activeToken!.token) : nil }
     private var isCancelled = false
 
@@ -245,119 +230,47 @@ class AppState: ObservableObject {
         isCheckingToken = false
     }
 
-    // ==========================================
-    // FILE HELPERS — DÙNG CHUNG
-    // ==========================================
-
-    /// Giải mã Data với nhiều bảng mã. Xoá BOM. Trả về nil nếu rỗng/không decode được.
-    nonisolated static func decodeFileData(_ data: Data) -> String? {
-        let encodings: [String.Encoding] = [
-            .utf8,
-            .utf16,
-            .utf16LittleEndian,
-            .utf16BigEndian,
-            .windowsCP1252,
-            .isoLatin1,
-            .ascii,
-            .nonLossyASCII
-        ]
-        for enc in encodings {
-            if let s = String(data: data, encoding: enc), !s.isEmpty {
-                return s.replacingOccurrences(of: "\u{FEFF}", with: "")
-            }
-        }
-        let fallback = String(decoding: data, as: UTF8.self)
-        return fallback.isEmpty ? nil : fallback.replacingOccurrences(of: "\u{FEFF}", with: "")
-    }
-
-    /// Đọc file ĐỒNG BỘ. PHẢI gọi bên trong callback của `fileImporter`
-    /// để giữ security-scoped resource còn hiệu lực.
-    nonisolated static func readFileData(from url: URL) -> Data? {
+    // Đọc token từ file (dùng chung cho chia sẻ file)
+    func addTokensFromFile(url: URL) async {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
 
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
 
         var fileData: Data?
-
-        // Cách 1: NSFileCoordinator (iCloud / FileProvider)
         let coordinator = NSFileCoordinator()
         var coordErr: NSError?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
             fileData = try? Data(contentsOf: newURL)
         }
+        if fileData == nil { fileData = try? Data(contentsOf: url) }
 
-        // Cách 2: đọc trực tiếp (fallback)
-        if fileData == nil {
-            fileData = try? Data(contentsOf: url)
+        guard let data = fileData else {
+            lastError = "Không thể đọc file token."
+            return
         }
 
-        return fileData
-    }
+        let encodings: [String.Encoding] = [
+            .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
+            .windowsCP1252, .isoLatin1, .ascii
+        ]
+        var content: String?
+        for enc in encodings {
+            if let s = String(data: data, encoding: enc), !s.isEmpty { content = s; break }
+        }
+        if content == nil { content = String(decoding: data, as: UTF8.self) }
 
-    // ==========================================
-    // NHẬP TOKEN TỪ DATA
-    // ==========================================
-    func addTokensFromData(_ data: Data) async {
-        guard let text = Self.decodeFileData(data), !text.isEmpty else {
+        guard let text = content, !text.isEmpty else {
             lastError = "File token rỗng hoặc sai định dạng."
             return
         }
-        let lines = text.components(separatedBy: .newlines)
-        var added = 0
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            await addToken(trimmed)
-            added += 1
-        }
-        if added == 0 {
-            lastError = "Không tìm thấy token nào trong file."
-        } else {
-            lastError = nil
-        }
-    }
 
-    /// API cũ — tự đọc file rồi xử lý
-    func addTokensFromFile(url: URL) async {
-        guard let data = Self.readFileData(from: url) else {
-            lastError = "Không thể đọc file token. Kiểm tra file đã tải về máy chưa."
-            return
+        let cleaned = text.replacingOccurrences(of: "\u{FEFF}", with: "")
+        let lines = cleaned.components(separatedBy: .newlines)
+        for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            await addToken(line)
         }
-        await addTokensFromData(data)
-    }
-
-    // ==========================================
-    // NHẬP VĂN BẢN TỪ DATA
-    // ==========================================
-    func loadTextFromData(_ data: Data) {
-        guard let text = Self.decodeFileData(data), !text.isEmpty else {
-            lastError = "File văn bản rỗng hoặc sai định dạng."
-            return
-        }
-        inputText = text
-        parseDirectInput()
-        if messages.isEmpty {
-            lastError = "File không có dòng nội dung hợp lệ."
-        } else {
-            lastError = nil
-        }
-    }
-
-    /// API cũ — đọc file đồng bộ rồi load
-    func parseFile(url: URL) {
-        guard let data = Self.readFileData(from: url) else {
-            lastError = "Không thể đọc file. Kiểm tra file đã tải về máy chưa."
-            return
-        }
-        loadTextFromData(data)
-    }
-
-    func parseDirectInput() {
-        messages = inputText.components(separatedBy: .newlines).compactMap {
-            let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : ParsedMessage(body: t)
-        }
+        lastError = nil
     }
 
     func setActiveToken(_ token: TokenInfo) {
@@ -404,6 +317,63 @@ class AppState: ObservableObject {
         return secs
     }
 
+    func parseFile(url: URL) {
+        let gotAccess = url.startAccessingSecurityScopedResource()
+        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
+
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+
+        var fileData: Data?
+        var readErr: String?
+
+        let coordinator = NSFileCoordinator()
+        var coordErr: NSError?
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
+            do { fileData = try Data(contentsOf: newURL) }
+            catch { readErr = error.localizedDescription }
+        }
+
+        if fileData == nil {
+            do { fileData = try Data(contentsOf: url) }
+            catch { readErr = error.localizedDescription }
+        }
+
+        guard let data = fileData else {
+            self.lastError = "Không thể đọc file: \(readErr ?? coordErr?.localizedDescription ?? "Lỗi không xác định")"
+            return
+        }
+
+        let encodings: [String.Encoding] = [
+            .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
+            .windowsCP1252, .isoLatin1, .ascii, .nonLossyASCII
+        ]
+
+        var content: String?
+        for enc in encodings {
+            if let s = String(data: data, encoding: enc), !s.isEmpty { content = s; break }
+        }
+        if content == nil || content!.isEmpty {
+            content = String(decoding: data, as: UTF8.self)
+        }
+
+        guard let finalContent = content, !finalContent.isEmpty else {
+            self.lastError = "File rỗng hoặc không đúng định dạng."
+            return
+        }
+
+        let cleaned = finalContent.replacingOccurrences(of: "\u{FEFF}", with: "")
+        self.inputText = cleaned
+        self.parseDirectInput()
+        self.lastError = nil
+    }
+
+    func parseDirectInput() {
+        messages = inputText.components(separatedBy: .newlines).compactMap {
+            let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : ParsedMessage(body: t)
+        }
+    }
+
     func startSending(channel: Channel) {
         guard let client = client, !messages.isEmpty else { return }
         if useTag && targetUserId.isEmpty { return }
@@ -448,6 +418,40 @@ class AppState: ObservableObject {
     func hideKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
+
+    // ==========================================
+    // MARK: - SHARE FILE HANDLERS
+    // ==========================================
+    /// Được gọi từ onOpenURL khi người dùng share file từ Files / app khác.
+    func handleIncomingFile(url: URL) {
+        guard url.isFileURL else { return }
+        pendingSharedFileURL = url
+        showShareChoice = true
+    }
+
+    /// Người dùng chọn "Đăng nhập" → thêm file như danh sách token.
+    func processSharedFileAsToken(url: URL) async {
+        await addTokensFromFile(url: url)
+        if let err = lastError {
+            sharedFileError = err
+        } else {
+            requestedTab = 1   // chuyển sang tab Tokens
+        }
+    }
+
+    /// Người dùng chọn "Thêm vào nội dung Spam" → nạp file vào TextEditor.
+    func processSharedFileAsContent(url: URL) {
+        parseFile(url: url)
+        if let err = lastError {
+            sharedFileError = err
+        } else {
+            requestedTab = 0   // chuyển sang tab Spam
+        }
+    }
+
+    func cancelSharedFile() {
+        pendingSharedFileURL = nil
+    }
 }
 
 // ==========================================
@@ -458,21 +462,75 @@ struct SpamDiscordApp: App {
     @StateObject private var app = AppState()
     var body: some Scene {
         WindowGroup {
-            MainTabView().environmentObject(app)
+            MainTabView()
+                .environmentObject(app)
+                // Nhận file khi người dùng share/copy-to-app từ Files hoặc app khác
+                .onOpenURL { url in
+                    Task { @MainActor in
+                        app.handleIncomingFile(url: url)
+                    }
+                }
         }
     }
 }
 
 struct MainTabView: View {
+    @EnvironmentObject var app: AppState
+    @State private var selectedTab = 0
+
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             SpamView()
                 .tabItem { Label("Spam", systemImage: "paperplane.fill") }
+                .tag(0)
 
             TokenListView()
                 .tabItem { Label("Tokens", systemImage: "person.2.fill") }
+                .tag(1)
         }
         .tint(.indigo)
+        // Hỏi người dùng muốn xử lý file được chia sẻ như thế nào
+        .confirmationDialog(
+            "File được chia sẻ",
+            isPresented: $app.showShareChoice,
+            titleVisibility: .visible
+        ) {
+            Button("Đăng nhập (thêm Token)") {
+                let url = app.pendingSharedFileURL
+                app.cancelSharedFile()
+                if let url = url {
+                    Task { await app.processSharedFileAsToken(url: url) }
+                }
+            }
+            Button("Thêm vào nội dung Spam") {
+                let url = app.pendingSharedFileURL
+                app.cancelSharedFile()
+                if let url = url {
+                    app.processSharedFileAsContent(url: url)
+                }
+            }
+            Button("Huỷ", role: .cancel) {
+                app.cancelSharedFile()
+            }
+        } message: {
+            Text("Bạn muốn xử lý file này như thế nào?")
+        }
+        // Tự động chuyển tab sau khi xử lý file
+        .onChange(of: app.requestedTab) { tab in
+            if let tab = tab {
+                selectedTab = tab
+                app.requestedTab = nil
+            }
+        }
+        // Báo lỗi nếu đọc file thất bại
+        .alert("Lỗi xử lý file", isPresented: Binding(
+            get: { app.sharedFileError != nil },
+            set: { if !$0 { app.sharedFileError = nil } }
+        )) {
+            Button("OK", role: .cancel) { app.sharedFileError = nil }
+        } message: {
+            Text(app.sharedFileError ?? "")
+        }
     }
 }
 
@@ -508,14 +566,16 @@ struct EmptyStateView: View {
 struct TokenListView: View {
     @EnvironmentObject var app: AppState
     @State private var showAddSheet = false
-    @State private var showImport = false
-    @State private var showErrorAlert = false
 
     var body: some View {
         NavigationStack {
             Group {
                 if app.tokens.isEmpty {
-                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash", description: "Vui lòng thêm token để sử dụng app.")
+                    EmptyStateView(
+                        title: "Chưa có Token",
+                        systemImage: "key.slash",
+                        description: "Thêm token bằng tay, hoặc chia sẻ file .txt từ Files / app khác tới app này để nhập hàng loạt."
+                    )
                 } else {
                     List {
                         Section(header: Text("Danh sách tài khoản")) {
@@ -559,47 +619,29 @@ struct TokenListView: View {
                             }
                             .onDelete(perform: app.deleteToken)
                         }
+
+                        Section {
+                            Label(
+                                "Mẹo: Chia sẻ file .txt từ Files → Copy to \"\(Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String ?? "App")\" để nhập token hàng loạt.",
+                                systemImage: "square.and.arrow.down.on.square"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
             .navigationTitle("Quản lý Token")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button("Thêm bằng tay", systemImage: "keyboard") { showAddSheet = true }
-                        Button("Nhập từ File .txt", systemImage: "doc.text") { showImport = true }
+                    Button {
+                        showAddSheet = true
                     } label: {
                         Image(systemName: "plus.circle.fill").font(.title3)
                     }
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            .fileImporter(
-                isPresented: $showImport,
-                allowedContentTypes: [.item, .content, .data, .text, .plainText],
-                allowsMultipleSelection: false
-            ) { res in
-                switch res {
-                case .success(let urls):
-                    guard let url = urls.first else { return }
-                    guard let data = AppState.readFileData(from: url) else {
-                        app.lastError = "Không thể đọc file. Hãy kiểm tra file đã tải về máy chưa (iCloud)."
-                        showErrorAlert = true
-                        return
-                    }
-                    Task { await app.addTokensFromData(data) }
-                case .failure(let error):
-                    let ns = error as NSError
-                    if ns.code == NSUserCancelledError { return }
-                    app.lastError = error.localizedDescription
-                    showErrorAlert = true
-                }
-            }
-            .alert("Lỗi Import Token", isPresented: $showErrorAlert) {
-                Button("OK", role: .cancel) { }
-            } message: {
-                Text(app.lastError ?? "Không thể đọc file.")
-            }
             .overlay {
                 if app.isCheckingToken {
                     ProgressView("Đang check Token...")
@@ -728,8 +770,6 @@ struct ChannelListView: View {
 struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
-    @State private var showImport = false
-    @State private var showErrorAlert = false
 
     var body: some View {
         ScrollView {
@@ -787,14 +827,7 @@ struct SendView: View {
 
                 // 3. Nội dung tin nhắn
                 VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
-                        Spacer()
-                        Button(action: { showImport = true }) {
-                            Label("Import File", systemImage: "doc.badge.plus")
-                                .font(.caption).bold()
-                        }
-                    }
+                    Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
 
                     ZStack(alignment: .topTrailing) {
                         TextEditor(text: $app.inputText)
@@ -802,8 +835,7 @@ struct SendView: View {
                             .padding(8)
                             .background(Color(UIColor.tertiarySystemBackground))
                             .cornerRadius(10)
-                            // ✅ FIX iOS 16: dùng compat modifier
-                            .onChangeCompat(of: app.inputText) { app.parseDirectInput() }
+                            .onChange(of: app.inputText) { _ in app.parseDirectInput() }
 
                         if !app.inputText.isEmpty {
                             Button(action: { app.inputText = ""; app.parseDirectInput() }) {
@@ -817,6 +849,11 @@ struct SendView: View {
                     if !app.messages.isEmpty {
                         Text("Đã nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
                     }
+
+                    Text("Mẹo: Chia sẻ file .txt từ Files → Copy to \"\(Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String ?? "App")\" để nạp nội dung tự động.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
                 }
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
@@ -867,32 +904,5 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        .fileImporter(
-            isPresented: $showImport,
-            allowedContentTypes: [.item, .content, .data, .text, .plainText],
-            allowsMultipleSelection: false
-        ) { res in
-            switch res {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                guard let data = AppState.readFileData(from: url) else {
-                    app.lastError = "Không thể đọc file. Hãy kiểm tra file đã tải về máy chưa (iCloud)."
-                    showErrorAlert = true
-                    return
-                }
-                app.loadTextFromData(data)
-                if app.lastError != nil { showErrorAlert = true }
-            case .failure(let error):
-                let ns = error as NSError
-                if ns.code == NSUserCancelledError { return }
-                app.lastError = error.localizedDescription
-                showErrorAlert = true
-            }
-        }
-        .alert("Lỗi Import File", isPresented: $showErrorAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text(app.lastError ?? "Không thể đọc file. Vui lòng thử lại.")
-        }
     }
 }
