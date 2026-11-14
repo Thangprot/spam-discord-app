@@ -6,6 +6,56 @@ import UniformTypeIdentifiers
 import UIKit
 
 // ==========================================
+// MARK: - DOCUMENT PICKER (FIX CHO MỌI iOS)
+// ==========================================
+// Lý do: SwiftUI .fileImporter bị bug "bấm vào file không phản hồi" khi
+// allowedContentTypes trộn .item với UTType con (.data, .text, .plainText).
+// Wrapper này dùng UIDocumentPickerViewController trực tiếp với asCopy: true
+// → ổn định trên iOS 14+ và mọi nguồn (iCloud, Drive, OneDrive, Files...).
+struct DocumentPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
+    let onPick: (URL) -> Void
+    let onCancel: (() -> Void)?
+
+    init(contentTypes: [UTType] = [.item],
+         onPick: @escaping (URL) -> Void,
+         onCancel: (() -> Void)? = nil) {
+        self.contentTypes = contentTypes
+        self.onPick = onPick
+        self.onCancel = onCancel
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(
+            forOpeningContentTypes: contentTypes,
+            asCopy: true   // 🔑 File được copy vào sandbox → không cần security scope
+        )
+        picker.allowsMultipleSelection = false
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let parent: DocumentPicker
+        init(_ parent: DocumentPicker) { self.parent = parent }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController,
+                            didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else { return }
+            parent.onPick(url)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.onCancel?()
+        }
+    }
+}
+
+// ==========================================
 // MARK: - MODELS
 // ==========================================
 struct DiscordUser: Codable {
@@ -169,8 +219,8 @@ class AppState: ObservableObject {
     @Published var delaySeconds: Double = 2.0
     @Published var useTag: Bool = true
     @Published var targetUserId = ""
-    @Published var addPrefix: Bool = false // >
-    @Published var addSuffix: Bool = false // #
+    @Published var addPrefix: Bool = false
+    @Published var addSuffix: Bool = false
 
     // Content
     @Published var inputText = ""
@@ -182,13 +232,9 @@ class AppState: ObservableObject {
     @Published var currentMessageStr = ""
     @Published var lastError: String?
 
-    // ==== NEW: Open-file-from-Files-app state ====
-    @Published var pendingOpenFileURL: URL? = nil
-    @Published var showImportChoice = false
-    // ============================================
-
     private var client: DiscordClient? { activeToken != nil ? DiscordClient(token: activeToken!.token) : nil }
     private var isCancelled = false
+    private var sendTask: Task<Void, Never>?
 
     init() { loadTokens() }
 
@@ -228,6 +274,11 @@ class AppState: ObservableObject {
         isCheckingToken = false
     }
 
+    // ==========================================
+    // FIX: addTokensFromFile — đọc được mọi bảng mã + iCloud
+    // (URL từ DocumentPicker asCopy:true đã ở sandbox nên không cần security scope,
+    //  nhưng vẫn gọi để an toàn khi hàm được dùng từ nguồn khác.)
+    // ==========================================
     func addTokensFromFile(url: URL) async {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
@@ -303,7 +354,8 @@ class AppState: ObservableObject {
         isLoading = true
         do {
             let all = try await client.getAllChannels(guildId: guild.id)
-            self.channels = all.filter { $0.isSendableText || $0.isCategory }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+            self.channels = all.filter { $0.isSendableText || $0.isCategory }
+                .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         } catch { lastError = error.localizedDescription }
         isLoading = false
     }
@@ -319,6 +371,9 @@ class AppState: ObservableObject {
         return secs
     }
 
+    // ==========================================
+    // FIX: parseFile — đọc được mọi bảng mã + iCloud + sandbox copy
+    // ==========================================
     func parseFile(url: URL) {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
@@ -331,19 +386,13 @@ class AppState: ObservableObject {
         let coordinator = NSFileCoordinator()
         var coordErr: NSError?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
-            do {
-                fileData = try Data(contentsOf: newURL)
-            } catch {
-                readErr = error.localizedDescription
-            }
+            do { fileData = try Data(contentsOf: newURL) }
+            catch { readErr = error.localizedDescription }
         }
 
         if fileData == nil {
-            do {
-                fileData = try Data(contentsOf: url)
-            } catch {
-                readErr = error.localizedDescription
-            }
+            do { fileData = try Data(contentsOf: url) }
+            catch { readErr = error.localizedDescription }
         }
 
         guard let data = fileData else {
@@ -352,14 +401,8 @@ class AppState: ObservableObject {
         }
 
         let encodings: [String.Encoding] = [
-            .utf8,
-            .utf16,
-            .utf16LittleEndian,
-            .utf16BigEndian,
-            .windowsCP1252,
-            .isoLatin1,
-            .ascii,
-            .nonLossyASCII
+            .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
+            .windowsCP1252, .isoLatin1, .ascii, .nonLossyASCII
         ]
 
         var content: String?
@@ -369,7 +412,6 @@ class AppState: ObservableObject {
                 break
             }
         }
-
         if content == nil || content!.isEmpty {
             content = String(decoding: data, as: UTF8.self)
         }
@@ -380,7 +422,6 @@ class AppState: ObservableObject {
         }
 
         let cleaned = finalContent.replacingOccurrences(of: "\u{FEFF}", with: "")
-
         self.inputText = cleaned
         self.parseDirectInput()
         self.lastError = nil
@@ -400,69 +441,51 @@ class AppState: ObservableObject {
         isSending = true; isCancelled = false; totalSent = 0; lastError = nil
         BackgroundManager.shared.start()
 
-        Task {
+        sendTask = Task { [weak self] in
+            guard let self = self else { return }
             var currentIndex = 0
-            while !isCancelled {
-                let msg = messages[currentIndex]
+            while !self.isCancelled && !Task.isCancelled {
+                let msg = self.messages[currentIndex]
 
                 var prefix = ""
-                if addPrefix { prefix += "> " }
-                if addSuffix { prefix += "# " }
+                if self.addPrefix { prefix += "> " }
+                if self.addSuffix { prefix += "# " }
 
                 var finalContent = prefix + msg.body
-                if useTag { finalContent += " <@\(targetUserId)>" }
+                if self.useTag { finalContent += " <@\(self.targetUserId)>" }
 
-                currentMessageStr = finalContent
+                self.currentMessageStr = finalContent
 
                 do {
                     try await client.sendMessage(channelId: channel.id, content: finalContent)
-                    totalSent += 1
+                    self.totalSent += 1
                 } catch {
-                    lastError = error.localizedDescription
+                    self.lastError = error.localizedDescription
                 }
 
-                currentIndex = (currentIndex + 1) % messages.count
-                let actualDelay = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
-                try? await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
+                currentIndex = (currentIndex + 1) % self.messages.count
+                let actualDelay = max(0.1, self.delaySeconds + Double.random(in: -0.3...0.3) * self.delaySeconds)
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
+                } catch {
+                    break   // Task bị cancel
+                }
             }
-            isSending = false; currentMessageStr = ""
+            self.isSending = false
+            self.currentMessageStr = ""
         }
     }
 
     func stopSending() {
-        isCancelled = true; isSending = false
+        isCancelled = true
+        sendTask?.cancel()
+        sendTask = nil
+        isSending = false
         BackgroundManager.shared.stop()
     }
 
     func hideKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-    }
-
-    // ==========================================
-    // MARK: - OPEN FILE FROM FILES APP
-    // ==========================================
-    func handleOpenURL(_ url: URL) async {
-        guard url.isFileURL else { return }
-        // đợi UI ổn định khi app vừa cold-launch
-        try? await Task.sleep(nanoseconds: 400_000_000)
-        self.pendingOpenFileURL = url
-        self.showImportChoice = true
-    }
-
-    func importPendingFile(asTokens: Bool) {
-        guard let url = pendingOpenFileURL else { return }
-        pendingOpenFileURL = nil
-        showImportChoice = false
-        if asTokens {
-            Task { await addTokensFromFile(url: url) }
-        } else {
-            parseFile(url: url)
-        }
-    }
-
-    func cancelPendingImport() {
-        pendingOpenFileURL = nil
-        showImportChoice = false
     }
 }
 
@@ -474,19 +497,12 @@ struct SpamDiscordApp: App {
     @StateObject private var app = AppState()
     var body: some Scene {
         WindowGroup {
-            MainTabView()
-                .environmentObject(app)
-                .onOpenURL { url in
-                    Task { @MainActor in
-                        await app.handleOpenURL(url)
-                    }
-                }
+            MainTabView().environmentObject(app)
         }
     }
 }
 
 struct MainTabView: View {
-    @EnvironmentObject var app: AppState
     var body: some View {
         TabView {
             SpamView()
@@ -496,13 +512,6 @@ struct MainTabView: View {
                 .tabItem { Label("Tokens", systemImage: "person.2.fill") }
         }
         .tint(.indigo)
-        .alert("Import file", isPresented: $app.showImportChoice) {
-            Button("Nội dung tin nhắn") { app.importPendingFile(asTokens: false) }
-            Button("Danh sách Token")   { app.importPendingFile(asTokens: true)  }
-            Button("Huỷ", role: .cancel) { app.cancelPendingImport() }
-        } message: {
-            Text("Bạn muốn import file này dưới dạng gì?")
-        }
     }
 }
 
@@ -519,8 +528,7 @@ struct EmptyStateView: View {
             Image(systemName: systemImage)
                 .font(.system(size: 50))
                 .foregroundStyle(.secondary)
-            Text(title)
-                .font(.title2).bold()
+            Text(title).font(.title2).bold()
             Text(description)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -544,7 +552,9 @@ struct TokenListView: View {
         NavigationStack {
             Group {
                 if app.tokens.isEmpty {
-                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash", description: "Vui lòng thêm token để sử dụng app.")
+                    EmptyStateView(title: "Chưa có Token",
+                                   systemImage: "key.slash",
+                                   description: "Vui lòng thêm token để sử dụng app.")
                 } else {
                     List {
                         Section(header: Text("Danh sách tài khoản")) {
@@ -563,7 +573,8 @@ struct TokenListView: View {
                                             .clipShape(Circle())
                                         } else {
                                             Image(systemName: "person.circle.fill")
-                                                .resizable().frame(width: 45, height: 45).foregroundStyle(.gray)
+                                                .resizable().frame(width: 45, height: 45)
+                                                .foregroundStyle(.gray)
                                         }
 
                                         VStack(alignment: .leading, spacing: 4) {
@@ -603,19 +614,10 @@ struct TokenListView: View {
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            .fileImporter(
-                isPresented: $showImport,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: false
-            ) { res in
-                switch res {
-                case .success(let urls):
-                    guard let url = urls.first else { return }
+            // 🔑 FIX: dùng DocumentPicker thay .fileImporter
+            .sheet(isPresented: $showImport) {
+                DocumentPicker(contentTypes: [.item]) { url in
                     Task { await app.addTokensFromFile(url: url) }
-                case .failure(let error):
-                    let ns = error as NSError
-                    if ns.code == NSUserCancelledError { return }
-                    app.lastError = error.localizedDescription
                 }
             }
             .overlay {
@@ -637,9 +639,11 @@ struct AddTokenSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section(header: Text("Nhập Token"), footer: Text("Hệ thống sẽ tự động kiểm tra token sống hay chết trước khi lưu.")) {
+                Section(header: Text("Nhập Token"),
+                        footer: Text("Hệ thống sẽ tự động kiểm tra token sống hay chết trước khi lưu.")) {
                     TextField("Dán token...", text: $tokenInput)
-                        .autocorrectionDisabled().textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                 }
             }
             .navigationTitle("Thêm Token")
@@ -668,22 +672,27 @@ struct SpamView: View {
     @State private var searchText = ""
 
     var filteredGuilds: [Guild] {
-        searchText.isEmpty ? app.guilds : app.guilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        searchText.isEmpty ? app.guilds :
+            app.guilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
     var body: some View {
         NavigationStack {
             Group {
                 if app.activeToken == nil {
-                    EmptyStateView(title: "Chưa chọn Token", systemImage: "exclamationmark.triangle", description: "Vào tab Tokens để thêm và chọn tài khoản.")
+                    EmptyStateView(title: "Chưa chọn Token",
+                                   systemImage: "exclamationmark.triangle",
+                                   description: "Vào tab Tokens để thêm và chọn tài khoản.")
                 } else if app.isLoading {
                     ProgressView("Đang tải Server...")
                 } else {
                     List(filteredGuilds) { guild in
                         NavigationLink(value: guild) {
                             HStack {
-                                if let icon = guild.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
-                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() } placeholder: { Circle().fill(.gray) }
+                                if let icon = guild.icon,
+                                   let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
+                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                        placeholder: { Circle().fill(.gray) }
                                         .frame(width: 35, height: 35).clipShape(Circle())
                                 } else {
                                     Circle().fill(.gray.opacity(0.3)).frame(width: 35, height: 35)
@@ -711,7 +720,9 @@ struct ChannelListView: View {
         let sections = app.groupedChannels()
         if searchText.isEmpty { return sections }
         return sections.compactMap { section in
-            let filteredItems = section.items.filter { $0.displayName.localizedCaseInsensitiveContains(searchText) }
+            let filteredItems = section.items.filter {
+                $0.displayName.localizedCaseInsensitiveContains(searchText)
+            }
             return filteredItems.isEmpty ? nil : (section.category, filteredItems)
         }
     }
@@ -722,11 +733,13 @@ struct ChannelListView: View {
             else {
                 List {
                     ForEach(filteredSections, id: \.category?.id) { sec in
-                        Section(header: Text(sec.category?.displayName.uppercased() ?? "KHÁC").font(.caption).bold()) {
+                        Section(header: Text(sec.category?.displayName.uppercased() ?? "KHÁC")
+                                    .font(.caption).bold()) {
                             ForEach(sec.items) { c in
                                 NavigationLink(value: c) {
                                     HStack {
-                                        Image(systemName: c.type == 5 ? "megaphone" : "number").foregroundStyle(.secondary)
+                                        Image(systemName: c.type == 5 ? "megaphone" : "number")
+                                            .foregroundStyle(.secondary)
                                         Text(c.displayName)
                                     }
                                 }
@@ -757,8 +770,7 @@ struct SendView: View {
                     Image(systemName: "number.circle.fill")
                         .font(.title)
                         .foregroundStyle(.indigo)
-                    Text(channel.displayName)
-                        .font(.title2.bold())
+                    Text(channel.displayName).font(.title2.bold())
                     Spacer()
                 }
                 .padding()
@@ -769,8 +781,7 @@ struct SendView: View {
                 VStack(alignment: .leading, spacing: 15) {
                     Text("CẤU HÌNH").font(.caption).bold().foregroundStyle(.secondary)
 
-                    Toggle("Tag User ID", isOn: $app.useTag)
-                        .tint(.indigo)
+                    Toggle("Tag User ID", isOn: $app.useTag).tint(.indigo)
                     if app.useTag {
                         TextField("Nhập User ID (dãy số)", text: $app.targetUserId)
                             .keyboardType(.numberPad)
@@ -832,7 +843,8 @@ struct SendView: View {
                     }
 
                     if !app.messages.isEmpty {
-                        Text("Đã nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
+                        Text("Đã nhận diện: \(app.messages.count) dòng")
+                            .font(.caption).foregroundStyle(.green)
                     }
                 }
                 .padding()
@@ -883,24 +895,17 @@ struct SendView: View {
         .background(Color(UIColor.systemGroupedBackground))
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        .fileImporter(
-            isPresented: $showImport,
-            allowedContentTypes: [.item],
-            allowsMultipleSelection: false
-        ) { res in
-            switch res {
-            case .success(let urls):
-                guard let url = urls.first else { return }
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Xong") { app.hideKeyboard() }
+            }
+        }
+        // 🔑 FIX: dùng DocumentPicker thay .fileImporter
+        .sheet(isPresented: $showImport) {
+            DocumentPicker(contentTypes: [.item]) { url in
                 app.parseFile(url: url)
-                if app.lastError != nil {
-                    showErrorAlert = true
-                }
-            case .failure(let error):
-                let ns = error as NSError
-                if ns.code == NSUserCancelledError { return }
-                app.lastError = error.localizedDescription
-                showErrorAlert = true
+                if app.lastError != nil { showErrorAlert = true }
             }
         }
         .alert("Lỗi Import File", isPresented: $showErrorAlert) {
