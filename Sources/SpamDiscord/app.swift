@@ -599,7 +599,6 @@ class UserNukeClient {
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
 
-    // --- WebSocket member fetch ---
     func fetchMembersWS(guildId: String,
                         onMember: @escaping ([String: Any]) -> Void,
                         onProgress: @escaping (Int) -> Void) async throws {
@@ -966,7 +965,7 @@ class UserNukeManager: ObservableObject {
     @Published var phaseProgress: Double = 0
     @Published var membersScanned = 0
 
-    private var isCancelled = false
+    private let cancelFlag = CancelFlag()
     private let key = "UserNukeTokensV2"
 
     init() { migrateIfNeeded(); loadTokens() }
@@ -1070,14 +1069,14 @@ class UserNukeManager: ObservableObject {
             .sorted { $0.name < $1.name }
     }
 
-    func stop() { isCancelled = true }
+    func stop() { cancelFlag.set() }
     private func log(_ m: String) { nukeLog.append(m); if nukeLog.count > 800 { nukeLog.removeFirst(nukeLog.count - 800) } }
     private func reset() { banSuccess = 0; banFailed = 0; channelsDeleted = 0; channelsCreated = 0; messagesSent = 0; rolesCreated = 0; membersScanned = 0; phaseProgress = 0 }
 
     func runNuke(guild: Guild, options: NukeConfig) async {
         let sel = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
         guard !sel.isEmpty else { return }
-        isNuking = true; isCancelled = false; nukeLog = []; reset()
+        isNuking = true; cancelFlag.reset(); nukeLog = []; reset()
         BackgroundManager.shared.start()
         let gid = guild.id
         let clients = sel.map { UserNukeClient(token: $0.token) }
@@ -1089,18 +1088,18 @@ class UserNukeManager: ObservableObject {
             log("Mass Ban...")
             await doMassBanScan(clients[0], clients: clients, gid: gid, roleId: options.banRoleId)
         }
-        if options.doDeleteChannels && !isCancelled {
+        if options.doDeleteChannels && !cancelFlag.isSet {
             currentPhase = "Xóa kênh"; phaseProgress = 0.4
             log("Xóa kênh...")
             await doDeleteChannels(clients, gid)
         }
-        if options.doRenameGuild && !options.newGuildName.isEmpty && !isCancelled {
+        if options.doRenameGuild && !options.newGuildName.isEmpty && !cancelFlag.isSet {
             currentPhase = "Đổi tên"; phaseProgress = 0.55
             log("Đổi tên server...")
             do { try await clients[0].renameGuild(gid, newName: options.newGuildName); log("[OK] Đổi tên") }
             catch { log("[LỖI] \(error.localizedDescription)") }
         }
-        if !isCancelled && (options.doCreateRoles || options.doCreateChannels) {
+        if !cancelFlag.isSet && (options.doCreateRoles || options.doCreateChannels) {
             currentPhase = "Tạo Role + Kênh"; phaseProgress = 0.75
             log("Tạo Role + Kênh song song...")
             if options.doCreateRoles && options.doCreateChannels {
@@ -1116,9 +1115,9 @@ class UserNukeManager: ObservableObject {
             }
             log("[OK] Role: \(rolesCreated) | Kênh: \(channelsCreated) | Tin: \(messagesSent)")
         }
-        currentPhase = isCancelled ? "Đã dừng" : "Hoàn tất"
+        currentPhase = cancelFlag.isSet ? "Đã dừng" : "Hoàn tất"
         phaseProgress = 1.0
-        log(isCancelled ? "Đã dừng" : "HOÀN TẤT")
+        log(cancelFlag.isSet ? "Đã dừng" : "HOÀN TẤT")
         isNuking = false
         BackgroundManager.shared.stop()
     }
@@ -1172,10 +1171,12 @@ class UserNukeManager: ObservableObject {
 
             let queue = candidates
             let idx = IndexBox()
+            // ✅ FIX: cache flag thread-safe trước withTaskGroup
+            let flag = self.cancelFlag
             await withTaskGroup(of: Void.self) { group in
                 for c in clients {
                     group.addTask {
-                        while !self.isCancelled {
+                        while !flag.isSet {
                             let i = idx.next()
                             if i >= queue.count { break }
                             let uid = queue[i]
@@ -1201,7 +1202,7 @@ class UserNukeManager: ObservableObject {
             await withTaskGroup(of: Bool.self) { group in
                 var inf = 0
                 for _ in 0..<chans.count {
-                    if isCancelled { break }
+                    if cancelFlag.isSet { break }
                     let c = clients[Int.random(in: 0..<clients.count)]
                     let i = idx.next()
                     if i >= chans.count { break }
@@ -1221,7 +1222,7 @@ class UserNukeManager: ObservableObject {
         await withTaskGroup(of: Bool.self) { group in
             var inf = 0
             for _ in 0..<opts.roleCount {
-                if isCancelled { break }
+                if cancelFlag.isSet { break }
                 let c = clients[Int.random(in: 0..<clients.count)]
                 group.addTask { do { try await c.createRole(gid, name: opts.roleName); return true } catch { return false } }
                 inf += 1
@@ -1238,7 +1239,7 @@ class UserNukeManager: ObservableObject {
         await withTaskGroup(of: (Bool, Bool).self) { group in
             var inf = 0
             for _ in 0..<opts.channelCount {
-                if isCancelled { break }
+                if cancelFlag.isSet { break }
                 let c = clients[Int.random(in: 0..<clients.count)]
                 group.addTask {
                     do {
@@ -1262,10 +1263,29 @@ class UserNukeManager: ObservableObject {
     }
 }
 
+// ==========================================
+// MARK: - THREAD-SAFE HELPERS
+// ==========================================
 final class IndexBox: @unchecked Sendable {
     private var value = 0
     private let lock = NSLock()
     func next() -> Int { lock.lock(); defer { lock.unlock() }; let v = value; value += 1; return v }
+}
+
+// ✅ FIX: CancelFlag thread-safe — dùng cho UserNukeManager
+final class CancelFlag: @unchecked Sendable {
+    private var flag = false
+    private let lock = NSLock()
+    var isSet: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return flag
+    }
+    func set() {
+        lock.lock(); flag = true; lock.unlock()
+    }
+    func reset() {
+        lock.lock(); flag = false; lock.unlock()
+    }
 }
 
 // ==========================================
@@ -1331,7 +1351,6 @@ struct EmptyStateView: View {
     }
 }
 
-// Avatar view (không dùng SF Symbol)
 struct AvatarView: View {
     let url: URL?
     let initial: String
@@ -1774,7 +1793,6 @@ struct BotGuildListView: View {
     }
 }
 
-// Shared options view for both bot & user nuke
 struct NukeOptionsView: View {
     @EnvironmentObject var bot: BotManager
     @EnvironmentObject var userNuke: UserNukeManager
@@ -1902,7 +1920,6 @@ struct NukeOptionsView: View {
     }
 }
 
-// Shared running UI
 struct NukeRunningUI: View {
     let phase: String
     let progress: Double
