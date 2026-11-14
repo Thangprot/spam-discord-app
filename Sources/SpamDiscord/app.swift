@@ -75,6 +75,7 @@ struct GuildRole: Codable { let id, name: String; let position: Int }
 struct BotMember: Codable { let user: BotMemberUser?; let roles: [String]? }
 struct BotMemberUser: Codable { let id: String; let username: String?; let bot: Bool? }
 
+// NukeGuild: permission per action
 struct NukeGuild: Codable {
     let id, name: String
     let icon: String?
@@ -87,9 +88,30 @@ struct NukeGuild: Codable {
     var canManageChannels: Bool { bits & (1 << 4) != 0 }
     var canBan: Bool { bits & (1 << 2) != 0 }
     var canManageRoles: Bool { bits & (1 << 28) != 0 }
-    var canNuke: Bool {
-        if isOwner || isAdmin { return true }
-        return canManageGuild && canManageChannels && canBan
+
+    // Per-action
+    var canMassBan: Bool { isOwner || isAdmin || canBan }
+    var canDeleteChannels: Bool { isOwner || isAdmin || canManageChannels }
+    var canCreateChannels: Bool { isOwner || isAdmin || canManageChannels }
+    var canCreateRoles: Bool { isOwner || isAdmin || canManageRoles }
+    var canRenameGuild: Bool { isOwner || isAdmin || canManageGuild }
+
+    // Show guild if ANY permission is available
+    var canDoAnything: Bool {
+        canMassBan || canDeleteChannels || canCreateChannels || canCreateRoles || canRenameGuild
+    }
+}
+
+// Effective permissions after union of all selected tokens
+struct GuildPermissions {
+    var massBan: Bool = false
+    var deleteChannels: Bool = false
+    var createChannels: Bool = false
+    var createRoles: Bool = false
+    var renameGuild: Bool = false
+
+    var any: Bool {
+        massBan || deleteChannels || createChannels || createRoles || renameGuild
     }
 }
 
@@ -122,7 +144,7 @@ struct NukeConfig {
     var msgDelay: Double = 0.10
 
     var banRoleId = ""
-    var roleName = "Ceker Cute"
+    var roleName = "Quoc Thang Tools"      // ✅ Đổi tên role mặc định
     var roleCount = 50
     var channelName = "nuked-by-tool"
     var channelCount = 50
@@ -744,10 +766,8 @@ class BotManager: ObservableObject {
             log("--- \(step.rawValue) ---")
 
             switch step {
-            case .massBan:
-                await doMassBan(c, gid, options: options)
-            case .deleteChannels:
-                await doDeleteChannels(c, gid, options: options)
+            case .massBan: await doMassBan(c, gid, options: options)
+            case .deleteChannels: await doDeleteChannels(c, gid, options: options)
             case .renameGuild:
                 if !options.newGuildName.isEmpty {
                     do { try await c.renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
@@ -936,6 +956,25 @@ class UserNukeManager: ObservableObject {
            let s = try? JSONDecoder().decode([TokenInfo].self, from: d) { tokens = s }
     }
 
+    // ✅ NEW: Add token manually (single)
+    func addTokenManually(_ raw: String) async -> Bool {
+        let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, !tokens.contains(where: { $0.token == clean }) else { return false }
+        isImporting = true
+        defer { isImporting = false }
+        do {
+            let u = try await UserNukeClient(token: clean).validate()
+            tokens.append(TokenInfo(token: clean, userId: u.id,
+                                    username: u.globalName ?? u.username,
+                                    avatarHash: u.avatar, isValid: true))
+            return true
+        } catch {
+            tokens.append(TokenInfo(token: clean, userId: "0",
+                                    username: "Token chết", avatarHash: nil, isValid: false))
+            return false
+        }
+    }
+
     func importFromFile(url: URL) async {
         let got = url.startAccessingSecurityScopedResource()
         defer { if got { url.stopAccessingSecurityScopedResource() } }
@@ -996,21 +1035,61 @@ class UserNukeManager: ObservableObject {
         catch { tokenGuilds[t.id] = [] }
         recomputeEligible()
     }
+
+    // ✅ CHANGED: eligibility = canDoAnything (union across tokens)
     func recomputeEligible() {
         guard !selectedTokenIds.isEmpty else { eligibleGuilds = []; return }
-        var set: Set<String>? = nil
-        var firstList: [NukeGuild]? = nil
+        var unionIds: Set<String> = []
+        var unionMap: [String: NukeGuild] = [:]
+
         for id in selectedTokenIds {
             guard let gs = tokenGuilds[id] else { eligibleGuilds = []; return }
-            let nukeable = gs.filter { $0.canNuke }
-            let ids = Set(nukeable.map { $0.id })
-            if set == nil { set = ids; firstList = nukeable }
-            else { set = set!.intersection(ids) }
+            for g in gs where g.canDoAnything {
+                unionIds.insert(g.id)
+                if unionMap[g.id] == nil { unionMap[g.id] = g }
+            }
         }
-        guard let s = set, let list = firstList else { eligibleGuilds = []; return }
-        eligibleGuilds = list.filter { s.contains($0.id) }
+        eligibleGuilds = unionIds.compactMap { unionMap[$0] }
             .map { Guild(id: $0.id, name: $0.name, icon: $0.icon) }
             .sorted { $0.name < $1.name }
+    }
+
+    // ✅ NEW: Compute effective permissions for a guild (union of all selected tokens)
+    func permissionsForGuild(_ guildId: String) -> GuildPermissions {
+        var perms = GuildPermissions()
+        for tokenId in selectedTokenIds {
+            guard let gs = tokenGuilds[tokenId],
+                  let g = gs.first(where: { $0.id == guildId }) else { continue }
+            if g.canMassBan { perms.massBan = true }
+            if g.canDeleteChannels { perms.deleteChannels = true }
+            if g.canCreateChannels { perms.createChannels = true }
+            if g.canCreateRoles { perms.createRoles = true }
+            if g.canRenameGuild { perms.renameGuild = true }
+        }
+        return perms
+    }
+
+    // ✅ NEW: Filter tokens that have a specific permission in a guild
+    private func clientsWithBanPerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
+        all.filter { tokenId, _ in
+            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canMassBan ?? false
+        }.map { $0.1 }
+    }
+    private func clientsWithChannelPerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
+        all.filter { tokenId, _ in
+            let g = tokenGuilds[tokenId]?.first(where: { $0.id == guildId })
+            return g?.canDeleteChannels ?? false || g?.canCreateChannels ?? false
+        }.map { $0.1 }
+    }
+    private func clientsWithRolePerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
+        all.filter { tokenId, _ in
+            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canCreateRoles ?? false
+        }.map { $0.1 }
+    }
+    private func clientsWithRenamePerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
+        all.filter { tokenId, _ in
+            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canRenameGuild ?? false
+        }.map { $0.1 }
     }
 
     func stop() { isCancelled = true }
@@ -1025,11 +1104,14 @@ class UserNukeManager: ObservableObject {
         isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start()
         let gid = guild.id
-        let clients = sel.map { UserNukeClient(token: $0.token) }
-        let scan = clients[0]
+
+        // ✅ Build tokenId ↔ client pairs to filter per permission
+        let allClients: [(UUID, UserNukeClient)] = sel.map { ($0.id, UserNukeClient(token: $0.token)) }
+        guard let scan = allClients.first?.1 else { return }
 
         log("Bắt đầu nuke: \(guild.name)")
-        log("Dùng \(clients.count) token")
+        log("Dùng \(allClients.count) token")
+
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
 
@@ -1040,18 +1122,30 @@ class UserNukeManager: ObservableObject {
             phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
             log("--- \(step.rawValue) ---")
             switch step {
-            case .massBan: await doMassBanScan(scan, clients: clients, gid: gid, options: options)
-            case .deleteChannels: await doDeleteChannels(clients, gid, options: options)
+            case .massBan:
+                let banClients = clientsWithBanPerm(guildId: gid, all: allClients)
+                if banClients.isEmpty { log("  Bỏ qua: không token nào có quyền ban"); break }
+                await doMassBanScan(scan, clients: banClients, gid: gid, options: options)
+            case .deleteChannels:
+                let chClients = clientsWithChannelPerm(guildId: gid, all: allClients)
+                if chClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
+                await doDeleteChannels(chClients, gid, options: options)
             case .renameGuild:
+                let rClients = clientsWithRenamePerm(guildId: gid, all: allClients)
+                if rClients.isEmpty { log("  Bỏ qua: không token nào có quyền đổi tên"); break }
                 if !options.newGuildName.isEmpty {
-                    do { try await clients[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
+                    do { try await rClients[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
                     catch { log("  Lỗi: \(error.localizedDescription)") }
                 }
             case .createRoles:
-                rolesCreated = await doCreateRoles(clients, gid, options: options)
+                let roleClients = clientsWithRolePerm(guildId: gid, all: allClients)
+                if roleClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý role"); break }
+                rolesCreated = await doCreateRoles(roleClients, gid, options: options)
                 log("  Role đã tạo: \(rolesCreated)")
             case .createChannels:
-                let (cc, ss) = await doCreateChannels(clients, gid, options: options)
+                let chClients = clientsWithChannelPerm(guildId: gid, all: allClients)
+                if chClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
+                let (cc, ss) = await doCreateChannels(chClients, gid, options: options)
                 channelsCreated = cc; messagesSent = ss
                 log("  Kênh đã tạo: \(cc), tin đã gửi: \(ss)")
             }
@@ -1128,8 +1222,6 @@ class UserNukeManager: ObservableObject {
             let queue = candidates
             let idxBox = IndexBox()
             let delay = options.banDelay
-
-            // ✅ FIX: capture manager tham chiếu để dùng await isCancelled trong closure
             let manager = self
 
             await withTaskGroup(of: Void.self) { group in
@@ -1150,7 +1242,6 @@ class UserNukeManager: ObservableObject {
                     }
                 }
             }
-
             log("  Ban xong: \(banSuccess) OK / \(banFailed) FAIL")
         } catch { log("  Lỗi mass ban: \(error.localizedDescription)") }
     }
@@ -1573,7 +1664,7 @@ struct BotNukeView: View {
             Group {
                 if bot.config == nil { BotSetupView() }
                 else if bot.isNuking { BotNukeRunningView() }
-                else if let g = selectedGuild { NukeOptionsView(guild: g, selectedGuild: $selectedGuild, mode: .bot) }
+                else if let g = selectedGuild { NukeOptionsView(guild: g, selectedGuild: $selectedGuild, mode: .bot, permissions: nil) }
                 else { BotGuildListView(selectedGuild: $selectedGuild) }
             }
             .navigationTitle(navTitle).navigationBarTitleDisplayMode(.inline)
@@ -1682,7 +1773,7 @@ struct BotGuildListView: View {
 }
 
 // ==========================================
-// MARK: - NUKE OPTIONS
+// MARK: - NUKE OPTIONS (shared, permission-aware)
 // ==========================================
 enum NukeMode { case bot, user }
 
@@ -1692,9 +1783,22 @@ struct NukeOptionsView: View {
     let guild: Guild
     @Binding var selectedGuild: Guild?
     let mode: NukeMode
+    let permissions: GuildPermissions?   // nil = no gating (bot mode)
     @State private var options = NukeConfig()
 
     var canRun: Bool { !options.enabledSteps.isEmpty }
+
+    // ✅ NEW: Is a step enabled by permissions?
+    func stepPermitted(_ step: NukeStepType) -> Bool {
+        guard let p = permissions else { return true }   // bot mode: all enabled
+        switch step {
+        case .massBan: return p.massBan
+        case .deleteChannels: return p.deleteChannels
+        case .createChannels: return p.createChannels
+        case .createRoles: return p.createRoles
+        case .renameGuild: return p.renameGuild
+        }
+    }
 
     var body: some View {
         ScrollView {
@@ -1720,6 +1824,21 @@ struct NukeOptionsView: View {
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
 
+                // Show permission summary for user mode
+                if let p = permissions {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("QUYỀN KHẢ DỤNG").font(.caption).bold().foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            permBadge("Ban", p.massBan)
+                            permBadge("Xóa", p.deleteChannels)
+                            permBadge("Tạo kênh", p.createChannels)
+                            permBadge("Role", p.createRoles)
+                            permBadge("Rename", p.renameGuild)
+                        }
+                    }.padding().frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
+                }
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("THỨ TỰ & CHỨC NĂNG").font(.caption).bold().foregroundStyle(.secondary)
                     ForEach(Array(options.stepOrder.enumerated()), id: \.element) { idx, step in
@@ -1728,6 +1847,18 @@ struct NukeOptionsView: View {
                 }
 
                 Button {
+                    // Auto-remove steps user has no perm for
+                    if let p = permissions {
+                        options.enabledSteps = options.enabledSteps.filter { s in
+                            switch s {
+                            case .massBan: return p.massBan
+                            case .deleteChannels: return p.deleteChannels
+                            case .createChannels: return p.createChannels
+                            case .createRoles: return p.createRoles
+                            case .renameGuild: return p.renameGuild
+                            }
+                        }
+                    }
                     if mode == .bot {
                         Task { await bot.runNuke(guild: guild, options: options) }
                     } else {
@@ -1746,8 +1877,22 @@ struct NukeOptionsView: View {
     }
 
     @ViewBuilder
+    func permBadge(_ text: String, _ ok: Bool) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .font(.caption2)
+                .foregroundStyle(ok ? .green : .red)
+            Text(text).font(.caption2).foregroundStyle(ok ? .primary : .secondary)
+        }.padding(.horizontal, 6).padding(.vertical, 3)
+        .background((ok ? Color.green : Color.red).opacity(0.12))
+        .cornerRadius(5)
+    }
+
+    @ViewBuilder
     func stepCard(step: NukeStepType, index: Int, total: Int) -> some View {
-        let isOn = options.enabledSteps.contains(step)
+        let permitted = stepPermitted(step)
+        let isOn = options.enabledSteps.contains(step) && permitted
+
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 VStack(spacing: 0) {
@@ -1760,8 +1905,15 @@ struct NukeOptionsView: View {
                 }.foregroundStyle(.secondary)
 
                 Text("\(index + 1)").font(.caption.bold()).foregroundStyle(.secondary).frame(width: 18)
-                Image(systemName: step.icon).foregroundStyle(.indigo).frame(width: 20)
-                Text(step.rawValue).font(.headline)
+                Image(systemName: step.icon)
+                    .foregroundStyle(permitted ? .indigo : .gray)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(step.rawValue).font(.headline)
+                    if !permitted {
+                        Text("Không có quyền").font(.caption2).foregroundStyle(.red)
+                    }
+                }
                 Spacer()
                 Toggle("", isOn: Binding(
                     get: { isOn },
@@ -1769,9 +1921,11 @@ struct NukeOptionsView: View {
                         if v { options.enabledSteps.insert(step) } else { options.enabledSteps.remove(step) }
                     }
                 )).labelsHidden().tint(.indigo)
+                .disabled(!permitted)
             }.padding()
+            .opacity(permitted ? 1 : 0.6)
 
-            if isOn {
+            if isOn && permitted {
                 Divider()
                 stepConfig(step: step).padding()
             }
@@ -1784,7 +1938,7 @@ struct NukeOptionsView: View {
         case .massBan:
             VStack(alignment: .leading, spacing: 10) {
                 Text(mode == .user
-                     ? "Ban member qua WebSocket, chia đều cho tất cả token."
+                     ? "Ban member qua WebSocket, chia đều cho token có quyền ban."
                      : "Ban member có role thấp hơn bot.")
                     .font(.caption2).foregroundStyle(.secondary)
                 if mode == .user {
@@ -1946,7 +2100,10 @@ struct UserNukeView: View {
         NavigationStack {
             Group {
                 if userNuke.isNuking { UserNukeRunningView() }
-                else if let g = selectedGuild { NukeOptionsView(guild: g, selectedGuild: $selectedGuild, mode: .user) }
+                else if let g = selectedGuild {
+                    NukeOptionsView(guild: g, selectedGuild: $selectedGuild, mode: .user,
+                                    permissions: userNuke.permissionsForGuild(g.id))
+                }
                 else if userNuke.selectedTokenIds.isEmpty { UserNukeTokenPickerView(selectedGuild: $selectedGuild) }
                 else { UserNukeGuildListView(selectedGuild: $selectedGuild) }
             }
@@ -1961,18 +2118,27 @@ struct UserNukeView: View {
     }
 }
 
+// ✅ MODIFIED: Add "Thêm tay" button + sheet
 struct UserNukeTokenPickerView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Binding var selectedGuild: Guild?
     @State private var showImport = false
+    @State private var showManual = false
     @State private var showErr = false
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Button { showImport = true } label: {
-                    Label("Import tokens", systemImage: "doc.badge.plus")
+                Button { showManual = true } label: {
+                    Label("Thêm tay", systemImage: "keyboard")
                         .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(12)
                 }.background(Color.indigo).foregroundStyle(.white).cornerRadius(10)
+
+                Button { showImport = true } label: {
+                    Label("Import", systemImage: "doc.badge.plus")
+                        .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(12)
+                }.background(Color.blue).foregroundStyle(.white).cornerRadius(10)
+
                 if !userNuke.tokens.isEmpty {
                     Menu {
                         Button("Xóa tất cả", systemImage: "trash", role: .destructive) { userNuke.clearAll() }
@@ -1987,7 +2153,7 @@ struct UserNukeTokenPickerView: View {
 
             if userNuke.tokens.isEmpty {
                 EmptyStateView(title: "Chưa có token user", systemImage: "person.badge.key",
-                               description: "Import file .txt (mỗi dòng 1 token) để bắt đầu.\nToken nuke lưu riêng, KHÔNG chung với token spam.")
+                               description: "Thêm token bằng tay hoặc import file .txt.\nToken nuke lưu riêng, KHÔNG chung với token spam.")
             } else {
                 List {
                     Section(header: Text("Chọn token (\(userNuke.selectedTokenIds.count) đã chọn)")) {
@@ -2037,9 +2203,72 @@ struct UserNukeTokenPickerView: View {
         .sheet(isPresented: $showImport) {
             DocumentPicker(contentTypes: [.item]) { u in Task { await userNuke.importFromFile(url: u) } }
         }
+        .sheet(isPresented: $showManual) {
+            UserNukeManualAddSheet()
+        }
         .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
         message: { Text(userNuke.importError ?? "") }
         .onChange(of: userNuke.importError) { v in if v != nil { showErr = true } }
+    }
+}
+
+// ✅ NEW: Manual add token sheet for user nuke
+struct UserNukeManualAddSheet: View {
+    @EnvironmentObject var userNuke: UserNukeManager
+    @Environment(\.dismiss) var dismiss
+    @State private var input = ""
+    @State private var errorMsg: String? = nil
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("Nhập User Token")) {
+                    TextEditor(text: $input)
+                        .frame(height: 100)
+                        .font(.system(.body, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .focused($focused)
+                }
+
+                if let e = errorMsg {
+                    Section {
+                        Text(e).font(.caption).foregroundStyle(.red)
+                    }
+                }
+
+                Section(footer: Text("Token sẽ được kiểm tra tính hợp lệ trước khi thêm. Có thể nhập nhiều dòng (mỗi dòng 1 token).")) {
+                    Button("Thêm token") {
+                        Task { await addTokens() }
+                    }
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || userNuke.isImporting)
+                }
+            }
+            .navigationTitle("Thêm token tay").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
+            }
+            .onAppear { focused = true }
+        }
+    }
+
+    private func addTokens() async {
+        let lines = input.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { errorMsg = "Không có token"; return }
+        errorMsg = nil
+        var okCount = 0
+        for line in lines {
+            let added = await userNuke.addTokenManually(line)
+            if added { okCount += 1 }
+        }
+        if okCount > 0 {
+            dismiss()
+        } else {
+            errorMsg = "Không thêm được token nào (có thể đã tồn tại hoặc token chết)."
+        }
     }
 }
 
@@ -2054,7 +2283,7 @@ struct UserNukeGuildListView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "shield.checkerboard").foregroundStyle(.green)
-                Text("Server mà TẤT CẢ \(userNuke.selectedTokenIds.count) token đều có quyền")
+                Text("Server có ít nhất 1 quyền cho \(userNuke.selectedTokenIds.count) token")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button { userNuke.clearSelection() } label: {
@@ -2068,8 +2297,8 @@ struct UserNukeGuildListView: View {
 
             if userNuke.isLoadingGuilds { ProgressView("Đang tải...").padding(40); Spacer() }
             else if userNuke.eligibleGuilds.isEmpty {
-                EmptyStateView(title: "Không có server chung", systemImage: "exclamationmark.triangle",
-                               description: "Tất cả token phải cùng ở server và đủ quyền (Admin / Manage Server / Manage Channels / Ban).")
+                EmptyStateView(title: "Không có server phù hợp", systemImage: "exclamationmark.triangle",
+                               description: "Cần ít nhất 1 token có quyền Ban / Manage Channels / Manage Roles / Manage Server.")
             } else {
                 List(filtered) { g in
                     Button { selectedGuild = g } label: {
