@@ -1,16 +1,7 @@
 import Foundation
 
-struct DiscordUser: Codable {
-    let id: String
-    let username: String
-    let globalName: String?
-}
-
-struct Guild: Codable, Identifiable, Hashable {
-    let id: String
-    let name: String
-    let icon: String?
-}
+struct DiscordUser: Codable { let id, username: String; let globalName: String? }
+struct Guild: Codable, Identifiable, Hashable { let id, name: String; let icon: String? }
 
 struct Channel: Codable, Identifiable, Hashable {
     let id: String
@@ -24,14 +15,5 @@ struct Channel: Codable, Identifiable, Hashable {
     var displayName: String { name ?? "không tên" }
 }
 
-struct ParsedMessage: Identifiable, Hashable {
-    let id = UUID()
-    let body: String
-}
-
-struct LogEntry: Identifiable {
-    let id = UUID()
-    let text: String
-    let isSuccess: Bool
-    let time = Date()
-}
+struct ParsedMessage: Identifiable, Hashable { let id = UUID(); let body: String }
+struct LogEntry: Identifiable { let id = UUID(); let text: String; let isSuccess: Bool }

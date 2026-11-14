@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>SpamDiscord</string>
     <key>CFBundleIdentifier</key>
-    <string>com.tenban.spamdiscord</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -18,12 +18,10 @@
     <string>1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <!-- Khai báo quyền đọc file txt -->
     <key>UIFileSharingEnabled</key>
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
-    <!-- Bắt buộc phải có để app hiển thị dạng full screen -->
     <key>UILaunchScreen</key>
     <dict/>
 </dict>

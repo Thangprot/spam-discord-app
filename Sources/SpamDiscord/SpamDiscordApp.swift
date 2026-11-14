@@ -7,11 +7,9 @@ struct SpamDiscordApp: App {
     var body: some Scene {
         WindowGroup {
             if app.me != nil {
-                GuildListView()
-                    .environmentObject(app)
+                GuildListView().environmentObject(app)
             } else {
-                LoginView()
-                    .environmentObject(app)
+                LoginView().environmentObject(app)
             }
         }
     }

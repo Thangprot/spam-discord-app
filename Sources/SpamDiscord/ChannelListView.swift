@@ -9,14 +9,11 @@ struct ChannelListView: View {
             if app.isLoading { ProgressView() }
             else {
                 List {
-                    ForEach(app.groupedChannels(), id: \.category?.id) { section in
-                        Section(header: Text(section.category?.displayName.uppercased() ?? "KHÔNG PHÂN LOẠI")) {
-                            ForEach(section.items) { channel in
-                                NavigationLink(value: channel) {
-                                    HStack {
-                                        Image(systemName: channel.type == 5 ? "megaphone" : "number")
-                                        Text(channel.displayName)
-                                    }
+                    ForEach(app.groupedChannels(), id: \.category?.id) { sec in
+                        Section(header: Text(sec.category?.displayName.uppercased() ?? "KHÁC")) {
+                            ForEach(sec.items) { c in
+                                NavigationLink(value: c) {
+                                    HStack { Image(systemName: c.type == 5 ? "megaphone" : "number"); Text(c.displayName) }
                                 }
                             }
                         }
@@ -26,8 +23,6 @@ struct ChannelListView: View {
         }
         .navigationTitle(guild.name)
         .task { await app.loadChannels(for: guild) }
-        .navigationDestination(for: Channel.self) { channel in
-            SendView(channel: channel)
-        }
+        .navigationDestination(for: Channel.self) { SendView(channel: $0) }
     }
 }
