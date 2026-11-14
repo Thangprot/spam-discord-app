@@ -6,6 +6,20 @@ options:
 settings:
   base:
     PRODUCT_BUNDLE_IDENTIFIER: com.tenban.spamdiscord
+    # Chỉ định rõ phiên bản Swift để tránh xung đột
+    SWIFT_VERSION: "5.0"
+    # Vô hiệu hóa Xcode Previews trong môi trường CI/CD
+    ENABLE_PREVIEWS: NO
+    # Tắt chế độ biên dịch hàng loạt để tránh lỗi biên dịch ngầm định
+    SWIFT_ENABLE_BATCH_MODE: NO
+    # Đảm bảo cấu hình kiến trúc ổn định
+    ONLY_ACTIVE_ARCH: NO
+    VALID_ARCHS: "arm64"
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: arm64
+  configs:
+    Release:
+      # Đặt mức tối ưu hóa rõ ràng cho cấu hình Release
+      SWIFT_OPTIMIZATION_LEVEL: "-O"
 targets:
   SpamDiscord:
     type: application
@@ -14,4 +28,4 @@ targets:
       - path: Sources/SpamDiscord
     settings:
       base:
-        INFOPLIST_FILE: info.plist # Sử dụng file info.plist bạn đã có
+        INFOPLIST_FILE: info.plist
