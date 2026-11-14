@@ -223,55 +223,21 @@ class AppState: ObservableObject {
         isCheckingToken = false
     }
     
-    // ==========================================
-    // FIX: addTokensFromFile — đọc được mọi bảng mã + iCloud
-    // ==========================================
     func addTokensFromFile(url: URL) async {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-
-        // Kích hoạt tải file iCloud Drive về máy (nếu có)
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-
-        var fileData: Data?
-        let coordinator = NSFileCoordinator()
-        var coordErr: NSError?
-        coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
-            fileData = try? Data(contentsOf: newURL)
-        }
-        if fileData == nil {
-            fileData = try? Data(contentsOf: url)
-        }
-
-        guard let data = fileData else {
-            lastError = "Không thể đọc file token."
-            return
-        }
-
-        let encodings: [String.Encoding] = [
-            .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
-            .windowsCP1252, .isoLatin1, .ascii
-        ]
-        var content: String?
-        for enc in encodings {
-            if let s = String(data: data, encoding: enc), !s.isEmpty {
-                content = s
-                break
+        
+        var content = ""
+        if let c = try? String(contentsOf: url, encoding: .utf8) { content = c }
+        else if let c = try? String(contentsOf: url, encoding: .utf16) { content = c }
+        else if let c = try? String(contentsOf: url, encoding: .isoLatin1) { content = c }
+        
+        if !content.isEmpty {
+            let lines = content.components(separatedBy: .newlines)
+            for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                await addToken(line)
             }
         }
-        if content == nil { content = String(decoding: data, as: UTF8.self) }
-
-        guard let text = content, !text.isEmpty else {
-            lastError = "File token rỗng hoặc sai định dạng."
-            return
-        }
-
-        let cleaned = text.replacingOccurrences(of: "\u{FEFF}", with: "")
-        let lines = cleaned.components(separatedBy: .newlines)
-        for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            await addToken(line)
-        }
-        lastError = nil
     }
     
     func setActiveToken(_ token: TokenInfo) {
@@ -319,79 +285,54 @@ class AppState: ObservableObject {
     }
     
     // ==========================================
-    // FIX TRIỆT ĐỂ LỖI ĐỌC FILE TXT
+    // FIX TRIỆT ĐỂ: COPY FILE VÀO APP TRƯỚC KHI ĐỌC
     // ==========================================
     func parseFile(url: URL) {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-
-        // Kích hoạt tải file iCloud Drive về máy (nếu có)
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-
-        var fileData: Data?
-        var readErr: String?
-
-        // Cách 1: NSFileCoordinator (hỗ trợ iCloud / file provider)
-        let coordinator = NSFileCoordinator()
-        var coordErr: NSError?
-        coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
-            do {
-                fileData = try Data(contentsOf: newURL)
-            } catch {
-                readErr = error.localizedDescription
+        
+        // 1. Tạo đường dẫn file tạm trong Sandbox của App
+        let tempDir = FileManager.default.temporaryDirectory
+        let tempURL = tempDir.appendingPathComponent("import_\(UUID().uuidString).txt")
+        
+        do {
+            // 2. Copy file từ iCloud/Files vào Sandbox của App
+            try? FileManager.default.removeItem(at: tempURL)
+            try FileManager.default.copyItem(at: url, to: tempURL)
+            
+            // 3. Đọc dữ liệu từ file tạm (Lúc này không cần Security Scope nữa)
+            let data = try Data(contentsOf: tempURL)
+            
+            // 4. Thử decode với hàng loạt bảng mã phổ biến
+            let encodings: [String.Encoding] = [.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian, .windowsCP1252, .isoLatin1, .ascii]
+            var content: String?
+            
+            for enc in encodings {
+                if let s = String(data: data, encoding: enc), !s.isEmpty {
+                    content = s
+                    break
+                }
             }
-        }
-
-        // Cách 2: Đọc trực tiếp (fallback khi coordinator lỗi)
-        if fileData == nil {
-            do {
-                fileData = try Data(contentsOf: url)
-            } catch {
-                readErr = error.localizedDescription
+            
+            if content == nil { content = String(decoding: data, as: UTF8.self) }
+            
+            guard let finalContent = content, !finalContent.isEmpty else {
+                self.lastError = "File rỗng hoặc không đúng định dạng."
+                return
             }
+            
+            // 5. Xóa BOM và gán
+            let cleaned = finalContent.replacingOccurrences(of: "\u{FEFF}", with: "")
+            self.inputText = cleaned
+            self.parseDirectInput()
+            self.lastError = nil
+            
+            // Xóa file tạm sau khi đọc xong
+            try? FileManager.default.removeItem(at: tempURL)
+            
+        } catch {
+            self.lastError = "Lỗi truy cập file: \(error.localizedDescription)"
         }
-
-        guard let data = fileData else {
-            self.lastError = "Không thể đọc file: \(readErr ?? coordErr?.localizedDescription ?? "Lỗi không xác định")"
-            return
-        }
-
-        // Thử NHIỀU bảng mã (quan trọng với file Windows / UTF-16 không BOM)
-        let encodings: [String.Encoding] = [
-            .utf8,
-            .utf16,               // có BOM
-            .utf16LittleEndian,
-            .utf16BigEndian,
-            .windowsCP1252,       // ANSI / Windows
-            .isoLatin1,
-            .ascii,
-            .nonLossyASCII
-        ]
-
-        var content: String?
-        for enc in encodings {
-            if let s = String(data: data, encoding: enc), !s.isEmpty {
-                content = s
-                break
-            }
-        }
-
-        // Fallback cuối cùng
-        if content == nil || content!.isEmpty {
-            content = String(decoding: data, as: UTF8.self)
-        }
-
-        guard let finalContent = content, !finalContent.isEmpty else {
-            self.lastError = "File rỗng hoặc không đúng định dạng."
-            return
-        }
-
-        // Xoá BOM nếu có (U+FEFF) — gây lỗi khi gửi Discord
-        let cleaned = finalContent.replacingOccurrences(of: "\u{FEFF}", with: "")
-
-        self.inputText = cleaned
-        self.parseDirectInput()
-        self.lastError = nil // Xóa lỗi nếu thành công
     }
     
     func parseDirectInput() {
@@ -575,15 +516,8 @@ struct TokenListView: View {
                 allowedContentTypes: [.item, .plainText, .text, .data],
                 allowsMultipleSelection: false
             ) { res in
-                switch res {
-                case .success(let urls):
-                    guard let url = urls.first else { return }
+                if case .success(let urls) = res, let url = urls.first {
                     Task { await app.addTokensFromFile(url: url) }
-                case .failure(let error):
-                    // Bỏ qua khi user bấm Cancel
-                    let ns = error as NSError
-                    if ns.code == NSUserCancelledError { return }
-                    app.lastError = error.localizedDescription
                 }
             }
             .overlay {
@@ -814,7 +748,6 @@ struct SendView: View {
                         Text("Đang gửi vô hạn...").font(.headline)
                         Text("Tổng đã gửi: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
                         
-                        // Hiển thị tin nhắn đang gửi
                         Text(app.currentMessageStr)
                             .font(.caption)
                             .foregroundStyle(.gray)
@@ -853,7 +786,6 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        // Sử dụng UTType rộng nhất để chọn được mọi file
         .fileImporter(
             isPresented: $showImport,
             allowedContentTypes: [.item, .data, .text, .plainText],
@@ -861,13 +793,11 @@ struct SendView: View {
         ) { res in
             switch res {
             case .success(let urls):
-                guard let url = urls.first else { return }
-                app.parseFile(url: url)
-                if app.lastError != nil {
-                    showErrorAlert = true
+                if let url = urls.first {
+                    app.parseFile(url: url)
+                    if app.lastError != nil { showErrorAlert = true }
                 }
             case .failure(let error):
-                // Bỏ qua khi user bấm Cancel
                 let ns = error as NSError
                 if ns.code == NSUserCancelledError { return }
                 app.lastError = error.localizedDescription
