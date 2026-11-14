@@ -93,7 +93,6 @@ struct NukeGuild: Codable {
     }
 }
 
-// Nuke step types
 enum NukeStepType: String, CaseIterable, Identifiable {
     case massBan = "Mass Ban"
     case deleteChannels = "Xóa kênh"
@@ -113,18 +112,15 @@ enum NukeStepType: String, CaseIterable, Identifiable {
 }
 
 struct NukeConfig {
-    // Order + enable
     var enabledSteps: Set<NukeStepType> = [.createChannels]
     var stepOrder: [NukeStepType] = NukeStepType.allCases
 
-    // Per-function delay (seconds between ops)
     var banDelay: Double = 0.02
     var deleteDelay: Double = 0.05
     var createChDelay: Double = 0.10
     var createRoleDelay: Double = 0.10
     var msgDelay: Double = 0.10
 
-    // Config
     var banRoleId = ""
     var roleName = "Ceker Cute"
     var roleCount = 50
@@ -554,7 +550,6 @@ class UserNukeClient {
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
 
-    // WebSocket fetch
     func fetchMembersWS(guildId: String,
                         onMember: @escaping ([String: Any]) -> Void,
                         onProgress: @escaping (Int) -> Void) async throws {
@@ -910,7 +905,6 @@ class BotManager: ObservableObject {
 // ==========================================
 @MainActor
 class UserNukeManager: ObservableObject {
-    // Tokens stored SEPARATELY from Spam tokens
     @Published var tokens: [TokenInfo] = [] { didSet { saveTokens() } }
     @Published var selectedTokenIds: Set<UUID> = []
     @Published var isImporting = false
@@ -931,7 +925,7 @@ class UserNukeManager: ObservableObject {
     @Published var membersScanned = 0
 
     private var isCancelled = false
-    private let key = "UserNukeTokensV1"  // SEPARATE from SavedTokens
+    private let key = "UserNukeTokensV1"
 
     init() { loadTokens() }
     private func saveTokens() {
@@ -1134,22 +1128,29 @@ class UserNukeManager: ObservableObject {
             let queue = candidates
             let idxBox = IndexBox()
             let delay = options.banDelay
+
+            // ✅ FIX: capture manager tham chiếu để dùng await isCancelled trong closure
+            let manager = self
+
             await withTaskGroup(of: Void.self) { group in
                 for client in clients {
                     group.addTask {
-                        while !self.isCancelled {
+                        while !(await manager.isCancelled) {
                             let i = idxBox.next()
                             if i >= queue.count { break }
                             let uid = queue[i]
                             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
                             do {
                                 try await client.banMember(gid, uid: uid)
-                                await MainActor.run { self.banSuccess += 1 }
-                            } catch { await MainActor.run { self.banFailed += 1 } }
+                                await MainActor.run { manager.banSuccess += 1 }
+                            } catch {
+                                await MainActor.run { manager.banFailed += 1 }
+                            }
                         }
                     }
                 }
             }
+
             log("  Ban xong: \(banSuccess) OK / \(banFailed) FAIL")
         } catch { log("  Lỗi mass ban: \(error.localizedDescription)") }
     }
@@ -1681,7 +1682,7 @@ struct BotGuildListView: View {
 }
 
 // ==========================================
-// MARK: - NUKE OPTIONS (shared)
+// MARK: - NUKE OPTIONS
 // ==========================================
 enum NukeMode { case bot, user }
 
@@ -1851,7 +1852,7 @@ struct NukeOptionsView: View {
 }
 
 // ==========================================
-// MARK: - NUKE RUNNING UI (shared) - no icons in log
+// MARK: - NUKE RUNNING UI
 // ==========================================
 struct NukeRunningUI: View {
     let phase: String
