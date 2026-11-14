@@ -22,7 +22,7 @@ struct TokenInfo: Identifiable, Codable, Equatable {
     var username: String
     var avatarHash: String?
     var isValid: Bool
-
+    
     var avatarURL: URL? {
         guard let hash = avatarHash else { return nil }
         return URL(string: "https://cdn.discordapp.com/avatars/\(userId)/\(hash).png?size=128")
@@ -49,13 +49,13 @@ class BackgroundManager {
     static let shared = BackgroundManager()
     private var audioPlayer: AVAudioPlayer?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
-
+    
     func start() {
         bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.stop() }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
-
+            
             let sampleRate = 8000, duration = 1, numSamples = sampleRate * duration, dataSize = numSamples * 2
             var header = Data()
             header.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
@@ -79,13 +79,13 @@ class BackgroundManager {
             header.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
             var dataChunkSize = UInt32(dataSize).littleEndian
             header.append(Data(bytes: &dataChunkSize, count: 4))
-
+            
             audioPlayer = try AVAudioPlayer(data: header + Data(repeating: 0, count: dataSize))
             audioPlayer?.numberOfLoops = -1
             audioPlayer?.play()
         } catch {}
     }
-
+    
     func stop() {
         audioPlayer?.stop(); audioPlayer = nil
         if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid }
@@ -98,7 +98,7 @@ class BackgroundManager {
 class DiscordClient {
     let token: String
     let session: URLSession
-
+    
     init(token: String) {
         self.token = token
         let config = URLSessionConfiguration.default
@@ -112,34 +112,34 @@ class DiscordClient {
         ]
         self.session = URLSession(configuration: config)
     }
-
+    
     private func check(_ res: URLResponse, _ data: Data) throws {
         guard let http = res as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw NSError(domain: "Discord", code: (res as? HTTPURLResponse)?.statusCode ?? 0, userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? ""])
         }
     }
-
+    
     func validateToken() async throws -> DiscordUser {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me")!)
         try check(r, d); return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
-
+    
     func getAllGuilds() async throws -> [Guild] {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me/guilds")!)
         try check(r, d); return try JSONDecoder().decode([Guild].self, from: d)
     }
-
+    
     func getAllChannels(guildId: String) async throws -> [Channel] {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
-
+    
     func sendMessage(channelId: String, content: String) async throws {
         var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(channelId)/messages")!)
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req)
-
+        
         if let http = r as? HTTPURLResponse, http.statusCode == 429,
            let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
            let retry = json["retry_after"] as? Double {
@@ -155,52 +155,40 @@ class DiscordClient {
 // ==========================================
 @MainActor
 class AppState: ObservableObject {
-    // Token Management
     @Published var tokens: [TokenInfo] = [] { didSet { saveTokens() } }
     @Published var activeToken: TokenInfo? = nil
     @Published var isCheckingToken = false
-
-    // Spam State
+    
     @Published var guilds: [Guild] = []
     @Published var channels: [Channel] = []
     @Published var isLoading = false
-
-    // Config
+    
     @Published var delaySeconds: Double = 2.0
     @Published var useTag: Bool = true
     @Published var targetUserId = ""
-    @Published var addPrefix: Bool = false // >
-    @Published var addSuffix: Bool = false // #
-
-    // Content
+    @Published var addPrefix: Bool = false
+    @Published var addSuffix: Bool = false
+    
     @Published var inputText = ""
     @Published var messages: [ParsedMessage] = []
-
-    // Sending Status
+    
     @Published var isSending = false
     @Published var totalSent = 0
     @Published var currentMessageStr = ""
     @Published var lastError: String?
-
-    // ===== SHARE FILE STATE =====
-    @Published var pendingSharedFileURL: URL? = nil
-    @Published var showShareChoice: Bool = false
-    @Published var sharedFileError: String? = nil
-    /// 0 = Spam tab, 1 = Tokens tab — dùng để tự chuyển tab sau khi xử lý file
-    @Published var requestedTab: Int? = nil
-
+    
     private var client: DiscordClient? { activeToken != nil ? DiscordClient(token: activeToken!.token) : nil }
     private var isCancelled = false
-
+    
     init() { loadTokens() }
-
+    
     // --- TOKEN LOGIC ---
     private func saveTokens() {
         if let encoded = try? JSONEncoder().encode(tokens) {
             UserDefaults.standard.set(encoded, forKey: "SavedTokens")
         }
     }
-
+    
     private func loadTokens() {
         if let data = UserDefaults.standard.data(forKey: "SavedTokens"),
            let saved = try? JSONDecoder().decode([TokenInfo].self, from: data) {
@@ -211,11 +199,11 @@ class AppState: ObservableObject {
             }
         }
     }
-
+    
     func addToken(_ tokenStr: String) async {
         let cleanToken = tokenStr.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanToken.isEmpty, !tokens.contains(where: { $0.token == cleanToken }) else { return }
-
+        
         isCheckingToken = true
         let tempClient = DiscordClient(token: cleanToken)
         do {
@@ -229,63 +217,128 @@ class AppState: ObservableObject {
         }
         isCheckingToken = false
     }
-
-    // Đọc token từ file (dùng chung cho chia sẻ file)
-    func addTokensFromFile(url: URL) async {
-        let gotAccess = url.startAccessingSecurityScopedResource()
-        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-
+    
+    // ==========================================
+    // FILE HELPERS (DÙNG CHUNG)
+    // ==========================================
+    /// Chờ iCloud tải file về máy (tối đa ~15s)
+    private func waitForICloudDownload(url: URL) async {
+        // Yêu cầu tải
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-
+        
+        // Nếu không phải iCloud item → trả về ngay
+        if let v = try? url.resourceValues(forKeys: [.isUbiquitousItemKey]),
+           v.isUbiquitousItem == false {
+            return
+        }
+        
+        // Poll cho đến khi file sẵn sàng
+        for _ in 0..<30 {
+            if let values = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey, .isUbiquitousItemKey]) {
+                if values.isUbiquitousItem != true { return }
+                if values.ubiquitousItemDownloadingStatus == .current { return }
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
+        }
+    }
+    
+    /// Đọc data thô từ URL, dùng NSFileCoordinator + fallback
+    private func readFileData(url: URL) -> (Data?, String?) {
         var fileData: Data?
+        var firstError: String?
+        
         let coordinator = NSFileCoordinator()
         var coordErr: NSError?
         coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
-            fileData = try? Data(contentsOf: newURL)
+            do { fileData = try Data(contentsOf: newURL) }
+            catch { firstError = error.localizedDescription }
         }
-        if fileData == nil { fileData = try? Data(contentsOf: url) }
-
-        guard let data = fileData else {
-            lastError = "Không thể đọc file token."
+        
+        if fileData == nil {
+            do { fileData = try Data(contentsOf: url) }
+            catch { firstError = firstError ?? error.localizedDescription }
+        }
+        
+        return (fileData, firstError ?? coordErr?.localizedDescription)
+    }
+    
+    /// Decode data thành String, thử nhiều bảng mã
+    private func decodeText(_ data: Data) -> String? {
+        let encodings: [String.Encoding] = [
+            .utf8,
+            .utf16,
+            .utf16LittleEndian,
+            .utf16BigEndian,
+            .windowsCP1252,
+            .isoLatin1,
+            .ascii,
+            .nonLossyASCII
+        ]
+        for enc in encodings {
+            if let s = String(data: data, encoding: enc), !s.isEmpty {
+                return s
+            }
+        }
+        let fallback = String(decoding: data, as: UTF8.self)
+        return fallback.isEmpty ? nil : fallback
+    }
+    
+    // ==========================================
+    // IMPORT TOKENS TỪ FILE
+    // ==========================================
+    func addTokensFromFile(url: URL) async {
+        // Giữ security scope (ref-counted, an toàn khi gọi nhiều lần)
+        let scope = url.startAccessingSecurityScopedResource()
+        defer { if scope { url.stopAccessingSecurityScopedResource() } }
+        
+        await waitForICloudDownload(url: url)
+        
+        let (data, err) = readFileData(url: url)
+        guard let data = data, !data.isEmpty else {
+            lastError = "Không thể đọc file token: \(err ?? "Lỗi không xác định")"
             return
         }
-
-        let encodings: [String.Encoding] = [
-            .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
-            .windowsCP1252, .isoLatin1, .ascii
-        ]
-        var content: String?
-        for enc in encodings {
-            if let s = String(data: data, encoding: enc), !s.isEmpty { content = s; break }
-        }
-        if content == nil { content = String(decoding: data, as: UTF8.self) }
-
-        guard let text = content, !text.isEmpty else {
+        
+        guard let raw = decodeText(data) else {
             lastError = "File token rỗng hoặc sai định dạng."
             return
         }
-
-        let cleaned = text.replacingOccurrences(of: "\u{FEFF}", with: "")
-        let lines = cleaned.components(separatedBy: .newlines)
-        for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            await addToken(line)
+        
+        // Xoá BOM + CRLF
+        let cleaned = raw
+            .replacingOccurrences(of: "\u{FEFF}", with: "")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        
+        let lines = cleaned.components(separatedBy: "\n")
+        var addedCount = 0
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            await addToken(trimmed)
+            addedCount += 1
         }
-        lastError = nil
+        
+        if addedCount == 0 {
+            lastError = "File không chứa token hợp lệ nào."
+        } else {
+            lastError = nil
+        }
     }
-
+    
     func setActiveToken(_ token: TokenInfo) {
         guard token.isValid else { return }
         activeToken = token
         Task { await loadGuilds() }
     }
-
+    
     func deleteToken(at offsets: IndexSet) {
         if let active = activeToken, offsets.map({ tokens[$0] }).contains(where: { $0.id == active.id }) {
             activeToken = nil; guilds = []
         }
         tokens.remove(atOffsets: offsets)
     }
-
+    
     // --- SPAM LOGIC ---
     func loadGuilds() async {
         guard let client = client else { return }
@@ -295,17 +348,18 @@ class AppState: ObservableObject {
         } catch { lastError = error.localizedDescription }
         isLoading = false
     }
-
+    
     func loadChannels(for guild: Guild) async {
         guard let client = client else { return }
         isLoading = true
         do {
             let all = try await client.getAllChannels(guildId: guild.id)
-            self.channels = all.filter { $0.isSendableText || $0.isCategory }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+            self.channels = all.filter { $0.isSendableText || $0.isCategory }
+                .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         } catch { lastError = error.localizedDescription }
         isLoading = false
     }
-
+    
     func groupedChannels() -> [(category: Channel?, items: [Channel])] {
         var secs: [(Channel?, [Channel])] = []
         let orp = channels.filter { $0.isSendableText && $0.parentId == nil }
@@ -316,92 +370,71 @@ class AppState: ObservableObject {
         }
         return secs
     }
-
+    
+    // ==========================================
+    // IMPORT NỘI DUNG TIN NHẮN (SYNC)
+    // ==========================================
     func parseFile(url: URL) {
-        let gotAccess = url.startAccessingSecurityScopedResource()
-        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-
-        var fileData: Data?
-        var readErr: String?
-
-        let coordinator = NSFileCoordinator()
-        var coordErr: NSError?
-        coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
-            do { fileData = try Data(contentsOf: newURL) }
-            catch { readErr = error.localizedDescription }
-        }
-
-        if fileData == nil {
-            do { fileData = try Data(contentsOf: url) }
-            catch { readErr = error.localizedDescription }
-        }
-
-        guard let data = fileData else {
-            self.lastError = "Không thể đọc file: \(readErr ?? coordErr?.localizedDescription ?? "Lỗi không xác định")"
+        // Giữ security scope (ref-counted)
+        let scope = url.startAccessingSecurityScopedResource()
+        defer { if scope { url.stopAccessingSecurityScopedResource() } }
+        
+        let (data, err) = readFileData(url: url)
+        guard let data = data, !data.isEmpty else {
+            self.lastError = "Không thể đọc file: \(err ?? "Lỗi không xác định")"
             return
         }
-
-        let encodings: [String.Encoding] = [
-            .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
-            .windowsCP1252, .isoLatin1, .ascii, .nonLossyASCII
-        ]
-
-        var content: String?
-        for enc in encodings {
-            if let s = String(data: data, encoding: enc), !s.isEmpty { content = s; break }
-        }
-        if content == nil || content!.isEmpty {
-            content = String(decoding: data, as: UTF8.self)
-        }
-
-        guard let finalContent = content, !finalContent.isEmpty else {
+        
+        guard let raw = decodeText(data) else {
             self.lastError = "File rỗng hoặc không đúng định dạng."
             return
         }
-
-        let cleaned = finalContent.replacingOccurrences(of: "\u{FEFF}", with: "")
+        
+        let cleaned = raw
+            .replacingOccurrences(of: "\u{FEFF}", with: "")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        
         self.inputText = cleaned
         self.parseDirectInput()
         self.lastError = nil
     }
-
+    
     func parseDirectInput() {
         messages = inputText.components(separatedBy: .newlines).compactMap {
             let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? nil : ParsedMessage(body: t)
         }
     }
-
+    
     func startSending(channel: Channel) {
         guard let client = client, !messages.isEmpty else { return }
         if useTag && targetUserId.isEmpty { return }
-
+        
         isSending = true; isCancelled = false; totalSent = 0; lastError = nil
         BackgroundManager.shared.start()
-
+        
         Task {
             var currentIndex = 0
             while !isCancelled {
                 let msg = messages[currentIndex]
-
+                
                 var prefix = ""
                 if addPrefix { prefix += "> " }
                 if addSuffix { prefix += "# " }
-
+                
                 var finalContent = prefix + msg.body
                 if useTag { finalContent += " <@\(targetUserId)>" }
-
+                
                 currentMessageStr = finalContent
-
+                
                 do {
                     try await client.sendMessage(channelId: channel.id, content: finalContent)
                     totalSent += 1
                 } catch {
                     lastError = error.localizedDescription
                 }
-
+                
                 currentIndex = (currentIndex + 1) % messages.count
                 let actualDelay = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
                 try? await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
@@ -409,48 +442,14 @@ class AppState: ObservableObject {
             isSending = false; currentMessageStr = ""
         }
     }
-
+    
     func stopSending() {
         isCancelled = true; isSending = false
         BackgroundManager.shared.stop()
     }
-
+    
     func hideKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-    }
-
-    // ==========================================
-    // MARK: - SHARE FILE HANDLERS
-    // ==========================================
-    /// Được gọi từ onOpenURL khi người dùng share file từ Files / app khác.
-    func handleIncomingFile(url: URL) {
-        guard url.isFileURL else { return }
-        pendingSharedFileURL = url
-        showShareChoice = true
-    }
-
-    /// Người dùng chọn "Đăng nhập" → thêm file như danh sách token.
-    func processSharedFileAsToken(url: URL) async {
-        await addTokensFromFile(url: url)
-        if let err = lastError {
-            sharedFileError = err
-        } else {
-            requestedTab = 1   // chuyển sang tab Tokens
-        }
-    }
-
-    /// Người dùng chọn "Thêm vào nội dung Spam" → nạp file vào TextEditor.
-    func processSharedFileAsContent(url: URL) {
-        parseFile(url: url)
-        if let err = lastError {
-            sharedFileError = err
-        } else {
-            requestedTab = 0   // chuyển sang tab Spam
-        }
-    }
-
-    func cancelSharedFile() {
-        pendingSharedFileURL = nil
     }
 }
 
@@ -462,75 +461,20 @@ struct SpamDiscordApp: App {
     @StateObject private var app = AppState()
     var body: some Scene {
         WindowGroup {
-            MainTabView()
-                .environmentObject(app)
-                // Nhận file khi người dùng share/copy-to-app từ Files hoặc app khác
-                .onOpenURL { url in
-                    Task { @MainActor in
-                        app.handleIncomingFile(url: url)
-                    }
-                }
+            MainTabView().environmentObject(app)
         }
     }
 }
 
 struct MainTabView: View {
-    @EnvironmentObject var app: AppState
-    @State private var selectedTab = 0
-
     var body: some View {
-        TabView(selection: $selectedTab) {
+        TabView {
             SpamView()
                 .tabItem { Label("Spam", systemImage: "paperplane.fill") }
-                .tag(0)
-
             TokenListView()
                 .tabItem { Label("Tokens", systemImage: "person.2.fill") }
-                .tag(1)
         }
         .tint(.indigo)
-        // Hỏi người dùng muốn xử lý file được chia sẻ như thế nào
-        .confirmationDialog(
-            "File được chia sẻ",
-            isPresented: $app.showShareChoice,
-            titleVisibility: .visible
-        ) {
-            Button("Đăng nhập (thêm Token)") {
-                let url = app.pendingSharedFileURL
-                app.cancelSharedFile()
-                if let url = url {
-                    Task { await app.processSharedFileAsToken(url: url) }
-                }
-            }
-            Button("Thêm vào nội dung Spam") {
-                let url = app.pendingSharedFileURL
-                app.cancelSharedFile()
-                if let url = url {
-                    app.processSharedFileAsContent(url: url)
-                }
-            }
-            Button("Huỷ", role: .cancel) {
-                app.cancelSharedFile()
-            }
-        } message: {
-            Text("Bạn muốn xử lý file này như thế nào?")
-        }
-        // Tự động chuyển tab sau khi xử lý file
-        .onChange(of: app.requestedTab) { tab in
-            if let tab = tab {
-                selectedTab = tab
-                app.requestedTab = nil
-            }
-        }
-        // Báo lỗi nếu đọc file thất bại
-        .alert("Lỗi xử lý file", isPresented: Binding(
-            get: { app.sharedFileError != nil },
-            set: { if !$0 { app.sharedFileError = nil } }
-        )) {
-            Button("OK", role: .cancel) { app.sharedFileError = nil }
-        } message: {
-            Text(app.sharedFileError ?? "")
-        }
     }
 }
 
@@ -541,7 +485,7 @@ struct EmptyStateView: View {
     let title: String
     let systemImage: String
     let description: String
-
+    
     var body: some View {
         VStack(spacing: 15) {
             Image(systemName: systemImage)
@@ -566,16 +510,14 @@ struct EmptyStateView: View {
 struct TokenListView: View {
     @EnvironmentObject var app: AppState
     @State private var showAddSheet = false
-
+    @State private var showImport = false
+    @State private var showErrorAlert = false
+    
     var body: some View {
         NavigationStack {
             Group {
                 if app.tokens.isEmpty {
-                    EmptyStateView(
-                        title: "Chưa có Token",
-                        systemImage: "key.slash",
-                        description: "Thêm token bằng tay, hoặc chia sẻ file .txt từ Files / app khác tới app này để nhập hàng loạt."
-                    )
+                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash", description: "Vui lòng thêm token để sử dụng app.")
                 } else {
                     List {
                         Section(header: Text("Danh sách tài khoản")) {
@@ -596,16 +538,16 @@ struct TokenListView: View {
                                             Image(systemName: "person.circle.fill")
                                                 .resizable().frame(width: 45, height: 45).foregroundStyle(.gray)
                                         }
-
+                                        
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(token.username).font(.headline)
                                             Text(token.isValid ? "Live" : "Die")
                                                 .font(.caption).bold()
                                                 .foregroundStyle(token.isValid ? .green : .red)
                                         }
-
+                                        
                                         Spacer()
-
+                                        
                                         if app.activeToken?.id == token.id {
                                             Image(systemName: "checkmark.circle.fill")
                                                 .foregroundStyle(.indigo)
@@ -619,29 +561,48 @@ struct TokenListView: View {
                             }
                             .onDelete(perform: app.deleteToken)
                         }
-
-                        Section {
-                            Label(
-                                "Mẹo: Chia sẻ file .txt từ Files → Copy to \"\(Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String ?? "App")\" để nhập token hàng loạt.",
-                                systemImage: "square.and.arrow.down.on.square"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
                     }
                 }
             }
             .navigationTitle("Quản lý Token")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showAddSheet = true
+                    Menu {
+                        Button("Thêm bằng tay", systemImage: "keyboard") { showAddSheet = true }
+                        Button("Nhập từ File .txt", systemImage: "doc.text") { showImport = true }
                     } label: {
                         Image(systemName: "plus.circle.fill").font(.title3)
                     }
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
+            .fileImporter(
+                isPresented: $showImport,
+                allowedContentTypes: [.plainText, .text, .data, .item],
+                allowsMultipleSelection: false
+            ) { res in
+                switch res {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    // ⚠️ QUAN TRỌNG: giữ security scope mở xuyên suốt task async
+                    let scope = url.startAccessingSecurityScopedResource()
+                    Task {
+                        await app.addTokensFromFile(url: url)
+                        if scope { url.stopAccessingSecurityScopedResource() }
+                        if app.lastError != nil { showErrorAlert = true }
+                    }
+                case .failure(let error):
+                    let ns = error as NSError
+                    if ns.code == NSUserCancelledError { return }
+                    app.lastError = error.localizedDescription
+                    showErrorAlert = true
+                }
+            }
+            .alert("Lỗi Import Token", isPresented: $showErrorAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(app.lastError ?? "Không thể đọc file.")
+            }
             .overlay {
                 if app.isCheckingToken {
                     ProgressView("Đang check Token...")
@@ -657,7 +618,7 @@ struct AddTokenSheet: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) var dismiss
     @State private var tokenInput = ""
-
+    
     var body: some View {
         NavigationStack {
             Form {
@@ -690,11 +651,11 @@ struct AddTokenSheet: View {
 struct SpamView: View {
     @EnvironmentObject var app: AppState
     @State private var searchText = ""
-
+    
     var filteredGuilds: [Guild] {
         searchText.isEmpty ? app.guilds : app.guilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-
+    
     var body: some View {
         NavigationStack {
             Group {
@@ -730,7 +691,7 @@ struct ChannelListView: View {
     @EnvironmentObject var app: AppState
     let guild: Guild
     @State private var searchText = ""
-
+    
     var filteredSections: [(category: Channel?, items: [Channel])] {
         let sections = app.groupedChannels()
         if searchText.isEmpty { return sections }
@@ -739,7 +700,7 @@ struct ChannelListView: View {
             return filteredItems.isEmpty ? nil : (section.category, filteredItems)
         }
     }
-
+    
     var body: some View {
         Group {
             if app.isLoading { ProgressView() }
@@ -770,7 +731,9 @@ struct ChannelListView: View {
 struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
-
+    @State private var showImport = false
+    @State private var showErrorAlert = false
+    
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
@@ -786,11 +749,11 @@ struct SendView: View {
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
-
+                
                 // 2. Cấu hình gửi
                 VStack(alignment: .leading, spacing: 15) {
                     Text("CẤU HÌNH").font(.caption).bold().foregroundStyle(.secondary)
-
+                    
                     Toggle("Tag User ID", isOn: $app.useTag)
                         .tint(.indigo)
                     if app.useTag {
@@ -800,16 +763,16 @@ struct SendView: View {
                             .background(Color(UIColor.tertiarySystemBackground))
                             .cornerRadius(8)
                     }
-
+                    
                     Divider()
-
+                    
                     HStack {
                         Toggle("Thêm '>'", isOn: $app.addPrefix).tint(.indigo)
                         Toggle("Thêm '#'", isOn: $app.addSuffix).tint(.indigo)
                     }
-
+                    
                     Divider()
-
+                    
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Delay:")
@@ -824,11 +787,18 @@ struct SendView: View {
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
-
+                
                 // 3. Nội dung tin nhắn
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
-
+                    HStack {
+                        Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
+                        Spacer()
+                        Button(action: { showImport = true }) {
+                            Label("Import File", systemImage: "doc.badge.plus")
+                                .font(.caption).bold()
+                        }
+                    }
+                    
                     ZStack(alignment: .topTrailing) {
                         TextEditor(text: $app.inputText)
                             .frame(minHeight: 150)
@@ -836,7 +806,7 @@ struct SendView: View {
                             .background(Color(UIColor.tertiarySystemBackground))
                             .cornerRadius(10)
                             .onChange(of: app.inputText) { _ in app.parseDirectInput() }
-
+                        
                         if !app.inputText.isEmpty {
                             Button(action: { app.inputText = ""; app.parseDirectInput() }) {
                                 Image(systemName: "xmark.circle.fill")
@@ -845,38 +815,33 @@ struct SendView: View {
                             }
                         }
                     }
-
+                    
                     if !app.messages.isEmpty {
                         Text("Đã nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
                     }
-
-                    Text("Mẹo: Chia sẻ file .txt từ Files → Copy to \"\(Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String ?? "App")\" để nạp nội dung tự động.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 4)
                 }
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
-
+                
                 // 4. Trạng thái và Nút bấm
                 if app.isSending {
                     VStack(spacing: 15) {
                         ProgressView().scaleEffect(1.5).tint(.indigo).padding(.top)
                         Text("Đang gửi vô hạn...").font(.headline)
                         Text("Tổng đã gửi: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
-
+                        
                         Text(app.currentMessageStr)
                             .font(.caption)
                             .foregroundStyle(.gray)
                             .lineLimit(2)
                             .padding(.horizontal)
                             .multilineTextAlignment(.center)
-
+                        
                         if let error = app.lastError {
                             Text(error).font(.caption).foregroundStyle(.red)
                         }
-
+                        
                         Button(action: { app.stopSending() }) {
                             Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
                         }
@@ -904,5 +869,30 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
+        .fileImporter(
+            isPresented: $showImport,
+            allowedContentTypes: [.plainText, .text, .data, .item],
+            allowsMultipleSelection: false
+        ) { res in
+            switch res {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                // ⚠️ QUAN TRỌNG: giữ scope mở trong lúc đọc file
+                let scope = url.startAccessingSecurityScopedResource()
+                app.parseFile(url: url)
+                if scope { url.stopAccessingSecurityScopedResource() }
+                if app.lastError != nil { showErrorAlert = true }
+            case .failure(let error):
+                let ns = error as NSError
+                if ns.code == NSUserCancelledError { return }
+                app.lastError = error.localizedDescription
+                showErrorAlert = true
+            }
+        }
+        .alert("Lỗi Import File", isPresented: $showErrorAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(app.lastError ?? "Không thể đọc file. Vui lòng thử lại.")
+        }
     }
 }
