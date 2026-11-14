@@ -6,6 +6,28 @@ import UniformTypeIdentifiers
 import UIKit
 
 // ==========================================
+// MARK: - COMPAT MODIFIER (iOS 16 ↔ 17+)
+// ==========================================
+struct OnChangeCompat<V: Equatable>: ViewModifier {
+    let value: V
+    let action: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content.onChange(of: value) { _, _ in action() }
+        } else {
+            content.onChange(of: value) { _ in action() }
+        }
+    }
+}
+
+extension View {
+    func onChangeCompat<V: Equatable>(of value: V, perform action: @escaping () -> Void) -> some View {
+        modifier(OnChangeCompat(value: value, action: action))
+    }
+}
+
+// ==========================================
 // MARK: - MODELS
 // ==========================================
 struct DiscordUser: Codable {
@@ -244,7 +266,6 @@ class AppState: ObservableObject {
                 return s.replacingOccurrences(of: "\u{FEFF}", with: "")
             }
         }
-        // Fallback cuối: decode mềm
         let fallback = String(decoding: data, as: UTF8.self)
         return fallback.isEmpty ? nil : fallback.replacingOccurrences(of: "\u{FEFF}", with: "")
     }
@@ -255,7 +276,6 @@ class AppState: ObservableObject {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
 
-        // Kích hoạt tải iCloud (nếu cần) — không chờ
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
 
         var fileData: Data?
@@ -276,7 +296,7 @@ class AppState: ObservableObject {
     }
 
     // ==========================================
-    // NHẬP TOKEN TỪ DATA (gọi sau khi đọc file xong)
+    // NHẬP TOKEN TỪ DATA
     // ==========================================
     func addTokensFromData(_ data: Data) async {
         guard let text = Self.decodeFileData(data), !text.isEmpty else {
@@ -298,7 +318,7 @@ class AppState: ObservableObject {
         }
     }
 
-    /// Giữ API cũ (nếu chỗ khác còn gọi). Bên trong sẽ tự đọc đồng bộ rồi xử lý.
+    /// API cũ — tự đọc file rồi xử lý
     func addTokensFromFile(url: URL) async {
         guard let data = Self.readFileData(from: url) else {
             lastError = "Không thể đọc file token. Kiểm tra file đã tải về máy chưa."
@@ -554,7 +574,6 @@ struct TokenListView: View {
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            // ✅ FIX: đọc file ĐỒNG BỘ trong callback, rồi mới Task
             .fileImporter(
                 isPresented: $showImport,
                 allowedContentTypes: [.item, .content, .data, .text, .plainText],
@@ -783,7 +802,8 @@ struct SendView: View {
                             .padding(8)
                             .background(Color(UIColor.tertiarySystemBackground))
                             .cornerRadius(10)
-                            .onChange(of: app.inputText) { _, _ in app.parseDirectInput() }
+                            // ✅ FIX iOS 16: dùng compat modifier
+                            .onChangeCompat(of: app.inputText) { app.parseDirectInput() }
 
                         if !app.inputText.isEmpty {
                             Button(action: { app.inputText = ""; app.parseDirectInput() }) {
@@ -847,7 +867,6 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        // ✅ FIX: đọc file ĐỒNG BỘ trong callback
         .fileImporter(
             isPresented: $showImport,
             allowedContentTypes: [.item, .content, .data, .text, .plainText],
