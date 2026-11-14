@@ -224,25 +224,14 @@ class AppState: ObservableObject {
     }
     
     func addTokensFromFile(url: URL) async {
-        let gotAccess = url.startAccessingSecurityScopedResource()
-        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
+        guard url.startAccessingSecurityScopedResource() else { return }
+        defer { url.stopAccessingSecurityScopedResource() }
         
-        let tempDir = FileManager.default.temporaryDirectory
-        let localUrl = tempDir.appendingPathComponent("temp_tokens.txt")
-        
-        do {
-            try? FileManager.default.removeItem(at: localUrl)
-            try FileManager.default.copyItem(at: url, to: localUrl)
-            let data = try Data(contentsOf: localUrl)
-            
-            var content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) ?? String(decoding: data, as: UTF8.self)
-            
+        if let content = try? String(contentsOf: url, encoding: .utf8) {
             let lines = content.components(separatedBy: .newlines)
             for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 await addToken(line)
             }
-        } catch {
-            lastError = "Lỗi đọc file token: \(error.localizedDescription)"
         }
     }
     
@@ -291,36 +280,50 @@ class AppState: ObservableObject {
     }
     
     // ==========================================
-    // FIX TRIỆT ĐỂ LỖI ĐỌC FILE TXT
+    // FIX TRIỆT ĐỂ LỖI ĐỌC FILE TXT BẰNG NSFileCoordinator
     // ==========================================
     func parseFile(url: URL) {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
         
-        // Bước 1: Copy file ra thư mục tạm của App để tránh lỗi phân quyền / iCloud
-        let tempDir = FileManager.default.temporaryDirectory
-        let localUrl = tempDir.appendingPathComponent("imported_text.txt")
+        var error: NSError?
+        var data: Data?
         
-        do {
-            try? FileManager.default.removeItem(at: localUrl)
-            try FileManager.default.copyItem(at: url, to: localUrl)
-            
-            // Bước 2: Đọc dữ liệu thô
-            let data = try Data(contentsOf: localUrl)
-            
-            // Bước 3: Thử decode với nhiều bảng mã
-            let content = String(data: data, encoding: .utf8) 
-                ?? String(data: data, encoding: .utf16) 
-                ?? String(data: data, encoding: .isoLatin1) 
-                ?? String(decoding: data, as: UTF8.self)
-            
-            // Bước 4: Gán vào biến và xử lý
-            self.inputText = content
-            parseDirectInput()
-            
-        } catch {
-            self.lastError = "Lỗi đọc file: \(error.localizedDescription)"
+        // Sử dụng NSFileCoordinator để ép iOS tải file về máy và cấp quyền đọc
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        coordinator.coordinate(readingItemAt: url, options: [], error: &error) { newURL in
+            do {
+                data = try Data(contentsOf: newURL)
+            } catch {
+                self.lastError = "Lỗi đọc dữ liệu: \(error.localizedDescription)"
+            }
         }
+        
+        if let err = error {
+            self.lastError = "Không thể truy cập file (Lỗi iCloud). Hãy thử tải file về máy trước."
+            print("Coordinator error: \(err)")
+            return
+        }
+        
+        guard let fileData = data else {
+            if self.lastError == nil { self.lastError = "Không có dữ liệu trong file." }
+            return
+        }
+        
+        // Thử decode nhiều bảng mã
+        let content = String(data: fileData, encoding: .utf8) 
+            ?? String(data: fileData, encoding: .utf16) 
+            ?? String(data: fileData, encoding: .isoLatin1) 
+            ?? String(decoding: fileData, as: UTF8.self)
+            
+        if content.isEmpty {
+            self.lastError = "File rỗng hoặc không đúng định dạng."
+            return
+        }
+        
+        self.inputText = content
+        self.parseDirectInput()
+        self.lastError = nil // Xóa lỗi nếu thành công
     }
     
     func parseDirectInput() {
@@ -342,7 +345,6 @@ class AppState: ObservableObject {
             while !isCancelled {
                 let msg = messages[currentIndex]
                 
-                // Logic > và # (Đầu câu)
                 var prefix = ""
                 if addPrefix { prefix += "> " }
                 if addSuffix { prefix += "# " }
@@ -634,6 +636,7 @@ struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
     @State private var showImport = false
+    @State private var showErrorAlert = false
     
     var body: some View {
         ScrollView {
@@ -771,14 +774,26 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        // Mở rộng loại file cho phép chọn để fix triệt để lỗi không chọn được
+        // Sử dụng UTType rộng nhất để chọn được mọi file
         .fileImporter(isPresented: $showImport, allowedContentTypes: [.item, .data, .text, .plainText], allowsMultipleSelection: false) { res in
             switch res {
             case .success(let urls):
-                if let url = urls.first { app.parseFile(url: url) }
+                if let url = urls.first {
+                    app.parseFile(url: url)
+                    if let err = app.lastError {
+                        showErrorAlert = true
+                        app.lastError = err
+                    }
+                }
             case .failure(let error):
-                app.lastError = "Lỗi chọn file: \(error.localizedDescription)"
+                app.lastError = error.localizedDescription
+                showErrorAlert = true
             }
+        }
+        .alert("Lỗi Import File", isPresented: $showErrorAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(app.lastError ?? "Không thể đọc file. Vui lòng thử lại.")
         }
     }
 }
