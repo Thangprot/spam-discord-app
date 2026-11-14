@@ -224,20 +224,25 @@ class AppState: ObservableObject {
     }
     
     func addTokensFromFile(url: URL) async {
-        guard url.startAccessingSecurityScopedResource() else { return }
-        defer { url.stopAccessingSecurityScopedResource() }
+        let gotAccess = url.startAccessingSecurityScopedResource()
+        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
         
-        var content = ""
-        // Thử đọc với UTF-8, nếu lỗi thử với các bảng mã khác (dành cho file từ Windows)
-        if let c = try? String(contentsOf: url, encoding: .utf8) { content = c }
-        else if let c = try? String(contentsOf: url, encoding: .utf16) { content = c }
-        else if let c = try? String(contentsOf: url, encoding: .isoLatin1) { content = c }
+        let tempDir = FileManager.default.temporaryDirectory
+        let localUrl = tempDir.appendingPathComponent("temp_tokens.txt")
         
-        if !content.isEmpty {
+        do {
+            try? FileManager.default.removeItem(at: localUrl)
+            try FileManager.default.copyItem(at: url, to: localUrl)
+            let data = try Data(contentsOf: localUrl)
+            
+            var content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) ?? String(decoding: data, as: UTF8.self)
+            
             let lines = content.components(separatedBy: .newlines)
             for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 await addToken(line)
             }
+        } catch {
+            lastError = "Lỗi đọc file token: \(error.localizedDescription)"
         }
     }
     
@@ -285,23 +290,37 @@ class AppState: ObservableObject {
         return secs
     }
     
+    // ==========================================
+    // FIX TRIỆT ĐỂ LỖI ĐỌC FILE TXT
+    // ==========================================
     func parseFile(url: URL) {
-        guard url.startAccessingSecurityScopedResource() else { return }
-        defer { url.stopAccessingSecurityScopedResource() }
+        let gotAccess = url.startAccessingSecurityScopedResource()
+        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
         
-        var content = ""
-        // FIX LỖI ĐỌC FILE: Thử nhiều bảng mã
-        if let c = try? String(contentsOf: url, encoding: .utf8) { content = c }
-        else if let c = try? String(contentsOf: url, encoding: .utf16) { content = c }
-        else if let c = try? String(contentsOf: url, encoding: .isoLatin1) { content = c }
+        // Bước 1: Copy file ra thư mục tạm của App để tránh lỗi phân quyền / iCloud
+        let tempDir = FileManager.default.temporaryDirectory
+        let localUrl = tempDir.appendingPathComponent("imported_text.txt")
         
-        if content.isEmpty {
-            lastError = "Không thể đọc file. Vui lòng kiểm tra lại định dạng."
-            return
+        do {
+            try? FileManager.default.removeItem(at: localUrl)
+            try FileManager.default.copyItem(at: url, to: localUrl)
+            
+            // Bước 2: Đọc dữ liệu thô
+            let data = try Data(contentsOf: localUrl)
+            
+            // Bước 3: Thử decode với nhiều bảng mã
+            let content = String(data: data, encoding: .utf8) 
+                ?? String(data: data, encoding: .utf16) 
+                ?? String(data: data, encoding: .isoLatin1) 
+                ?? String(decoding: data, as: UTF8.self)
+            
+            // Bước 4: Gán vào biến và xử lý
+            self.inputText = content
+            parseDirectInput()
+            
+        } catch {
+            self.lastError = "Lỗi đọc file: \(error.localizedDescription)"
         }
-        
-        self.inputText = content
-        parseDirectInput()
     }
     
     func parseDirectInput() {
@@ -385,7 +404,7 @@ struct MainTabView: View {
 }
 
 // ==========================================
-// MARK: - EMPTY STATE VIEW (Thay thế cho ContentUnavailableView)
+// MARK: - EMPTY STATE VIEW
 // ==========================================
 struct EmptyStateView: View {
     let title: String
@@ -481,7 +500,7 @@ struct TokenListView: View {
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            .fileImporter(isPresented: $showImport, allowedContentTypes: [.plainText, .text, .item], allowsMultipleSelection: false) { res in
+            .fileImporter(isPresented: $showImport, allowedContentTypes: [.item, .plainText, .text], allowsMultipleSelection: false) { res in
                 if case .success(let urls) = res, let url = urls.first {
                     Task { await app.addTokensFromFile(url: url) }
                 }
@@ -611,9 +630,6 @@ struct ChannelListView: View {
     }
 }
 
-// ==========================================
-// MARK: - NEW SEND VIEW (GIAO DIỆN ĐÃ ĐƯỢC LÀM LẠI)
-// ==========================================
 struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
@@ -755,8 +771,14 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        .fileImporter(isPresented: $showImport, allowedContentTypes: [.plainText, .text, .item], allowsMultipleSelection: false) { res in
-            if case .success(let urls) = res, let url = urls.first { app.parseFile(url: url) }
+        // Mở rộng loại file cho phép chọn để fix triệt để lỗi không chọn được
+        .fileImporter(isPresented: $showImport, allowedContentTypes: [.item, .data, .text, .plainText], allowsMultipleSelection: false) { res in
+            switch res {
+            case .success(let urls):
+                if let url = urls.first { app.parseFile(url: url) }
+            case .failure(let error):
+                app.lastError = "Lỗi chọn file: \(error.localizedDescription)"
+            }
         }
     }
 }
