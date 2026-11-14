@@ -5,8 +5,6 @@ struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
     @State private var showImport = false
-    
-    // Trạng thái chọn nhập liệu: 0 là File, 1 là Trực tiếp
     @State private var inputMode = 1 
     
     var body: some View {
@@ -19,6 +17,7 @@ struct SendView: View {
             }
             
             Section("Tùy chọn Tag") {
+                // Lỗi trước đó nằm ở dòng này, giờ đã có biến useTag trong AppState
                 Toggle("Tag người dùng vào cuối tin nhắn", isOn: $app.useTag)
                 if app.useTag {
                     TextField("Nhập User ID (dãy số)", text: $app.targetUserId)
@@ -33,7 +32,7 @@ struct SendView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: inputMode) { _ in
-                    app.parseDirectInput() // Cập nhật lại danh sách khi đổi chế độ
+                    app.parseDirectInput()
                 }
                 
                 if inputMode == 0 {
@@ -74,7 +73,7 @@ struct SendView: View {
         .navigationTitle("Cấu hình")
         .fileImporter(
             isPresented: $showImport,
-            allowedContentTypes: [UTType.plainText, UTType.text, UTType.item], // Mở rộng loại file để dễ chọn
+            allowedContentTypes: [UTType.plainText, UTType.text, UTType.item],
             allowsMultipleSelection: false
         ) { res in
             switch res {
