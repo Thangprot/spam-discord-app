@@ -169,8 +169,8 @@ class AppState: ObservableObject {
     @Published var delaySeconds: Double = 2.0
     @Published var useTag: Bool = true
     @Published var targetUserId = ""
-    @Published var addPrefix: Bool = false // >
-    @Published var addSuffix: Bool = false // #
+    @Published var addPrefix: Bool = false
+    @Published var addSuffix: Bool = false
     
     // Content
     @Published var inputText = ""
@@ -223,13 +223,43 @@ class AppState: ObservableObject {
         isCheckingToken = false
     }
     
-    // ==========================================
-    // 🔧 HELPER: Đọc text từ Data với mọi bảng mã (FIX BUG UTF-16)
-    // ==========================================
-    private func decodeText(_ data: Data) -> String? {
+    // 🔧 HÀM ĐỌC FILE ĐÃ ĐƯỢC FIX TRIỆT ĐỂ (Không dùng NSFileCoordinator gây treo)
+    nonisolated func readFileContent(url: URL) async throws -> String {
+        let gotAccess = url.startAccessingSecurityScopedResource()
+        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
+        
+        // Xử lý tải file từ iCloud nếu có
+        if FileManager.default.isUbiquitousItem(at: url) {
+            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+            let deadline = Date().addingTimeInterval(15)
+            while Date() < deadline {
+                let status = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]).ubiquitousItemDownloadingStatus
+                if status == .current { break }
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+        }
+        
+        // Đọc file trên Background Thread (Tránh treo UI)
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let data = try Data(contentsOf: url)
+                    guard let text = Self.decodeText(data) else {
+                        continuation.resume(throwing: NSError(domain: "App", code: 0, userInfo: [NSLocalizedDescriptionKey: "Định dạng file không được hỗ trợ."]))
+                        return
+                    }
+                    continuation.resume(returning: text)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+    
+    // Giải mã văn bản thông minh (Hỗ trợ UTF-8, UTF-16, ANSI...)
+    nonisolated static func decodeText(_ data: Data) -> String? {
         guard !data.isEmpty else { return nil }
         
-        // 1. Kiểm tra BOM trước (chính xác nhất)
         if data.count >= 3, data[0] == 0xEF, data[1] == 0xBB, data[2] == 0xBF {
             if let s = String(data: data.dropFirst(3), encoding: .utf8) { return s }
         }
@@ -240,111 +270,34 @@ class AppState: ObservableObject {
             if let s = String(data: data.dropFirst(2), encoding: .utf16BigEndian) { return s }
         }
         
-        // 2. UTF-8 strict (đúng cho phần lớn file .txt hiện đại)
-        if let s = String(data: data, encoding: .utf8) {
-            return s
-        }
+        if let s = String(data: data, encoding: .utf8) { return s }
         
-        // 3. Heuristic cho UTF-16 không BOM — tránh decode nhầm
-        if data.count % 2 == 0 {
-            var nullsOdd = 0, nullsEven = 0
-            for (i, b) in data.enumerated() where b == 0 {
-                if i % 2 == 0 { nullsEven += 1 } else { nullsOdd += 1 }
-            }
-            let threshold = max(4, data.count / 8)
-            if nullsOdd > threshold && nullsOdd > nullsEven,
-               let s = String(data: data, encoding: .utf16LittleEndian) { return s }
-            if nullsEven > threshold && nullsEven > nullsOdd,
-               let s = String(data: data, encoding: .utf16BigEndian) { return s }
-        }
-        
-        // 4. Fallback cho file Windows cũ (ANSI / ISO-8859-1)
         for enc: String.Encoding in [.windowsCP1252, .isoLatin1] {
             if let s = String(data: data, encoding: enc), !s.isEmpty { return s }
         }
-        
-        // 5. Cuối cùng — decode lossy (luôn ra được string, có thể mất ký tự)
         return String(decoding: data, as: UTF8.self)
     }
     
-    // ==========================================
-    // 🔧 HELPER: Chờ iCloud download xong (FIX BUG đọc file nil)
-    // ==========================================
-    private func waitForUbiquitousDownload(_ url: URL, timeout: TimeInterval = 15) async {
-        guard FileManager.default.isUbiquitousItem(at: url) else { return }
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-        
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let status = try? url.resourceValues(
-                forKeys: [.ubiquitousItemDownloadingStatusKey]
-            ).ubiquitousItemDownloadingStatus
-            if status == .current { return }
-            try? await Task.sleep(nanoseconds: 150_000_000) // 150ms
-        }
-    }
-    
-    // ==========================================
-    // 🔧 HELPER: Đọc Data từ URL (an toàn cho sandbox + iCloud)
-    // ==========================================
-    private func readFileData(_ url: URL) -> (Data?, Error?) {
-        // Thử trực tiếp trước (nhanh, ít lỗi với file local)
-        do {
-            let data = try Data(contentsOf: url)
-            return (data, nil)
-        } catch {
-            // Fallback qua NSFileCoordinator (file provider, iCloud Drive)
-            let coordinator = NSFileCoordinator()
-            var coordErr: NSError?
-            var fileData: Data?
-            var readErr: Error? = error
-            coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
-                do {
-                    fileData = try Data(contentsOf: newURL)
-                    readErr = nil
-                } catch {
-                    readErr = error
-                }
-            }
-            if let ce = coordErr, fileData == nil { readErr = ce }
-            return (fileData, readErr)
-        }
-    }
-    
-    // ==========================================
-    // FIX: addTokensFromFile — đọc được mọi bảng mã + iCloud
-    // ==========================================
     func addTokensFromFile(url: URL) async {
-        let gotAccess = url.startAccessingSecurityScopedResource()
-        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-        
-        // Chờ iCloud tải xong
-        await waitForUbiquitousDownload(url)
-        
-        let (data, readErr) = readFileData(url)
-        guard let fileData = data, !fileData.isEmpty else {
-            lastError = "Không đọc được file token: \(readErr?.localizedDescription ?? "file rỗng")"
-            return
-        }
-        
-        guard let text = decodeText(fileData) else {
-            lastError = "Không giải mã được file token. Hãy lưu file dưới dạng UTF-8."
-            return
-        }
-        
-        let cleaned = text.replacingOccurrences(of: "\u{FEFF}", with: "")
-        let lines = cleaned.components(separatedBy: .newlines)
-        var addedCount = 0
-        for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let before = tokens.count
-            await addToken(line)
-            if tokens.count > before { addedCount += 1 }
-        }
-        
-        if addedCount == 0 {
-            lastError = "Không thêm được token nào (có thể đã tồn tại hoặc không hợp lệ)."
-        } else {
-            lastError = nil
+        do {
+            let text = try await readFileContent(url: url)
+            let cleaned = text.replacingOccurrences(of: "\u{FEFF}", with: "")
+            let lines = cleaned.components(separatedBy: .newlines)
+            
+            var addedCount = 0
+            for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let before = tokens.count
+                await addToken(line)
+                if tokens.count > before { addedCount += 1 }
+            }
+            
+            if addedCount == 0 {
+                lastError = "File rỗng hoặc không có Token hợp lệ."
+            } else {
+                lastError = nil
+            }
+        } catch {
+            lastError = "Lỗi đọc file: \(error.localizedDescription)"
         }
     }
     
@@ -392,47 +345,23 @@ class AppState: ObservableObject {
         return secs
     }
     
-    // ==========================================
-    // FIX TRIỆT ĐỂ LỖI ĐỌC FILE TXT
-    // ==========================================
-    func parseFile(url: URL) {
-        let gotAccess = url.startAccessingSecurityScopedResource()
-        defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
-        
-        // iCloud: chờ download xong (dùng synchronous wait cho hàm sync)
-        if FileManager.default.isUbiquitousItem(at: url) {
-            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-            let deadline = Date().addingTimeInterval(15)
-            while Date() < deadline {
-                let status = try? url.resourceValues(
-                    forKeys: [.ubiquitousItemDownloadingStatusKey]
-                ).ubiquitousItemDownloadingStatus
-                if status == .current { break }
-                Thread.sleep(forTimeInterval: 0.15)
+    // Import file tin nhắn (Bất đồng bộ - không treo app)
+    func parseFile(url: URL) async {
+        do {
+            let content = try await readFileContent(url: url)
+            let cleaned = content.replacingOccurrences(of: "\u{FEFF}", with: "")
+            
+            guard !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                self.lastError = "File rỗng hoặc chỉ có khoảng trắng."
+                return
             }
+            
+            self.inputText = cleaned
+            self.parseDirectInput()
+            self.lastError = nil
+        } catch {
+            self.lastError = "Lỗi đọc file: \(error.localizedDescription)"
         }
-        
-        let (data, readErr) = readFileData(url)
-        guard let fileData = data, !fileData.isEmpty else {
-            self.lastError = "Không đọc được file: \(readErr?.localizedDescription ?? "file rỗng")"
-            return
-        }
-        
-        guard let content = decodeText(fileData) else {
-            self.lastError = "Không giải mã được file. Hãy lưu file dưới dạng UTF-8."
-            return
-        }
-        
-        // Xoá BOM nếu còn sót
-        let cleaned = content.replacingOccurrences(of: "\u{FEFF}", with: "")
-        guard !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            self.lastError = "File rỗng hoặc chỉ có khoảng trắng."
-            return
-        }
-        
-        self.inputText = cleaned
-        self.parseDirectInput()
-        self.lastError = nil
     }
     
     func parseDirectInput() {
@@ -612,10 +541,9 @@ struct TokenListView: View {
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            // 🔧 FIX: bỏ .item, dùng [.plainText, .text, .data] để picker show được .txt
             .fileImporter(
                 isPresented: $showImport,
-                allowedContentTypes: [.plainText, .text, .data],
+                allowedContentTypes: [.item], // Mở khoá chọn mọi file
                 allowsMultipleSelection: false
             ) { res in
                 switch res {
@@ -903,17 +831,19 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        // 🔧 FIX: bỏ .item, dùng [.plainText, .text, .data] để picker show được .txt
         .fileImporter(
             isPresented: $showImport,
-            allowedContentTypes: [.plainText, .text, .data],
+            allowedContentTypes: [.item], // Mở khoá chọn mọi file
             allowsMultipleSelection: false
         ) { res in
             switch res {
             case .success(let urls):
                 guard let url = urls.first else { return }
-                app.parseFile(url: url)
-                if app.lastError != nil { showErrorAlert = true }
+                // Bọc trong Task để không treo UI
+                Task {
+                    await app.parseFile(url: url)
+                    if app.lastError != nil { showErrorAlert = true }
+                }
             case .failure(let error):
                 let ns = error as NSError
                 if ns.code == NSUserCancelledError { return }
