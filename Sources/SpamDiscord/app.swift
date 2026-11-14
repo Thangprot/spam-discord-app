@@ -8,8 +8,6 @@ import UIKit
 // ==========================================
 // MARK: - DOCUMENT PICKER (FIX iOS FILE PICKER)
 // ==========================================
-// Dùng UIDocumentPickerViewController thay .fileImporter để tránh bug
-// "bấm vào file không phản hồi" trên iOS 16/17/18 khi trộn .item với UTType con.
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
     let onPick: (URL) -> Void
@@ -26,10 +24,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: contentTypes,
-            asCopy: true
-        )
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
         picker.allowsMultipleSelection = false
         picker.delegate = context.coordinator
         return picker
@@ -40,12 +35,10 @@ struct DocumentPicker: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let parent: DocumentPicker
         init(_ parent: DocumentPicker) { self.parent = parent }
-
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
             parent.onPick(url)
         }
-
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
             parent.onCancel?()
         }
@@ -152,7 +145,7 @@ struct NukeConfig {
 }
 
 // ==========================================
-// MARK: - SILENT AUDIO (CHẠY NGẦM)
+// MARK: - SILENT AUDIO
 // ==========================================
 class BackgroundManager {
     static let shared = BackgroundManager()
@@ -202,7 +195,7 @@ class BackgroundManager {
 }
 
 // ==========================================
-// MARK: - DISCORD CLIENT (SPAM, user token)
+// MARK: - DISCORD CLIENT (SPAM)
 // ==========================================
 class DiscordClient {
     let token: String
@@ -832,7 +825,8 @@ class BotManager: ObservableObject {
             let detail = try await client.getGuildDetail(guildId)
             let ownerId = detail["owner_id"] as? String
 
-            let botMember = try await client.getMember(guildId: guildId, userId: cfg.userId)
+            // ✅ FIX: bỏ label `guildId:` — signature là `_ gid`
+            let botMember = try await client.getMember(guildId, userId: cfg.userId)
             let roles = try await client.getRoles(guildId)
             let roleMap = Dictionary(uniqueKeysWithValues: roles.map { ($0.id, $0) })
 
@@ -851,7 +845,8 @@ class BotManager: ObservableObject {
             while !isCancelled {
                 let members: [BotMember]
                 do {
-                    members = try await client.getMembers(guildId: guildId, after: after)
+                    // ✅ FIX: bỏ label `guildId:`
+                    members = try await client.getMembers(guildId, after: after)
                 } catch {
                     let msg = error.localizedDescription
                     appendLog("  ✗ Không lấy được member list: \(msg)")
@@ -874,7 +869,8 @@ class BotManager: ObservableObject {
                     if pos >= botMaxPos { continue }
 
                     do {
-                        try await client.banMember(guildId: guildId, userId: uid)
+                        // ✅ FIX: bỏ label `guildId:`
+                        try await client.banMember(guildId, userId: uid)
                         banSuccess += 1
                     } catch {
                         banFailed += 1
@@ -1028,7 +1024,7 @@ struct MainTabView: View {
 }
 
 // ==========================================
-// MARK: - EMPTY STATE VIEW
+// MARK: - EMPTY STATE
 // ==========================================
 struct EmptyStateView: View {
     let title: String
