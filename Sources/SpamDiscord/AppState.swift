@@ -17,7 +17,7 @@ class AppState: ObservableObject {
     
     @Published var messages: [ParsedMessage] = []
     @Published var isSending = false
-    @Published var currentIndex = 0
+    @Published var totalSent = 0 // Đổi thành tổng số tin đã gửi
     @Published var logs: [LogEntry] = []
     
     private var client: DiscordClient? { token.isEmpty ? nil : DiscordClient(token: token) }
@@ -77,32 +77,40 @@ class AppState: ObservableObject {
         guard let client = client, !messages.isEmpty else { return }
         if useTag && targetUserId.isEmpty { return }
         
-        isSending = true; isCancelled = false; currentIndex = 0; logs.removeAll()
+        isSending = true; isCancelled = false; totalSent = 0; logs.removeAll()
         
         let mentionText = useTag ? " <@\(targetUserId)>" : ""
         
         Task {
-            for (i, msg) in messages.enumerated() {
-                if isCancelled { break }
+            var currentIndex = 0
+            
+            // VÒNG LẶP VÔ HẠN CHO ĐẾN KHI BẤM DỪNG
+            while !isCancelled {
+                let msg = messages[currentIndex]
                 
-                logs.append(LogEntry(text: "Đang gửi: \(msg.body.prefix(20))...", isSuccess: true, isSendingState: true))
+                // Cập nhật trạng thái đang gửi
+                let sendingLog = LogEntry(text: "Đang gửi: \(msg.body.prefix(20))...", isSuccess: true, isSendingState: true)
+                logs.append(sendingLog)
                 
                 do {
                     try await client.sendMessage(channelId: channel.id, content: "\(msg.body)\(mentionText)")
-                    // Xóa log tạm và thêm log thành công
-                    logs.removeLast() 
+                    // Xóa log tạm, thêm log thành công
+                    if let idx = logs.firstIndex(where: { $0.id == sendingLog.id }) { logs.remove(at: idx) }
                     logs.append(LogEntry(text: "Đã gửi: \(msg.body.prefix(20))...", isSuccess: true))
+                    totalSent += 1
                 } catch { 
-                    logs.removeLast()
+                    if let idx = logs.firstIndex(where: { $0.id == sendingLog.id }) { logs.remove(at: idx) }
                     logs.append(LogEntry(text: "Lỗi: \(error.localizedDescription)", isSuccess: false)) 
                 }
                 
-                currentIndex = i + 1
+                // Chuyển sang tin tiếp theo, nếu hết thì quay lại từ đầu
+                currentIndex = (currentIndex + 1) % messages.count
                 
-                if i < messages.count - 1 {
-                    try? await Task.sleep(nanoseconds: UInt64(max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds) * 1_000_000_000))
-                }
+                // Delay có yếu tố ngẫu nhiên (jitter)
+                let actualDelay = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
+                try? await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
             }
+            
             isSending = false
         }
     }

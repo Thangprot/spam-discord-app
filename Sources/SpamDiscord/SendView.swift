@@ -58,7 +58,6 @@ struct SendView: View {
                             .cornerRadius(8)
                             .onChange(of: app.inputText) { _ in app.parseDirectInput() }
                         
-                        // Nút X để xóa nhanh
                         if !app.inputText.isEmpty {
                             Button(action: { 
                                 app.inputText = "" 
@@ -85,10 +84,16 @@ struct SendView: View {
             Section {
                 if app.isSending {
                     VStack(spacing: 12) {
-                        ProgressView(value: Double(app.currentIndex), total: Double(app.messages.count))
+                        ProgressView()
                             .tint(.blue)
-                        Text("Đang gửi \(app.currentIndex)/\(app.messages.count)...")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .scaleEffect(1.2)
+                        
+                        // Hiển thị tổng số tin đã gửi thay vì progress bar
+                        Text("Đang gửi liên tục...\nĐã gửi: \(app.totalSent) tin nhắn")
+                            .font(.subheadline)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.secondary)
+                        
                         Button(action: { app.stopSending() }) {
                             Text("DỪNG LẠI").bold().frame(maxWidth: .infinity)
                         }
@@ -98,7 +103,7 @@ struct SendView: View {
                     .padding(.vertical, 8)
                 } else {
                     Button(action: { app.startSending(channel: channel) }) {
-                        Text("BẮT ĐẦU GỬI").bold().frame(maxWidth: .infinity)
+                        Text("BẮT ĐẦU GỬI (LẶP VÔ HẠN)").bold().frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
@@ -108,7 +113,6 @@ struct SendView: View {
             
             if !app.logs.isEmpty {
                 Section(header: Text("Lịch sử hoạt động").font(.caption)) {
-                    // Đảo ngược mảng để log mới nhất lên đầu
                     ForEach(app.logs.reversed()) { log in
                         LogRow(log: log)
                     }
@@ -117,7 +121,6 @@ struct SendView: View {
         }
         .navigationTitle("Cấu hình gửi")
         .toolbar {
-            // Nút Done trên bàn phím để đóng bàn phím
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Xong") { app.hideKeyboard() }
@@ -138,7 +141,6 @@ struct SendView: View {
     }
 }
 
-// Giao diện dòng Log đẹp mắt
 struct LogRow: View {
     let log: LogEntry
     
