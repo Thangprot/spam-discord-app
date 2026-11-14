@@ -1,0 +1,17 @@
+name: SpamDiscord
+options:
+  bundleIdPrefix: com.tenban # Thay bằng tiền tố Bundle ID của bạn
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    PRODUCT_BUNDLE_IDENTIFIER: com.tenban.spamdiscord
+targets:
+  SpamDiscord:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/SpamDiscord
+    settings:
+      base:
+        INFOPLIST_FILE: info.plist # Sử dụng file info.plist bạn đã có

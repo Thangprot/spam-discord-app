@@ -3,11 +3,11 @@ name: Build Unsigned IPA
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: # Cho phép chạy thủ công từ tab Actions
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15 # Sử dụng runner macOS 15 mới nhất
+    runs-on: macos-15
 
     steps:
     - name: Checkout code
@@ -15,7 +15,6 @@ jobs:
 
     - name: Select Xcode version
       run: |
-        # Tự động tìm Xcode 16 mới nhất trên máy ảo
         XCODE_PATH=$(ls -d /Applications/Xcode_16*.app | head -n 1)/Contents/Developer
         if [ -d "$XCODE_PATH" ]; then
           echo "Selecting Xcode: $XCODE_PATH"
@@ -25,28 +24,27 @@ jobs:
         fi
         xcodebuild -version
 
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Generate Xcode Project
+      run: xcodegen generate
+
     - name: Build App (Unsigned)
       run: |
-        # Tự động lấy tên scheme từ Package.swift
-        SCHEME=$(xcodebuild -list | grep -A100 Schemes | grep -v "Schemes:" | head -n 1 | xargs)
-        echo "Detected Scheme: $SCHEME"
-        
-        # Build app với các cờ cần thiết cho Swift Package trên CI/CD
         xcodebuild build \
-          -scheme "$SCHEME" \
+          -project SpamDiscord.xcodeproj \
+          -scheme SpamDiscord \
           -configuration Release \
           -sdk iphoneos \
           -destination 'generic/platform=iOS' \
           -derivedDataPath "$RUNNER_TEMP/build" \
-          -skipPackagePluginValidation \
-          -skipMacroValidation \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY=""
 
     - name: Package into IPA
       run: |
-        # Đóng gói .app thành .ipa
         mkdir -p "$RUNNER_TEMP/Payload"
         APP_PATH=$(find "$RUNNER_TEMP/build/Build/Products/Release-iphoneos" -name "*.app" | head -n 1)
         echo "Copying $APP_PATH"
