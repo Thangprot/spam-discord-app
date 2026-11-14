@@ -2,27 +2,22 @@ import SwiftUI
 
 @MainActor
 class AppState: ObservableObject {
-    // Auth & Data
     @Published var token: String = ""
     @Published var me: DiscordUser?
     @Published var guilds: [Guild] = []
-    @Published var selectedGuild: Guild?
     @Published var channels: [Channel] = []
-    @Published var selectedChannel: Channel?
     
-    // UI States
     @Published var isLoading = false
     @Published var loginError: String?
     
-    // Sender Config
     @Published var delaySeconds: Double = 2.0
     @Published var targetUserId: String = ""
     @Published var messages: [ParsedMessage] = []
     
-    // Sending States
     @Published var isSending = false
     @Published var currentIndex = 0
     @Published var logs: [LogEntry] = []
+    
     private var isCancelled = false
     
     var client: DiscordClient? { token.isEmpty ? nil : DiscordClient(token: token) }
@@ -45,17 +40,15 @@ class AppState: ObservableObject {
     
     func loadChannels(for guild: Guild) async {
         isLoading = true
-        self.selectedGuild = guild
         self.channels = []
-        self.selectedChannel = nil
         do {
             guard let client = client else { return }
-            let allChannels = try await client.getAllChannels(guildId: guild.id)
-            self.channels = allChannels
+            let all = try await client.getAllChannels(guildId: guild.id)
+            self.channels = all
                 .filter { $0.isSendableText || $0.isCategory }
                 .sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         } catch {
-            logs.append(LogEntry(text: "Lỗi tải kênh: \(error.localizedDescription)", isSuccess: false))
+            print("Lỗi tải kênh: \(error.localizedDescription)")
         }
         isLoading = false
     }
@@ -88,12 +81,12 @@ class AppState: ObservableObject {
             }
             self.messages = parsed
         } catch {
-            logs.append(LogEntry(text: "Lỗi đọc file: \(error.localizedDescription)", isSuccess: false))
+            print("Lỗi đọc file: \(error.localizedDescription)")
         }
     }
     
-    func startSending() {
-        guard let client = client, let channel = selectedChannel, !messages.isEmpty, !targetUserId.isEmpty else { return }
+    func startSending(channel: Channel) {
+        guard let client = client, !messages.isEmpty, !targetUserId.isEmpty else { return }
         
         isSending = true
         isCancelled = false
@@ -107,21 +100,16 @@ class AppState: ObservableObject {
         Task {
             for (index, msg) in msgs.enumerated() {
                 if isCancelled { break }
-                
-                let content = "\(msg.body) \(mention)"
                 do {
-                    try await client.sendMessage(channelId: channel.id, content: content)
+                    try await client.sendMessage(channelId: channel.id, content: "\(msg.body) \(mention)")
                     logs.append(LogEntry(text: "✅ [\(index+1)/\(msgs.count)] Đã gửi", isSuccess: true))
                 } catch {
                     logs.append(LogEntry(text: "❌ [\(index+1)] \(error.localizedDescription)", isSuccess: false))
                 }
-                
                 currentIndex = index + 1
                 
-                // Random Jitter ±25% để tránh bị Discord phát hiện pattern
                 let jitter = Double.random(in: -0.25...0.25) * delay
                 let waitTime = max(0.1, delay + jitter)
-                
                 try? await Task.sleep(nanoseconds: UInt64(waitTime * 1_000_000_000))
             }
             isSending = false
