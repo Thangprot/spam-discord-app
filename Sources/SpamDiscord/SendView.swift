@@ -17,7 +17,6 @@ struct SendView: View {
             }
             
             Section("Tùy chọn Tag") {
-                // Lỗi trước đó nằm ở dòng này, giờ đã có biến useTag trong AppState
                 Toggle("Tag người dùng vào cuối tin nhắn", isOn: $app.useTag)
                 if app.useTag {
                     TextField("Nhập User ID (dãy số)", text: $app.targetUserId)
