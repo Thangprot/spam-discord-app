@@ -25,16 +25,15 @@ jobs:
         fi
         xcodebuild -version
 
-    - name: Generate Xcode Project from Swift Package
-      run: |
-        # Tạo dự án Xcode từ Package.swift
-        swift package generate-xcodeproj
-
     - name: Build App (Unsigned)
       run: |
+        # Tự động lấy tên scheme từ Package.swift
+        SCHEME=$(xcodebuild -list | grep -A100 Schemes | grep -v "Schemes:" | head -n 1 | xargs)
+        echo "Detected Scheme: $SCHEME"
+        
         # Build app và vô hiệu hóa ký code
-        xcodebuild -project SpamDiscord.xcodeproj \
-          -scheme SpamDiscord \
+        xcodebuild \
+          -scheme "$SCHEME" \
           -configuration Release \
           -sdk iphoneos \
           -destination 'generic/platform=iOS' \
@@ -48,7 +47,9 @@ jobs:
       run: |
         # Đóng gói .app thành .ipa
         mkdir -p "$RUNNER_TEMP/Payload"
-        cp -R "$RUNNER_TEMP/build/Build/Products/Release-iphoneos/SpamDiscord.app" "$RUNNER_TEMP/Payload/"
+        APP_PATH=$(find "$RUNNER_TEMP/build/Build/Products/Release-iphoneos" -name "*.app" | head -n 1)
+        echo "Copying $APP_PATH"
+        cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
         cd "$RUNNER_TEMP" && zip -qry SpamDiscord-unsigned.ipa Payload
 
     - name: Upload IPA Artifact
