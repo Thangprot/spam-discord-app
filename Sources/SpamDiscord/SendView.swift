@@ -12,7 +12,8 @@ struct SendView: View {
             
             Section("Delay (giây)") {
                 Slider(value: $app.delaySeconds, in: 0.1...5.0, step: 0.1)
-                Text(String(format: "%.1f giây", app.delaySeconds)).foregroundStyle(app.delaySeconds < 1.0 ? .red : .primary)
+                // Đã sửa: Thêm Color.
+                Text(String(format: "%.1f giây", app.delaySeconds)).foregroundStyle(app.delaySeconds < 1.0 ? Color.red : Color.primary)
             }
             
             Section("Tag User ID") {
@@ -21,7 +22,7 @@ struct SendView: View {
             
             Section("Nội dung") {
                 Button("Chọn file .txt") { showImport = true }
-                if !app.messages.isEmpty { Text("Đã nạp \(app.messages.count) dòng").foregroundStyle(.green) }
+                if !app.messages.isEmpty { Text("Đã nạp \(app.messages.count) dòng").foregroundStyle(Color.green) }
             }
             
             Section {
@@ -37,7 +38,8 @@ struct SendView: View {
             if !app.logs.isEmpty {
                 Section("Logs") {
                     ForEach(app.logs.suffix(20)) { log in
-                        Text(log.text).font(.caption).foregroundStyle(log.isSuccess ? .primary : .red)
+                        // Đã sửa: Thêm Color.
+                        Text(log.text).font(.caption).foregroundStyle(log.isSuccess ? Color.primary : Color.red)
                     }
                 }
             }
