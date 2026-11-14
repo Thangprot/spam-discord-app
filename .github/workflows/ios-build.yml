@@ -31,17 +31,18 @@ jobs:
         SCHEME=$(xcodebuild -list | grep -A100 Schemes | grep -v "Schemes:" | head -n 1 | xargs)
         echo "Detected Scheme: $SCHEME"
         
-        # Build app và vô hiệu hóa ký code
-        xcodebuild \
+        # Build app với các cờ cần thiết cho Swift Package trên CI/CD
+        xcodebuild build \
           -scheme "$SCHEME" \
           -configuration Release \
           -sdk iphoneos \
           -destination 'generic/platform=iOS' \
           -derivedDataPath "$RUNNER_TEMP/build" \
+          -skipPackagePluginValidation \
+          -skipMacroValidation \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGN_IDENTITY="" \
-          build
+          CODE_SIGN_IDENTITY=""
 
     - name: Package into IPA
       run: |
