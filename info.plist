@@ -25,4 +25,19 @@
     <key>UILaunchScreen</key>
     <dict/>
 </dict>
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- CÁC KEY CŨ CỦA BẠN GIỮ NGUYÊN -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <!-- ... các key khác ... -->
+    
+    <!-- THÊM KEY NÀY ĐỂ CHO PHÉP CHẠY NGẦM BẰNG ÂM THANH -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+</dict>
 </plist>

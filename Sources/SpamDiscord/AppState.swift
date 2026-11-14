@@ -1,5 +1,67 @@
 import SwiftUI
 import UIKit
+import AVFoundation // Thêm thư viện âm thanh
+
+// Class quản lý âm thanh chạy ngầm
+class SilentAudioManager {
+    static let shared = SilentAudioManager()
+    private var audioPlayer: AVAudioPlayer?
+    
+    func start() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+            
+            // Tạo một file WAV câm (1 giây) trong bộ nhớ
+            let sampleRate = 8000
+            let duration = 1
+            let numSamples = sampleRate * duration
+            let dataSize = numSamples * 2
+            
+            var header = Data()
+            header.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // RIFF
+            var chunkSize = UInt32(36 + dataSize).littleEndian
+            header.append(Data(bytes: &chunkSize, count: 4))
+            header.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // WAVE
+            header.append(contentsOf: [0x66, 0x6d, 0x74, 0x20]) // fmt 
+            var subchunk1Size = UInt32(16).littleEndian
+            header.append(Data(bytes: &subchunk1Size, count: 4))
+            var audioFormat = UInt16(1).littleEndian // PCM
+            header.append(Data(bytes: &audioFormat, count: 2))
+            var numChannels = UInt16(1).littleEndian
+            header.append(Data(bytes: &numChannels, count: 2))
+            var sampleRateL = UInt32(sampleRate).littleEndian
+            header.append(Data(bytes: &sampleRateL, count: 4))
+            var byteRate = UInt32(sampleRate * 2).littleEndian
+            header.append(Data(bytes: &byteRate, count: 4))
+            var blockAlign = UInt16(2).littleEndian
+            header.append(Data(bytes: &blockAlign, count: 2))
+            var bitsPerSample = UInt16(16).littleEndian
+            header.append(Data(bytes: &bitsPerSample, count: 2))
+            header.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // data
+            var dataChunkSize = UInt32(dataSize).littleEndian
+            header.append(Data(bytes: &dataChunkSize, count: 4))
+            
+            let silentData = Data(repeating: 0, count: dataSize)
+            let wavData = header + silentData
+            
+            audioPlayer = try AVAudioPlayer(data: wavData)
+            audioPlayer?.numberOfLoops = -1 // Lặp vô hạn
+            audioPlayer?.play()
+            print("Bắt đầu phát âm thanh chạy ngầm.")
+        } catch {
+            print("Lỗi khởi tạo âm thanh chạy ngầm: \(error)")
+        }
+    }
+    
+    func stop() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        try? AVAudioSession.sharedInstance().setActive(false)
+        print("Đã dừng âm thanh chạy ngầm.")
+    }
+}
 
 @MainActor
 class AppState: ObservableObject {
@@ -17,7 +79,7 @@ class AppState: ObservableObject {
     
     @Published var messages: [ParsedMessage] = []
     @Published var isSending = false
-    @Published var totalSent = 0 // Đổi thành tổng số tin đã gửi
+    @Published var totalSent = 0
     @Published var logs: [LogEntry] = []
     
     private var client: DiscordClient? { token.isEmpty ? nil : DiscordClient(token: token) }
@@ -79,22 +141,20 @@ class AppState: ObservableObject {
         
         isSending = true; isCancelled = false; totalSent = 0; logs.removeAll()
         
+        // BẬT ÂM THANH CHẠY NGẦM KHI BẮT ĐẦU GỬI
+        SilentAudioManager.shared.start()
+        
         let mentionText = useTag ? " <@\(targetUserId)>" : ""
         
         Task {
             var currentIndex = 0
-            
-            // VÒNG LẶP VÔ HẠN CHO ĐẾN KHI BẤM DỪNG
             while !isCancelled {
                 let msg = messages[currentIndex]
-                
-                // Cập nhật trạng thái đang gửi
                 let sendingLog = LogEntry(text: "Đang gửi: \(msg.body.prefix(20))...", isSuccess: true, isSendingState: true)
                 logs.append(sendingLog)
                 
                 do {
                     try await client.sendMessage(channelId: channel.id, content: "\(msg.body)\(mentionText)")
-                    // Xóa log tạm, thêm log thành công
                     if let idx = logs.firstIndex(where: { $0.id == sendingLog.id }) { logs.remove(at: idx) }
                     logs.append(LogEntry(text: "Đã gửi: \(msg.body.prefix(20))...", isSuccess: true))
                     totalSent += 1
@@ -103,14 +163,10 @@ class AppState: ObservableObject {
                     logs.append(LogEntry(text: "Lỗi: \(error.localizedDescription)", isSuccess: false)) 
                 }
                 
-                // Chuyển sang tin tiếp theo, nếu hết thì quay lại từ đầu
                 currentIndex = (currentIndex + 1) % messages.count
-                
-                // Delay có yếu tố ngẫu nhiên (jitter)
                 let actualDelay = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
                 try? await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
             }
-            
             isSending = false
         }
     }
@@ -118,9 +174,12 @@ class AppState: ObservableObject {
     func stopSending() { 
         isCancelled = true 
         isSending = false
+        // TẮT ÂM THANH KHI DỪNG
+        SilentAudioManager.shared.stop()
     }
     
     func logout() { 
+        stopSending()
         KeychainHelper.delete(key: "token")
         token = ""; me = nil; guilds = []; channels = [] 
     }
