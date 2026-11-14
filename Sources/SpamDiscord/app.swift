@@ -22,7 +22,7 @@ struct TokenInfo: Identifiable, Codable, Equatable {
     var username: String
     var avatarHash: String?
     var isValid: Bool
-    
+
     var avatarURL: URL? {
         guard let hash = avatarHash else { return nil }
         return URL(string: "https://cdn.discordapp.com/avatars/\(userId)/\(hash).png?size=128")
@@ -49,13 +49,13 @@ class BackgroundManager {
     static let shared = BackgroundManager()
     private var audioPlayer: AVAudioPlayer?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
-    
+
     func start() {
         bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.stop() }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try AVAudioSession.sharedInstance().setActive(true)
-            
+
             let sampleRate = 8000, duration = 1, numSamples = sampleRate * duration, dataSize = numSamples * 2
             var header = Data()
             header.append(contentsOf: [0x52, 0x49, 0x46, 0x46])
@@ -79,13 +79,13 @@ class BackgroundManager {
             header.append(contentsOf: [0x64, 0x61, 0x74, 0x61])
             var dataChunkSize = UInt32(dataSize).littleEndian
             header.append(Data(bytes: &dataChunkSize, count: 4))
-            
+
             audioPlayer = try AVAudioPlayer(data: header + Data(repeating: 0, count: dataSize))
             audioPlayer?.numberOfLoops = -1
             audioPlayer?.play()
         } catch {}
     }
-    
+
     func stop() {
         audioPlayer?.stop(); audioPlayer = nil
         if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid }
@@ -98,7 +98,7 @@ class BackgroundManager {
 class DiscordClient {
     let token: String
     let session: URLSession
-    
+
     init(token: String) {
         self.token = token
         let config = URLSessionConfiguration.default
@@ -112,34 +112,34 @@ class DiscordClient {
         ]
         self.session = URLSession(configuration: config)
     }
-    
+
     private func check(_ res: URLResponse, _ data: Data) throws {
         guard let http = res as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw NSError(domain: "Discord", code: (res as? HTTPURLResponse)?.statusCode ?? 0, userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? ""])
         }
     }
-    
+
     func validateToken() async throws -> DiscordUser {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me")!)
         try check(r, d); return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
-    
+
     func getAllGuilds() async throws -> [Guild] {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me/guilds")!)
         try check(r, d); return try JSONDecoder().decode([Guild].self, from: d)
     }
-    
+
     func getAllChannels(guildId: String) async throws -> [Channel] {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
-    
+
     func sendMessage(channelId: String, content: String) async throws {
         var req = URLRequest(url: URL(string: "https://discord.com/api/v10/channels/\(channelId)/messages")!)
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req)
-        
+
         if let http = r as? HTTPURLResponse, http.statusCode == 429,
            let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
            let retry = json["retry_after"] as? Double {
@@ -159,41 +159,46 @@ class AppState: ObservableObject {
     @Published var tokens: [TokenInfo] = [] { didSet { saveTokens() } }
     @Published var activeToken: TokenInfo? = nil
     @Published var isCheckingToken = false
-    
+
     // Spam State
     @Published var guilds: [Guild] = []
     @Published var channels: [Channel] = []
     @Published var isLoading = false
-    
+
     // Config
     @Published var delaySeconds: Double = 2.0
     @Published var useTag: Bool = true
     @Published var targetUserId = ""
     @Published var addPrefix: Bool = false // >
     @Published var addSuffix: Bool = false // #
-    
+
     // Content
     @Published var inputText = ""
     @Published var messages: [ParsedMessage] = []
-    
+
     // Sending Status
     @Published var isSending = false
     @Published var totalSent = 0
     @Published var currentMessageStr = ""
     @Published var lastError: String?
-    
+
+    // ==== NEW: Open-file-from-Files-app state ====
+    @Published var pendingOpenFileURL: URL? = nil
+    @Published var showImportChoice = false
+    // ============================================
+
     private var client: DiscordClient? { activeToken != nil ? DiscordClient(token: activeToken!.token) : nil }
     private var isCancelled = false
-    
+
     init() { loadTokens() }
-    
+
     // --- TOKEN LOGIC ---
     private func saveTokens() {
         if let encoded = try? JSONEncoder().encode(tokens) {
             UserDefaults.standard.set(encoded, forKey: "SavedTokens")
         }
     }
-    
+
     private func loadTokens() {
         if let data = UserDefaults.standard.data(forKey: "SavedTokens"),
            let saved = try? JSONDecoder().decode([TokenInfo].self, from: data) {
@@ -204,11 +209,11 @@ class AppState: ObservableObject {
             }
         }
     }
-    
+
     func addToken(_ tokenStr: String) async {
         let cleanToken = tokenStr.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanToken.isEmpty, !tokens.contains(where: { $0.token == cleanToken }) else { return }
-        
+
         isCheckingToken = true
         let tempClient = DiscordClient(token: cleanToken)
         do {
@@ -222,25 +227,31 @@ class AppState: ObservableObject {
         }
         isCheckingToken = false
     }
-    
-    // ==========================================
-    // ĐỌC TOKENS TỪ FILE (đã fix)
-    // ==========================================
+
     func addTokensFromFile(url: URL) async {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
 
-        // Chờ iCloud tải xong thực sự
-        await waitForICloudDownload(url: url)
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
 
-        guard let data = try? Data(contentsOf: url) else {
+        var fileData: Data?
+        let coordinator = NSFileCoordinator()
+        var coordErr: NSError?
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
+            fileData = try? Data(contentsOf: newURL)
+        }
+        if fileData == nil {
+            fileData = try? Data(contentsOf: url)
+        }
+
+        guard let data = fileData else {
             lastError = "Không thể đọc file token."
             return
         }
 
         let encodings: [String.Encoding] = [
             .utf8, .utf16, .utf16LittleEndian, .utf16BigEndian,
-            .windowsCP1252, .isoLatin1, .ascii, .nonLossyASCII
+            .windowsCP1252, .isoLatin1, .ascii
         ]
         var content: String?
         for enc in encodings {
@@ -249,9 +260,7 @@ class AppState: ObservableObject {
                 break
             }
         }
-        if content == nil || content!.isEmpty {
-            content = String(decoding: data, as: UTF8.self)
-        }
+        if content == nil { content = String(decoding: data, as: UTF8.self) }
 
         guard let text = content, !text.isEmpty else {
             lastError = "File token rỗng hoặc sai định dạng."
@@ -259,8 +268,8 @@ class AppState: ObservableObject {
         }
 
         let cleaned = text.replacingOccurrences(of: "\u{FEFF}", with: "")
-        for line in cleaned.components(separatedBy: .newlines)
-            where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let lines = cleaned.components(separatedBy: .newlines)
+        for line in lines where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             await addToken(line)
         }
         lastError = nil
@@ -271,14 +280,14 @@ class AppState: ObservableObject {
         activeToken = token
         Task { await loadGuilds() }
     }
-    
+
     func deleteToken(at offsets: IndexSet) {
         if let active = activeToken, offsets.map({ tokens[$0] }).contains(where: { $0.id == active.id }) {
             activeToken = nil; guilds = []
         }
         tokens.remove(atOffsets: offsets)
     }
-    
+
     // --- SPAM LOGIC ---
     func loadGuilds() async {
         guard let client = client else { return }
@@ -288,7 +297,7 @@ class AppState: ObservableObject {
         } catch { lastError = error.localizedDescription }
         isLoading = false
     }
-    
+
     func loadChannels(for guild: Guild) async {
         guard let client = client else { return }
         isLoading = true
@@ -298,7 +307,7 @@ class AppState: ObservableObject {
         } catch { lastError = error.localizedDescription }
         isLoading = false
     }
-    
+
     func groupedChannels() -> [(category: Channel?, items: [Channel])] {
         var secs: [(Channel?, [Channel])] = []
         let orp = channels.filter { $0.isSendableText && $0.parentId == nil }
@@ -310,49 +319,38 @@ class AppState: ObservableObject {
         return secs
     }
 
-    // ==========================================
-    // HÀM PHỤ: chờ iCloud download xong
-    // ==========================================
-    private func waitForICloudDownload(url: URL) async {
-        let isUbiquitous = (try? url.resourceValues(forKeys: [.isUbiquitousItemKey]).isUbiquitousItem) ?? false
-        guard isUbiquitous else { return }
-
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-
-        for _ in 0..<100 { // tối đa 10 giây
-            if let values = try? url.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]),
-               values.ubiquitousItemDownloadingStatus == .current {
-                return
-            }
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1s
-        }
-    }
-    
-    // ==========================================
-    // FIX TRIỆT ĐỂ: ĐỌC FILE TXT NỘI DUNG
-    // ==========================================
-    func parseFile(url: URL) async {
+    func parseFile(url: URL) {
         let gotAccess = url.startAccessingSecurityScopedResource()
         defer { if gotAccess { url.stopAccessingSecurityScopedResource() } }
 
-        // Chờ iCloud tải xong trước khi đọc
-        await waitForICloudDownload(url: url)
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
 
-        // Đọc trực tiếp — bỏ NSFileCoordinator vì nó fail với security-scoped URL
-        let data: Data
-        do {
-            data = try Data(contentsOf: url)
-        } catch {
-            self.lastError = "Không thể đọc file: \(error.localizedDescription)"
+        var fileData: Data?
+        var readErr: String?
+
+        let coordinator = NSFileCoordinator()
+        var coordErr: NSError?
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordErr) { newURL in
+            do {
+                fileData = try Data(contentsOf: newURL)
+            } catch {
+                readErr = error.localizedDescription
+            }
+        }
+
+        if fileData == nil {
+            do {
+                fileData = try Data(contentsOf: url)
+            } catch {
+                readErr = error.localizedDescription
+            }
+        }
+
+        guard let data = fileData else {
+            self.lastError = "Không thể đọc file: \(readErr ?? coordErr?.localizedDescription ?? "Lỗi không xác định")"
             return
         }
 
-        guard !data.isEmpty else {
-            self.lastError = "File rỗng."
-            return
-        }
-
-        // Thử nhiều bảng mã
         let encodings: [String.Encoding] = [
             .utf8,
             .utf16,
@@ -381,50 +379,48 @@ class AppState: ObservableObject {
             return
         }
 
-        // Xoá BOM nếu có
         let cleaned = finalContent.replacingOccurrences(of: "\u{FEFF}", with: "")
 
         self.inputText = cleaned
         self.parseDirectInput()
         self.lastError = nil
-        print("✅ Đã import \(messages.count) dòng từ file: \(url.lastPathComponent)")
     }
-    
+
     func parseDirectInput() {
         messages = inputText.components(separatedBy: .newlines).compactMap {
             let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? nil : ParsedMessage(body: t)
         }
     }
-    
+
     func startSending(channel: Channel) {
         guard let client = client, !messages.isEmpty else { return }
         if useTag && targetUserId.isEmpty { return }
-        
+
         isSending = true; isCancelled = false; totalSent = 0; lastError = nil
         BackgroundManager.shared.start()
-        
+
         Task {
             var currentIndex = 0
             while !isCancelled {
                 let msg = messages[currentIndex]
-                
+
                 var prefix = ""
                 if addPrefix { prefix += "> " }
                 if addSuffix { prefix += "# " }
-                
+
                 var finalContent = prefix + msg.body
                 if useTag { finalContent += " <@\(targetUserId)>" }
-                
+
                 currentMessageStr = finalContent
-                
+
                 do {
                     try await client.sendMessage(channelId: channel.id, content: finalContent)
                     totalSent += 1
                 } catch {
                     lastError = error.localizedDescription
                 }
-                
+
                 currentIndex = (currentIndex + 1) % messages.count
                 let actualDelay = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
                 try? await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
@@ -432,14 +428,41 @@ class AppState: ObservableObject {
             isSending = false; currentMessageStr = ""
         }
     }
-    
+
     func stopSending() {
         isCancelled = true; isSending = false
         BackgroundManager.shared.stop()
     }
-    
+
     func hideKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    // ==========================================
+    // MARK: - OPEN FILE FROM FILES APP
+    // ==========================================
+    func handleOpenURL(_ url: URL) async {
+        guard url.isFileURL else { return }
+        // đợi UI ổn định khi app vừa cold-launch
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        self.pendingOpenFileURL = url
+        self.showImportChoice = true
+    }
+
+    func importPendingFile(asTokens: Bool) {
+        guard let url = pendingOpenFileURL else { return }
+        pendingOpenFileURL = nil
+        showImportChoice = false
+        if asTokens {
+            Task { await addTokensFromFile(url: url) }
+        } else {
+            parseFile(url: url)
+        }
+    }
+
+    func cancelPendingImport() {
+        pendingOpenFileURL = nil
+        showImportChoice = false
     }
 }
 
@@ -451,21 +474,35 @@ struct SpamDiscordApp: App {
     @StateObject private var app = AppState()
     var body: some Scene {
         WindowGroup {
-            MainTabView().environmentObject(app)
+            MainTabView()
+                .environmentObject(app)
+                .onOpenURL { url in
+                    Task { @MainActor in
+                        await app.handleOpenURL(url)
+                    }
+                }
         }
     }
 }
 
 struct MainTabView: View {
+    @EnvironmentObject var app: AppState
     var body: some View {
         TabView {
             SpamView()
                 .tabItem { Label("Spam", systemImage: "paperplane.fill") }
-            
+
             TokenListView()
                 .tabItem { Label("Tokens", systemImage: "person.2.fill") }
         }
         .tint(.indigo)
+        .alert("Import file", isPresented: $app.showImportChoice) {
+            Button("Nội dung tin nhắn") { app.importPendingFile(asTokens: false) }
+            Button("Danh sách Token")   { app.importPendingFile(asTokens: true)  }
+            Button("Huỷ", role: .cancel) { app.cancelPendingImport() }
+        } message: {
+            Text("Bạn muốn import file này dưới dạng gì?")
+        }
     }
 }
 
@@ -476,7 +513,7 @@ struct EmptyStateView: View {
     let title: String
     let systemImage: String
     let description: String
-    
+
     var body: some View {
         VStack(spacing: 15) {
             Image(systemName: systemImage)
@@ -502,7 +539,7 @@ struct TokenListView: View {
     @EnvironmentObject var app: AppState
     @State private var showAddSheet = false
     @State private var showImport = false
-    
+
     var body: some View {
         NavigationStack {
             Group {
@@ -528,16 +565,16 @@ struct TokenListView: View {
                                             Image(systemName: "person.circle.fill")
                                                 .resizable().frame(width: 45, height: 45).foregroundStyle(.gray)
                                         }
-                                        
+
                                         VStack(alignment: .leading, spacing: 4) {
                                             Text(token.username).font(.headline)
                                             Text(token.isValid ? "Live" : "Die")
                                                 .font(.caption).bold()
                                                 .foregroundStyle(token.isValid ? .green : .red)
                                         }
-                                        
+
                                         Spacer()
-                                        
+
                                         if app.activeToken?.id == token.id {
                                             Image(systemName: "checkmark.circle.fill")
                                                 .foregroundStyle(.indigo)
@@ -566,10 +603,9 @@ struct TokenListView: View {
                 }
             }
             .sheet(isPresented: $showAddSheet) { AddTokenSheet() }
-            // FIX: bỏ .item (gây mở chế độ preview thay vì picker)
             .fileImporter(
                 isPresented: $showImport,
-                allowedContentTypes: [.plainText, .text, .data],
+                allowedContentTypes: [.item],
                 allowsMultipleSelection: false
             ) { res in
                 switch res {
@@ -597,7 +633,7 @@ struct AddTokenSheet: View {
     @EnvironmentObject var app: AppState
     @Environment(\.dismiss) var dismiss
     @State private var tokenInput = ""
-    
+
     var body: some View {
         NavigationStack {
             Form {
@@ -630,11 +666,11 @@ struct AddTokenSheet: View {
 struct SpamView: View {
     @EnvironmentObject var app: AppState
     @State private var searchText = ""
-    
+
     var filteredGuilds: [Guild] {
         searchText.isEmpty ? app.guilds : app.guilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-    
+
     var body: some View {
         NavigationStack {
             Group {
@@ -670,7 +706,7 @@ struct ChannelListView: View {
     @EnvironmentObject var app: AppState
     let guild: Guild
     @State private var searchText = ""
-    
+
     var filteredSections: [(category: Channel?, items: [Channel])] {
         let sections = app.groupedChannels()
         if searchText.isEmpty { return sections }
@@ -679,7 +715,7 @@ struct ChannelListView: View {
             return filteredItems.isEmpty ? nil : (section.category, filteredItems)
         }
     }
-    
+
     var body: some View {
         Group {
             if app.isLoading { ProgressView() }
@@ -712,9 +748,7 @@ struct SendView: View {
     let channel: Channel
     @State private var showImport = false
     @State private var showErrorAlert = false
-    @State private var showSuccessToast = false
-    @State private var importedCount = 0
-    
+
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
@@ -730,11 +764,11 @@ struct SendView: View {
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
-                
+
                 // 2. Cấu hình gửi
                 VStack(alignment: .leading, spacing: 15) {
                     Text("CẤU HÌNH").font(.caption).bold().foregroundStyle(.secondary)
-                    
+
                     Toggle("Tag User ID", isOn: $app.useTag)
                         .tint(.indigo)
                     if app.useTag {
@@ -744,16 +778,16 @@ struct SendView: View {
                             .background(Color(UIColor.tertiarySystemBackground))
                             .cornerRadius(8)
                     }
-                    
+
                     Divider()
-                    
+
                     HStack {
                         Toggle("Thêm '>'", isOn: $app.addPrefix).tint(.indigo)
                         Toggle("Thêm '#'", isOn: $app.addSuffix).tint(.indigo)
                     }
-                    
+
                     Divider()
-                    
+
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("Delay:")
@@ -768,7 +802,7 @@ struct SendView: View {
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
-                
+
                 // 3. Nội dung tin nhắn
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -779,7 +813,7 @@ struct SendView: View {
                                 .font(.caption).bold()
                         }
                     }
-                    
+
                     ZStack(alignment: .topTrailing) {
                         TextEditor(text: $app.inputText)
                             .frame(minHeight: 150)
@@ -787,7 +821,7 @@ struct SendView: View {
                             .background(Color(UIColor.tertiarySystemBackground))
                             .cornerRadius(10)
                             .onChange(of: app.inputText) { _ in app.parseDirectInput() }
-                        
+
                         if !app.inputText.isEmpty {
                             Button(action: { app.inputText = ""; app.parseDirectInput() }) {
                                 Image(systemName: "xmark.circle.fill")
@@ -796,7 +830,7 @@ struct SendView: View {
                             }
                         }
                     }
-                    
+
                     if !app.messages.isEmpty {
                         Text("Đã nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
                     }
@@ -804,25 +838,25 @@ struct SendView: View {
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
-                
+
                 // 4. Trạng thái và Nút bấm
                 if app.isSending {
                     VStack(spacing: 15) {
                         ProgressView().scaleEffect(1.5).tint(.indigo).padding(.top)
                         Text("Đang gửi vô hạn...").font(.headline)
                         Text("Tổng đã gửi: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
-                        
+
                         Text(app.currentMessageStr)
                             .font(.caption)
                             .foregroundStyle(.gray)
                             .lineLimit(2)
                             .padding(.horizontal)
                             .multilineTextAlignment(.center)
-                        
+
                         if let error = app.lastError {
                             Text(error).font(.caption).foregroundStyle(.red)
                         }
-                        
+
                         Button(action: { app.stopSending() }) {
                             Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
                         }
@@ -850,25 +884,17 @@ struct SendView: View {
         .navigationTitle("Gửi tin nhắn")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
-        // FIX: bỏ .item
         .fileImporter(
             isPresented: $showImport,
-            allowedContentTypes: [.plainText, .text, .data],
+            allowedContentTypes: [.item],
             allowsMultipleSelection: false
         ) { res in
             switch res {
             case .success(let urls):
                 guard let url = urls.first else { return }
-                Task {
-                    await app.parseFile(url: url)
-                    if app.lastError != nil {
-                        showErrorAlert = true
-                    } else {
-                        importedCount = app.messages.count
-                        withAnimation { showSuccessToast = true }
-                        try? await Task.sleep(nanoseconds: 2_000_000_000)
-                        withAnimation { showSuccessToast = false }
-                    }
+                app.parseFile(url: url)
+                if app.lastError != nil {
+                    showErrorAlert = true
                 }
             case .failure(let error):
                 let ns = error as NSError
@@ -881,18 +907,6 @@ struct SendView: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text(app.lastError ?? "Không thể đọc file. Vui lòng thử lại.")
-        }
-        .overlay(alignment: .top) {
-            if showSuccessToast {
-                Label("Đã import \(importedCount) dòng", systemImage: "checkmark.circle.fill")
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.green, in: Capsule())
-                    .padding(.top, 8)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-            }
         }
     }
 }
