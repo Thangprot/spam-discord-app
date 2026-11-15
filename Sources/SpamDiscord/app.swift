@@ -577,7 +577,7 @@ class UserNukeClient {
 
         guard let url = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else { return }
         let ws = session.webSocketTask(with: url)
-        ws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX LỖI MESSAGE TOO LONG
+        ws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX MESSAGE TOO LONG
         ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
 
@@ -767,7 +767,7 @@ class VoiceRoomClient {
 
         log?("Mở gateway WS...")
         let gw = session.webSocketTask(with: URL(string: "wss://gateway.discord.gg/?v=10&encoding=json")!)
-        gw.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX LỖI MESSAGE TOO LONG
+        gw.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX MESSAGE TOO LONG
         gw.resume()
         gatewayWS = gw
 
@@ -839,7 +839,7 @@ class VoiceRoomClient {
 
         log?("Mở voice WS...")
         let vws = session.webSocketTask(with: URL(string: "wss://\(ep)/?v=4")!)
-        vws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX LỖI MESSAGE TOO LONG
+        vws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX MESSAGE TOO LONG
         vws.resume()
         voiceWS = vws
 
@@ -1710,7 +1710,7 @@ class VoiceRoomManager: ObservableObject {
         selectedTokenIds.remove(id)
         tokenGuilds.removeValue(forKey: id)
         tokenChannels.removeValue(forKey: id)
-        recomputeEligibility()
+        recomputeEligibleGuilds()
     }
     func clearAll() {
         tokens = []; selectedTokenIds = []
@@ -1727,98 +1727,82 @@ class VoiceRoomManager: ObservableObject {
         guard t.isValid else { return }
         if selectedTokenIds.contains(t.id) { selectedTokenIds.remove(t.id) }
         else { selectedTokenIds.insert(t.id) }
-        recomputeEligibility()
+        recomputeEligibleGuilds()
     }
-    
-    // ✅ FIX: Quét song song tất cả server của 1 token
-    func loadAllForSelected() async {
+
+    // ✅ BƯỚC 1: Chỉ load danh sách Server (nhẹ, nhanh)
+    func loadGuildsForSelected() async {
         isLoading = true
-        log("Bắt đầu quét \(selectedTokenIds.count) token...")
+        log("Bắt đầu tìm Server chung...")
+        
         for id in selectedTokenIds {
             guard let t = tokens.first(where: { $0.id == id }), t.isValid else { continue }
-            await loadForToken(t)
-        }
-        recomputeEligibility()
-        isLoading = false
-        log("Quét xong: \(eligibleGuilds.count) server, \(eligibleChannels.values.reduce(0) { $0 + $1.count }) kênh")
-    }
-    
-    private func loadForToken(_ t: TokenInfo) async {
-        let client = VoiceRoomClient(token: t.token)
-        do {
-            let guilds = try await client.getGuilds()
-            tokenGuilds[t.id] = guilds
-            log("[\(t.username.prefix(12))] \(guilds.count) server")
-            
-            var channelMap: [String: [VoiceChannelInfo]] = [:]
-            
-            // ✅ FIX: Dùng TaskGroup quét song song
-            await withTaskGroup(of: (String, [VoiceChannelInfo]).self) { group in
-                for g in guilds {
-                    group.addTask {
-                        do {
-                            let chs = try await client.getVoiceChannels(guildId: g.id)
-                            return (g.id, chs)
-                        } catch {
-                            return (g.id, [])
-                        }
-                    }
-                }
-                for await (guildId, chs) in group {
-                    channelMap[guildId] = chs
-                }
+            do {
+                let client = VoiceRoomClient(token: t.token)
+                let guilds = try await client.getGuilds()
+                tokenGuilds[t.id] = guilds
+                log("[\(t.username.prefix(12))] \(guilds.count) server")
+            } catch {
+                log("[\(t.username.prefix(12))] Lỗi: \(error.localizedDescription)")
+                tokenGuilds[t.id] = []
             }
-            
-            tokenChannels[t.id] = channelMap
-            let totalChannels = channelMap.values.reduce(0) { $0 + $1.count }
-            log("  [\(t.username.prefix(12))] Đã quét xong \(totalChannels) kênh thoại")
-            
-        } catch {
-            log("[\(t.username.prefix(12))] LỖI guilds: \(error.localizedDescription)")
-            tokenGuilds[t.id] = []
-            tokenChannels[t.id] = [:]
+            try? await Task.sleep(nanoseconds: 200_000_000)
         }
-        recomputeEligibility()
+        
+        recomputeEligibleGuilds()
+        isLoading = false
+        log("Quét xong: \(eligibleGuilds.count) server chung")
     }
-    
-    func recomputeEligibility() {
-        guard !selectedTokenIds.isEmpty else {
-            eligibleGuilds = []; eligibleChannels = [:]
-            selectedGuild = nil; selectedChannel = nil
-            return
+
+    // ✅ BƯỚC 2: Chỉ load kênh của Server được chọn
+    func loadChannelsForSelected(guild: Guild) async {
+        isLoading = true
+        log("Đang quét kênh của: \(guild.name)...")
+        
+        // Xoá cache cũ của server này
+        for id in selectedTokenIds {
+            tokenChannels[id]?[guild.id] = nil
         }
+        
+        for id in selectedTokenIds {
+            guard let t = tokens.first(where: { $0.id == id }), t.isValid else { continue }
+            do {
+                let client = VoiceRoomClient(token: t.token)
+                let chs = try await client.getVoiceChannels(guildId: guild.id)
+                if tokenChannels[id] == nil { tokenChannels[id] = [:] }
+                tokenChannels[id]?[guild.id] = chs
+                log("  [\(t.username.prefix(12))] \(chs.count) kênh thoại")
+            } catch {
+                log("  [\(t.username.prefix(12))] Lỗi kênh: \(error.localizedDescription)")
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        
+        recomputeEligibleChannels(for: guild)
+        isLoading = false
+        log("Quét xong kênh của \(guild.name)")
+    }
+
+    func recomputeEligibleGuilds() {
+        guard !selectedTokenIds.isEmpty else { eligibleGuilds = []; return }
         var guildSet: Set<String>? = nil
         var guildMap: [String: Guild] = [:]
         for id in selectedTokenIds {
-            guard let gs = tokenGuilds[id] else {
-                eligibleGuilds = []; eligibleChannels = [:]; return
-            }
+            guard let gs = tokenGuilds[id] else { eligibleGuilds = []; return }
             let ids = Set(gs.map { $0.id })
             for g in gs where guildMap[g.id] == nil { guildMap[g.id] = g }
             guildSet = guildSet == nil ? ids : guildSet!.intersection(ids)
         }
-        eligibleGuilds = (guildSet ?? []).compactMap { guildMap[$0] }
-            .sorted { $0.name < $1.name }
+        eligibleGuilds = (guildSet ?? []).compactMap { guildMap[$0] }.sorted { $0.name < $1.name }
+    }
 
-        var chMap: [String: [VoiceChannelInfo]] = [:]
-        for guild in eligibleGuilds {
-            var chInfo: [String: VoiceChannelInfo] = [:]
-            for id in selectedTokenIds {
-                let chs = tokenChannels[id]?[guild.id] ?? []
-                for c in chs where chInfo[c.id] == nil { chInfo[c.id] = c }
-            }
-            let result = Array(chInfo.values).sorted { $0.name < $1.name }
-            if !result.isEmpty { chMap[guild.id] = result }
+    func recomputeEligibleChannels(for guild: Guild) {
+        var chInfo: [String: VoiceChannelInfo] = [:]
+        for id in selectedTokenIds {
+            let chs = tokenChannels[id]?[guild.id] ?? []
+            for c in chs where chInfo[c.id] == nil { chInfo[c.id] = c }
         }
-        eligibleChannels = chMap
-
-        if let sg = selectedGuild, !eligibleGuilds.contains(where: { $0.id == sg.id }) {
-            selectedGuild = nil; selectedChannel = nil
-        }
-        if let sc = selectedChannel, let sg = selectedGuild,
-           !(eligibleChannels[sg.id] ?? []).contains(where: { $0.id == sc.id }) {
-            selectedChannel = nil
-        }
+        eligibleChannels[guild.id] = Array(chInfo.values).sorted { $0.name < $1.name }
     }
 
     func tokensWithAccess(guildId: String, channelId: String) -> [TokenInfo] {
@@ -1908,9 +1892,7 @@ class VoiceRoomManager: ObservableObject {
                 perTokenStatus[t.id] = "Lỗi: \(error.localizedDescription.prefix(50))"
                 log("[\(t.username.prefix(12))] Lỗi: \(error.localizedDescription)")
             }
-            
-            // ✅ FIX: Giảm thời gian chờ join
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
 
         log("Hoàn tất join \(clients.count) token")
@@ -3030,7 +3012,7 @@ struct RoomTokenPickerView: View {
 
             if !room.selectedTokenIds.isEmpty {
                 Button {
-                    Task { await room.loadAllForSelected() }
+                    Task { await room.loadGuildsForSelected() } // ✅ ĐÃ ĐỔI THÀNH loadGuildsForSelected
                 } label: {
                     HStack {
                         if room.isLoading { ProgressView().tint(.white) }
@@ -3107,19 +3089,19 @@ struct RoomGuildListView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
-                Text("Server mà TẤT CẢ \(room.selectedTokenIds.count) token đều ở")
+                Text("Server chung của \(room.selectedTokenIds.count) token")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button { room.clearSelection() } label: {
                     Text("Đổi").font(.caption.bold()).padding(6)
                         .background(Color.indigo.opacity(0.15)).cornerRadius(6)
                 }
-                Button { Task { await room.loadAllForSelected() } } label: {
+                Button { Task { await room.loadGuildsForSelected() } } label: {
                     Image(systemName: "arrow.clockwise").padding(8)
                 }
             }.padding(.horizontal).padding(.vertical, 8).background(Color.green.opacity(0.1))
 
-            if room.isLoading { ProgressView("Đang quét...").padding(40); Spacer() }
+            if room.isLoading { ProgressView("Đang tải...").padding(40); Spacer() }
             else if room.eligibleGuilds.isEmpty {
                 EmptyStateView(title: "Không có server chung",
                                systemImage: "exclamationmark.triangle",
@@ -3129,6 +3111,7 @@ struct RoomGuildListView: View {
                     Button {
                         room.selectedGuild = g
                         room.selectedChannel = nil
+                        Task { await room.loadChannelsForSelected(guild: g) } // ✅ TẢI KÊNH KHI CHỌN SERVER
                     } label: {
                         HStack(spacing: 12) {
                             if let icon = g.icon,
@@ -3139,11 +3122,6 @@ struct RoomGuildListView: View {
                             } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(g.name).font(.headline)
-                                if let chs = room.eligibleChannels[g.id] {
-                                    let voiceOnly = chs.filter { $0.isVoice }.count
-                                    Text("\(voiceOnly) kênh thoại")
-                                        .font(.caption2).foregroundStyle(.secondary)
-                                }
                             }
                             Spacer()
                             Image(systemName: "chevron.right").foregroundStyle(.tertiary)
@@ -3178,8 +3156,12 @@ struct RoomConfigView: View {
                     } else { Circle().fill(.gray.opacity(0.3)).frame(width: 48, height: 48) }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(guild.name).font(.headline)
-                        Text("\(channels.filter { $0.isVoice }.count) kênh thoại")
-                            .font(.caption2).foregroundStyle(.secondary)
+                        if room.isLoading {
+                            Text("Đang tải kênh...").font(.caption2).foregroundStyle(.blue)
+                        } else {
+                            Text("\(channels.filter { $0.isVoice }.count) kênh thoại")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer()
                     Button { room.selectedGuild = nil } label: {
@@ -3187,45 +3169,50 @@ struct RoomConfigView: View {
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("CHỌN KÊNH THOẠI").font(.caption).bold().foregroundStyle(.secondary)
-                    if channels.isEmpty {
-                        Text("Không có kênh thoại chung").font(.caption).foregroundStyle(.red)
-                    } else {
-                        ForEach(channels) { ch in
-                            let accessCount = room.accessCount(guildId: guild.id, channelId: ch.id)
-                            let totalTokens = room.selectedTokenIds.count
-                            let hasAccess = accessCount > 0
+                if room.isLoading {
+                    ProgressView("Đang quét kênh thoại...")
+                        .padding(50)
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("CHỌN KÊNH THOẠI").font(.caption).bold().foregroundStyle(.secondary)
+                        if channels.isEmpty {
+                            Text("Không có kênh thoại chung").font(.caption).foregroundStyle(.red).padding()
+                        } else {
+                            ForEach(channels) { ch in
+                                let accessCount = room.accessCount(guildId: guild.id, channelId: ch.id)
+                                let totalTokens = room.selectedTokenIds.count
+                                let hasAccess = accessCount > 0
 
-                            Button {
-                                room.selectedChannel = ch
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: ch.icon).foregroundStyle(.indigo).frame(width: 22)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(ch.name).font(.subheadline)
-                                            .foregroundStyle(hasAccess ? .primary : .secondary)
-                                        Text("\(accessCount)/\(totalTokens) token có quyền")
-                                            .font(.caption2)
-                                            .foregroundStyle(accessCount == totalTokens ? .green :
-                                                            (hasAccess ? .orange : .red))
+                                Button {
+                                    room.selectedChannel = ch
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: ch.icon).foregroundStyle(.indigo).frame(width: 22)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(ch.name).font(.subheadline)
+                                                .foregroundStyle(hasAccess ? .primary : .secondary)
+                                            Text("\(accessCount)/\(totalTokens) token có quyền")
+                                                .font(.caption2)
+                                                .foregroundStyle(accessCount == totalTokens ? .green :
+                                                                (hasAccess ? .orange : .red))
+                                        }
+                                        Spacer()
+                                        if room.selectedChannel?.id == ch.id {
+                                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo)
+                                        }
                                     }
-                                    Spacer()
-                                    if room.selectedChannel?.id == ch.id {
-                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo)
-                                    }
+                                    .padding(12)
+                                    .background(room.selectedChannel?.id == ch.id
+                                                ? Color.indigo.opacity(0.15)
+                                                : Color(UIColor.secondarySystemBackground))
+                                    .cornerRadius(10)
                                 }
-                                .padding(12)
-                                .background(room.selectedChannel?.id == ch.id
-                                            ? Color.indigo.opacity(0.15)
-                                            : Color(UIColor.secondarySystemBackground))
-                                .cornerRadius(10)
+                                .buttonStyle(.plain)
+                                .disabled(!hasAccess)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(!hasAccess)
                         }
-                    }
-                }.padding().background(Color(UIColor.tertiarySystemBackground)).cornerRadius(12)
+                    }.padding().background(Color(UIColor.tertiarySystemBackground)).cornerRadius(12)
+                }
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("CHỨC NĂNG KHI ĐANG Ở TRONG VOICE").font(.caption).bold().foregroundStyle(.secondary)
@@ -3243,9 +3230,9 @@ struct RoomConfigView: View {
                 }
                 .background(canStart ? Color.green : Color.gray)
                 .foregroundStyle(.white).cornerRadius(12)
-                .disabled(!canStart)
+                .disabled(!canStart || room.isLoading)
 
-                if !canStart {
+                if !canStart && !room.isLoading {
                     Text("Chọn kênh thoại + ít nhất 1 token").font(.caption).foregroundStyle(.secondary)
                 }
             }.padding()
