@@ -1650,7 +1650,8 @@ struct ProxyInfo {
     let password: String?
     let scheme: String
 
-    /// Chấp nhận: host:port | host:port:user:pass | user:pass@host:port | scheme://...
+    /// Chấp nhận: host:port | host:port:user:pass | user:pass@host:port | http://...
+    /// ✅ iOS CHỈ hỗ trợ HTTP proxy — từ chối scheme socks.
     static func parse(_ raw: String) -> ProxyInfo? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // CHỈ 1 proxy: từ chối nếu có xuống dòng
@@ -1660,6 +1661,8 @@ struct ProxyInfo {
             scheme = String(s[..<r.lowerBound]).lowercased()
             s = String(s[r.upperBound...])
         }
+        // ✅ iOS chỉ hỗ trợ HTTP/HTTPS proxy qua connectionProxyDictionary
+        guard scheme == "http" || scheme == "https" else { return nil }
         var user: String? = nil
         var pass: String? = nil
         if let at = s.range(of: "@") {
@@ -1686,9 +1689,9 @@ final class ProxyAuthDelegate: NSObject, URLSessionTaskDelegate {
                     didReceive challenge: URLAuthenticationChallenge) async
         -> (URLSession.AuthChallengeDisposition, URLCredential?) {
         let m = challenge.protectionSpace.authenticationMethod
+        // ✅ iOS: chỉ Basic/Digest (bỏ NSURLAuthenticationMethodProxy vì macOS-only)
         if m == NSURLAuthenticationMethodHTTPBasic ||
-           m == NSURLAuthenticationMethodHTTPDigest ||
-           m == NSURLAuthenticationMethodProxy {
+           m == NSURLAuthenticationMethodHTTPDigest {
             if let u = username, let p = password {
                 return (.useCredential, URLCredential(user: u, password: p, persistence: .forSession))
             }
@@ -1763,7 +1766,8 @@ final class UsernameCheckerManager: ObservableObject {
     func start() {
         guard !isRunning else { return }
         guard let proxy = ProxyInfo.parse(proxyRaw) else {
-            lastError = "Proxy không hợp lệ (chỉ nhập 1 proxy)"; return
+            lastError = "Proxy không hợp lệ. iOS chỉ hỗ trợ HTTP proxy (host:port:user:pass). Không hỗ trợ SOCKS."
+            return
         }
         var names = inputText
             .components(separatedBy: .newlines)
@@ -1872,20 +1876,15 @@ final class UsernameCheckerManager: ObservableObject {
             "Origin": "https://discord.com",
             "Referer": "https://discord.com/register"
         ]
+        // ✅ iOS chỉ hỗ trợ HTTP proxy (kCFNetworkProxiesHTTPxxx).
+        // Không có kCFNetworkProxiesHTTPSxxx / SOCKSxxx trên iOS —
+        // HTTPS requests vẫn đi qua HTTP proxy bằng CONNECT tunnel.
         var d: [AnyHashable: Any] = [:]
-        if proxy.scheme.hasPrefix("socks") {
-            d[kCFNetworkProxiesSOCKSEnable as String] = 1
-            d[kCFNetworkProxiesSOCKSProxy as String] = proxy.host
-            d[kCFNetworkProxiesSOCKSPort as String] = proxy.port
-        } else {
-            d[kCFNetworkProxiesHTTPEnable as String] = 1
-            d[kCFNetworkProxiesHTTPProxy as String] = proxy.host
-            d[kCFNetworkProxiesHTTPPort as String] = proxy.port
-            d[kCFNetworkProxiesHTTPSEnable as String] = 1
-            d[kCFNetworkProxiesHTTPSProxy as String] = proxy.host
-            d[kCFNetworkProxiesHTTPSPort as String] = proxy.port
-        }
+        d[kCFNetworkProxiesHTTPEnable as String] = 1
+        d[kCFNetworkProxiesHTTPProxy as String] = proxy.host
+        d[kCFNetworkProxiesHTTPPort as String] = proxy.port
         cfg.connectionProxyDictionary = d
+
         let del = ProxyAuthDelegate(username: proxy.username, password: proxy.password)
         return URLSession(configuration: cfg, delegate: del, delegateQueue: nil)
     }
@@ -2415,14 +2414,14 @@ struct UsernameCheckerView: View {
                                     .font(.caption.bold())
                             }
                         }
-                        TextField("host:port:user:pass", text: $checker.proxyRaw)
+                        TextField("host:port:user:pass  (HTTP proxy)", text: $checker.proxyRaw)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                             .padding(10)
                             .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(10)
                             .onChange(of: checker.proxyRaw) { _ in checker.validateProxy() }
                         if !checker.proxyRaw.isEmpty {
-                            Text(checker.proxyValid ? "✅ Proxy hợp lệ" : "❌ Proxy sai định dạng")
+                            Text(checker.proxyValid ? "✅ Proxy hợp lệ" : "❌ Proxy sai định dạng (chỉ hỗ trợ HTTP)")
                                 .font(.caption2)
                                 .foregroundStyle(checker.proxyValid ? .green : .red)
                         }
@@ -2743,7 +2742,6 @@ struct SpamView: View {
                     } else if app.isLoading {
                         ProgressView("Đang tải...")
                     } else if filtered.isEmpty {
-                        // ✅ FIX: phân biệt search vs lỗi tải
                         EmptyStateView(
                             title: searchText.isEmpty ? "Chưa tải được server" : "Không tìm thấy",
                             systemImage: searchText.isEmpty ? "server.rack" : "magnifyingglass",
