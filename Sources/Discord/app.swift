@@ -5,6 +5,41 @@ import AVFoundation
 import UniformTypeIdentifiers
 import UIKit
 import CryptoKit
+import MediaPlayer // Thêm thư viện để hiện thông báo màn hình khóa
+
+// ==========================================
+// MARK: - NOW PLAYING MANAGER (MÀN HÌNH KHÓA)
+// ==========================================
+class NowPlayingManager {
+    static let shared = NowPlayingManager()
+    
+    func start(title: String, subtitle: String) {
+        var info = [String: Any]()
+        info[MPMediaItemPropertyTitle] = title
+        info[MPMediaItemPropertyArtist] = subtitle
+        info[MPMediaItemPropertyAlbumTitle] = "Quoc Thang Tools"
+        info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+        info[MPNowPlayingInfoPropertyIsLiveStream] = true
+        
+        // Fake album art (có thể thay bằng ảnh thật nếu muốn)
+        // let image = UIImage(named: "app_icon")
+        // info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image?.size ?? .zero) { _ in image! }
+        
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+    
+    func update(title: String, subtitle: String) {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        info[MPMediaItemPropertyTitle] = title
+        info[MPMediaItemPropertyArtist] = subtitle
+        info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+    
+    func stop() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+}
 
 // ==========================================
 // MARK: - DOCUMENT PICKER
@@ -33,7 +68,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
 }
 
 // ==========================================
-// MARK: - KEYCHAIN HELPER (LƯU TRỮ VĨNH VIỄN)
+// MARK: - KEYCHAIN HELPER
 // ==========================================
 class KeychainHelper {
     static let standard = KeychainHelper()
@@ -238,6 +273,10 @@ class DiscordClient {
     init(token: String) {
         self.token = token
         let cfg = URLSessionConfiguration.default
+        // FIX TREO APP: Tăng timeout, chờ kết nối
+        cfg.timeoutIntervalForRequest = 30
+        cfg.waitsForConnectivity = true
+        
         let sp = """
         {"os":"Mac OS X","browser":"Chrome","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0","browser_version":"126.0.0.0","os_version":"10.15.7","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
         """
@@ -271,10 +310,12 @@ class DiscordClient {
         req.httpMethod = "POST"
         req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req)
+        
         if let h = r as? HTTPURLResponse, h.statusCode == 429,
            let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
            let retry = j["retry_after"] as? Double {
-            try await Task.sleep(nanoseconds: UInt64((retry + 0.5) * 1_000_000_000))
+            // FIX: Nghỉ đúng thời gian Discord yêu cầu + 1s an toàn
+            try await Task.sleep(nanoseconds: UInt64((retry + 1.0) * 1_000_000_000))
             return try await sendMessage(channelId: channelId, content: content)
         }
         try check(r, d)
@@ -282,33 +323,41 @@ class DiscordClient {
 }
 
 // ==========================================
-// MARK: - APP STATE
+// MARK: - APP STATE (SPAM ĐA TOKEN)
 // ==========================================
 @MainActor
 class AppState: ObservableObject {
     @Published var tokens: [TokenInfo] = [] { didSet { saveTokens() } }
-    @Published var activeToken: TokenInfo? = nil
+    @Published var selectedTokenIds: Set<UUID> = [] // Đa token
+    
+    // Trạng thái tải
     @Published var isCheckingToken = false
     @Published var guilds: [Guild] = []
     @Published var channels: [Channel] = []
     @Published var isLoading = false
+    
+    // Cấu hình
     @Published var delaySeconds: Double = 2.0
     @Published var useTag = true
     @Published var targetUserId = ""
     @Published var addPrefix = false
     @Published var addSuffix = false
+    
+    // Nội dung
     @Published var inputText = ""
     @Published var messages: [ParsedMessage] = []
+    
+    // Trạng thái gửi
     @Published var isSending = false
     @Published var totalSent = 0
     @Published var currentMessageStr = ""
     @Published var lastError: String?
-
-    private var client: DiscordClient? { activeToken.map { DiscordClient(token: $0.token) } }
+    
     private var isCancelled = false
-    private var sendTask: Task<Void, Never>?
+    private var spamTask: Task<Void, Never>?
 
     init() { loadTokens() }
+    
     private func saveTokens() {
         if let e = try? JSONEncoder().encode(tokens) { UserDefaults.standard.set(e, forKey: "SavedTokens") }
     }
@@ -316,11 +365,10 @@ class AppState: ObservableObject {
         if let d = UserDefaults.standard.data(forKey: "SavedTokens"),
            let s = try? JSONDecoder().decode([TokenInfo].self, from: d) {
             tokens = s
-            if let a = s.first(where: { $0.isValid }) {
-                activeToken = a; Task { await loadGuilds() }
-            }
         }
     }
+    
+    // MARK: - TOKEN MANAGEMENT
     func addToken(_ s: String) async {
         let c = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !c.isEmpty, !tokens.contains(where: { $0.token == c }) else { return }
@@ -328,12 +376,15 @@ class AppState: ObservableObject {
         do {
             let u = try await DiscordClient(token: c).validateToken()
             let t = TokenInfo(token: c, userId: u.id, username: u.globalName ?? u.username, avatarHash: u.avatar, isValid: true)
-            tokens.append(t); if activeToken == nil { setActiveToken(t) }
+            tokens.append(t)
+            // Tự động chọn nếu là token đầu tiên
+            if selectedTokenIds.isEmpty { selectedTokenIds.insert(t.id) }
         } catch {
             tokens.append(TokenInfo(token: c, userId: "0", username: "Token chết", avatarHash: nil, isValid: false))
         }
         isCheckingToken = false
     }
+    
     func addTokensFromFile(url: URL) async {
         let got = url.startAccessingSecurityScopedResource()
         defer { if got { url.stopAccessingSecurityScopedResource() } }
@@ -355,27 +406,73 @@ class AppState: ObservableObject {
         }
         lastError = nil
     }
-    func setActiveToken(_ t: TokenInfo) { guard t.isValid else { return }; activeToken = t; Task { await loadGuilds() } }
-    func deleteToken(at off: IndexSet) {
-        if let a = activeToken, off.map({ tokens[$0] }).contains(where: { $0.id == a.id }) { activeToken = nil; guilds = [] }
-        tokens.remove(atOffsets: off)
+    
+    func toggleTokenSelection(_ t: TokenInfo) {
+        guard t.isValid else { return }
+        if selectedTokenIds.contains(t.id) {
+            selectedTokenIds.remove(t.id)
+        } else {
+            selectedTokenIds.insert(t.id)
+        }
+        // Tải lại server nếu danh sách token thay đổi
+        Task { await loadGuilds() }
     }
+    
+    func deleteToken(at off: IndexSet) {
+        let removedIds = off.map { tokens[$0].id }
+        for id in removedIds {
+            selectedTokenIds.remove(id)
+        }
+        tokens.remove(atOffsets: off)
+        Task { await loadGuilds() }
+    }
+    
+    // MARK: - LOAD GUILDS (INTERSECTION)
     func loadGuilds() async {
-        guard let c = client else { return }
+        guard !selectedTokenIds.isEmpty else {
+            guilds = []
+            return
+        }
         isLoading = true
-        do { guilds = try await c.getAllGuilds().sorted { $0.name < $1.name } }
-        catch { lastError = error.localizedDescription }
+        guilds = []
+        
+        let selected = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
+        var guildSets: [Set<String>] = []
+        var guildMap: [String: Guild] = [:]
+        
+        // Lấy danh sách server của TỪNG token
+        for t in selected {
+            let c = DiscordClient(token: t.token)
+            if let gs = try? await c.getAllGuilds() {
+                let set = Set(gs.map { $0.id })
+                guildSets.append(set)
+                for g in gs { guildMap[g.id] = g }
+            }
+        }
+        
+        // Tìm giao điểm (Server mà tất cả token đều ở)
+        if let firstSet = guildSets.first {
+            var intersection = firstSet
+            for set in guildSets.dropFirst() {
+                intersection = intersection.intersection(set)
+            }
+            guilds = intersection.compactMap { guildMap[$0] }.sorted { $0.name < $1.name }
+        }
+        
         isLoading = false
     }
+    
     func loadChannels(for g: Guild) async {
-        guard let c = client else { return }
+        guard let firstToken = tokens.first(where: { selectedTokenIds.contains($0.id) && $0.isValid }) else { return }
         isLoading = true
         do {
+            let c = DiscordClient(token: firstToken.token)
             let all = try await c.getAllChannels(guildId: g.id)
             channels = all.filter { $0.isSendableText || $0.isCategory }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         } catch { lastError = error.localizedDescription }
         isLoading = false
     }
+    
     func groupedChannels() -> [(category: Channel?, items: [Channel])] {
         var r: [(Channel?, [Channel])] = []
         let o = channels.filter { $0.isSendableText && $0.parentId == nil }
@@ -386,6 +483,8 @@ class AppState: ObservableObject {
         }
         return r
     }
+    
+    // MARK: - FILE PARSING
     func parseFile(url: URL) {
         let got = url.startAccessingSecurityScopedResource()
         defer { if got { url.stopAccessingSecurityScopedResource() } }
@@ -406,38 +505,106 @@ class AppState: ObservableObject {
         inputText = fc.replacingOccurrences(of: "\u{FEFF}", with: "")
         parseDirectInput(); lastError = nil
     }
+    
     func parseDirectInput() {
         messages = inputText.components(separatedBy: .newlines).compactMap {
             let t = $0.trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? nil : ParsedMessage(body: t)
         }
     }
+    
+    // MARK: - SPAM LOGIC (ĐA LUỒNG)
     func startSending(channel: Channel) {
-        guard let c = client, !messages.isEmpty else { return }
+        let selectedTokens = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
+        guard !selectedTokens.isEmpty, !messages.isEmpty else { return }
         if useTag && targetUserId.isEmpty { return }
-        isSending = true; isCancelled = false; totalSent = 0; lastError = nil
+        
+        isSending = true
+        isCancelled = false
+        totalSent = 0
+        lastError = nil
+        
         BackgroundManager.shared.start()
-        sendTask = Task { [weak self] in
-            guard let self = self else { return }
-            var i = 0
-            while !self.isCancelled && !Task.isCancelled {
-                let m = self.messages[i]
-                var p = ""
-                if self.addPrefix { p += "> " }
-                if self.addSuffix { p += "# " }
-                var fc = p + m.body
-                if self.useTag { fc += " <@\(self.targetUserId)>" }
-                self.currentMessageStr = fc
-                do { try await c.sendMessage(channelId: channel.id, content: fc); self.totalSent += 1 }
-                catch { self.lastError = error.localizedDescription }
-                i = (i + 1) % self.messages.count
-                let d = max(0.1, self.delaySeconds + Double.random(in: -0.3...0.3) * self.delaySeconds)
-                do { try await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) } catch { break }
+        NowPlayingManager.shared.start(title: "Đang Spam...", subtitle: "Chuẩn bị gửi...")
+        
+        // Tạo client cho từng token
+        let clients = selectedTokens.map { DiscordClient(token: $0.token) }
+        
+        spamTask = Task {
+            // FIX TREO: Sử dụng TaskGroup để chạy song song, mỗi token 1 luồng
+            await withTaskGroup(of: Void.self) { group in
+                for client in clients {
+                    group.addTask {
+                        var currentIndex = 0
+                        while !Task.isCancelled && !(await MainActor.run { self.isCancelled }) {
+                            let msg = await MainActor.run { self.messages[currentIndex] }
+                            
+                            var prefix = ""
+                            if await MainActor.run(body: { self.addPrefix }) { prefix += "> " }
+                            if await MainActor.run(body: { self.addSuffix }) { prefix += "# " }
+                            
+                            var finalContent = prefix + msg.body
+                            if await MainActor.run(body: { self.useTag }) {
+                                let uid = await MainActor.run { self.targetUserId }
+                                finalContent += " <@\(uid)>"
+                            }
+                            
+                            // Cập nhật UI
+                            await MainActor.run {
+                                self.currentMessageStr = finalContent
+                            }
+                            
+                            do {
+                                // Gửi tin nhắn
+                                try await client.sendMessage(channelId: channel.id, content: finalContent)
+                                
+                                // Cập nhật số lượng & Now Playing
+                                let newTotal = await MainActor.run { () -> Int in
+                                    self.totalSent += 1
+                                    return self.totalSent
+                                }
+                                
+                                NowPlayingManager.shared.update(title: "Đang Spam...", subtitle: "Đã gửi: \(newTotal) tin nhắn")
+                                
+                            } catch {
+                                let err = error.localizedDescription
+                                await MainActor.run { self.lastError = err }
+                            }
+                            
+                            currentIndex = (currentIndex + 1) % (await MainActor.run { self.messages.count })
+                            
+                            // Delay
+                            let delay = await MainActor.run { self.delaySeconds }
+                            let actualDelay = max(0.1, delay + Double.random(in: -0.3...0.3) * delay)
+                            do {
+                                try await Task.sleep(nanoseconds: UInt64(actualDelay * 1_000_000_000))
+                            } catch {
+                                break // Bị cancel
+                            }
+                        }
+                    }
+                }
             }
-            self.isSending = false; self.currentMessageStr = ""
+            
+            // Hoàn tất
+            await MainActor.run {
+                self.isSending = false
+                self.currentMessageStr = ""
+                BackgroundManager.shared.stop()
+                NowPlayingManager.shared.stop()
+            }
         }
     }
-    func stopSending() { isCancelled = true; sendTask?.cancel(); sendTask = nil; isSending = false; BackgroundManager.shared.stop() }
+    
+    func stopSending() {
+        isCancelled = true
+        spamTask?.cancel()
+        spamTask = nil
+        isSending = false
+        BackgroundManager.shared.stop()
+        NowPlayingManager.shared.stop()
+    }
+    
     func hideKeyboard() { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
 }
 
@@ -1389,22 +1556,14 @@ enum LicenseStatus: Equatable {
 final class LicenseAPIClient {
     static let shared = LicenseAPIClient()
 
-    // ⚠️ ĐỔI URL NÀY thành URL Worker của bạn
     let baseURL = "https://key.nqtaff01.workers.dev"
 
     private func machineID() -> String {
         let keychainKey = "QT_MachineID"
-        
-        // Thử đọc từ Keychain trước để đảm bảo ID không đổi khi xóa app
-        if let savedID = KeychainHelper.standard.readString(forKey: keychainKey) {
-            return savedID
-        }
-        
-        // Nếu chưa có, tạo mới và lưu vào Keychain
+        if let savedID = KeychainHelper.standard.readString(forKey: keychainKey) { return savedID }
         let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)-\(Bundle.main.bundleIdentifier ?? "app")"
         let hash = SHA256.hash(data: Data(raw.utf8))
         let newID = hash.compactMap { String(format: "%02x", $0) }.joined()
-        
         KeychainHelper.standard.saveString(newID, forKey: keychainKey)
         return newID
     }
@@ -1414,10 +1573,7 @@ final class LicenseAPIClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 15
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "license_key": key,
-            "machine_id": machineID()
-        ])
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["license_key": key, "machine_id": machineID()])
         let (data, _) = try await URLSession.shared.data(for: req)
         return try JSONDecoder().decode(LicenseActivationResponse.self, from: data)
     }
@@ -1427,10 +1583,7 @@ final class LicenseAPIClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 15
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "license_key": key,
-            "machine_id": machineID() // Check chính chủ
-        ])
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["license_key": key, "machine_id": machineID()])
         let (data, _) = try await URLSession.shared.data(for: req)
         return try JSONDecoder().decode(LicenseValidationResponse.self, from: data)
     }
@@ -1451,14 +1604,11 @@ final class LicenseManager: ObservableObject {
     private let activatedStoreKey = "QT_LicenseActivatedAt"
 
     init() {
-        // Đọc dữ liệu từ Keychain
         self.licenseKey = KeychainHelper.standard.readString(forKey: keyStoreKey)
-        
         if let actString = KeychainHelper.standard.readString(forKey: activatedStoreKey),
            let actDouble = Double(actString) {
             self.activatedAt = Date(timeIntervalSince1970: actDouble)
         }
-
         if licenseKey == nil {
             status = .notActivated
         } else if let expString = KeychainHelper.standard.readString(forKey: expiryStoreKey),
@@ -1466,10 +1616,7 @@ final class LicenseManager: ObservableObject {
             let cachedExp = Date(timeIntervalSince1970: expDouble)
             status = Date() > cachedExp ? .expired(expiresOn: cachedExp) : .valid(expiresOn: cachedExp)
         }
-        
-        Task { @MainActor [weak self] in
-            await self?.refreshStatus()
-        }
+        Task { @MainActor [weak self] in await self?.refreshStatus() }
     }
 
     func activate(key: String) async -> LicenseStatus {
@@ -1485,13 +1632,10 @@ final class LicenseManager: ObservableObject {
             if res.valid == true, let expMs = res.expiresAt {
                 let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
                 let now = Date()
-                
-                // Lưu vào Keychain
                 KeychainHelper.standard.saveString(clean, forKey: keyStoreKey)
                 KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
                 KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: lastCheckKey)
                 KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
-                
                 licenseKey = clean
                 activatedAt = now
                 status = .valid(expiresOn: exp)
@@ -1513,15 +1657,12 @@ final class LicenseManager: ObservableObject {
         }
         isChecking = true
         defer { isChecking = false }
-
         do {
             let res = try await LicenseAPIClient.shared.validate(key: key)
             if res.valid == true, let expMs = res.expiresAt {
                 let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
-                
                 KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
                 KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
-                
                 status = .valid(expiresOn: exp)
                 return
             } else {
@@ -1548,10 +1689,7 @@ final class LicenseManager: ObservableObject {
         KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: expiryStoreKey)
         KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: lastCheckKey)
         KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: activatedStoreKey)
-        
-        licenseKey = nil
-        activatedAt = nil
-        status = .notActivated
+        licenseKey = nil; activatedAt = nil; status = .notActivated
     }
 
     var isUnlocked: Bool {
@@ -1570,9 +1708,7 @@ final class LicenseManager: ObservableObject {
     }
 
     func formatDate(_ d: Date) -> String {
-        let df = DateFormatter()
-        df.dateFormat = "dd/MM/yyyy"
-        return df.string(from: d)
+        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy"; return df.string(from: d)
     }
 }
 
@@ -1588,10 +1724,7 @@ struct LockView: View {
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.08, green: 0.08, blue: 0.16), Color.black],
-                startPoint: .top, endPoint: .bottom
-            ).ignoresSafeArea()
+            LinearGradient(colors: [Color(red: 0.08, green: 0.08, blue: 0.16), Color.black], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
 
             ScrollView {
                 VStack(spacing: 24) {
@@ -1604,57 +1737,32 @@ struct LockView: View {
                             .shadow(color: .red.opacity(0.4), radius: 20)
                             .onTapGesture {
                                 logoTapCount += 1
-                                if logoTapCount >= 7 {
-                                    logoTapCount = 0
-                                    showAdminInfo = true
-                                }
+                                if logoTapCount >= 7 { logoTapCount = 0; showAdminInfo = true }
                             }
 
-                        Text("QUOC THANG TOOLS")
-                            .font(.system(size: 22, weight: .heavy))
-                            .foregroundStyle(.white)
-                            .tracking(1.5)
-
-                        Text("LICENSE REQUIRED")
-                            .font(.caption.bold())
-                            .foregroundStyle(.red.opacity(0.8))
-                            .tracking(3)
+                        Text("QUOC THANG TOOLS").font(.system(size: 22, weight: .heavy)).foregroundStyle(.white).tracking(1.5)
+                        Text("LICENSE REQUIRED").font(.caption.bold()).foregroundStyle(.red.opacity(0.8)).tracking(3)
                     }
 
                     VStack(spacing: 14) {
                         TextField("Nhập license key...", text: $input)
-                            .textInputAutocapitalization(.characters)
-                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.characters).autocorrectionDisabled()
                             .font(.system(.body, design: .monospaced))
-                            .padding(14)
-                            .background(Color.white.opacity(0.08))
-                            .foregroundStyle(.white)
-                            .cornerRadius(10)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                            )
+                            .padding(14).background(Color.white.opacity(0.08)).foregroundStyle(.white).cornerRadius(10)
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.15), lineWidth: 1))
                             .onChange(of: input) { _ in error = nil }
 
-                        if let e = error {
-                            Text(e).font(.caption).foregroundStyle(.red)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal)
-                        }
+                        if let e = error { Text(e).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center).padding(.horizontal) }
 
                         Button {
                             Task {
                                 error = nil
                                 let st = await license.activate(key: input)
                                 switch st {
-                                case .valid:
-                                    error = nil
-                                case .invalid(let r):
-                                    error = r
-                                case .expired(let d):
-                                    error = "Key đã hết hạn ngày \(fmt(d))"
-                                default:
-                                    error = "Không thể kích hoạt"
+                                case .valid: error = nil
+                                case .invalid(let r): error = r
+                                case .expired(let d): error = "Key đã hết hạn ngày \(fmt(d))"
+                                default: error = "Không thể kích hoạt"
                                 }
                             }
                         } label: {
@@ -1664,35 +1772,24 @@ struct LockView: View {
                             }.frame(maxWidth: .infinity).padding()
                         }
                         .background(input.trimmingCharacters(in: .whitespaces).isEmpty ? Color.gray : Color.indigo)
-                        .foregroundStyle(.white)
-                        .cornerRadius(10)
+                        .foregroundStyle(.white).cornerRadius(10)
                         .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || license.isChecking)
-                    }
-                    .padding(.horizontal, 30)
+                    }.padding(.horizontal, 30)
 
                     if case .expired(let d) = license.status {
-                        Text("⚠️ Key trước đó đã hết hạn ngày \(fmt(d))")
-                            .font(.caption).foregroundStyle(.orange)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal)
+                        Text("⚠️ Key trước đó đã hết hạn ngày \(fmt(d))").font(.caption).foregroundStyle(.orange).multilineTextAlignment(.center).padding(.horizontal)
                     }
 
                     Spacer(minLength: 20)
-
                     Text("v1.0").font(.caption2).foregroundStyle(.gray.opacity(0.4))
-                }
-                .padding(.vertical, 20)
+                }.padding(.vertical, 20)
             }
         }
-        .sheet(isPresented: $showAdminInfo) {
-            LicenseAdminInfoView().environmentObject(license)
-        }
+        .sheet(isPresented: $showAdminInfo) { LicenseAdminInfoView().environmentObject(license) }
     }
 
     private func fmt(_ d: Date) -> String {
-        let df = DateFormatter()
-        df.dateFormat = "dd/MM/yyyy"
-        return df.string(from: d)
+        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy"; return df.string(from: d)
     }
 }
 
@@ -1707,90 +1804,30 @@ struct LicenseAdminInfoView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("THÔNG TIN ADMIN")
-                        .font(.headline)
-
+                    Text("THÔNG TIN ADMIN").font(.headline)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("API Endpoint").font(.caption.bold()).foregroundStyle(.secondary)
-                        Text(LicenseAPIClient.shared.baseURL)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(10)
+                        Text(LicenseAPIClient.shared.baseURL).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    }.padding().frame(maxWidth: .infinity, alignment: .leading).background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
 
                     if let k = license.licenseKey {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("KEY HIỆN TẠI").font(.caption.bold()).foregroundStyle(.secondary)
-                            Text(k).font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
+                            Text(k).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                             Text(license.statusText).font(.caption2).foregroundStyle(.green)
-                        }
-                        .padding()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(UIColor.secondarySystemBackground))
-                        .cornerRadius(10)
+                        }.padding().frame(maxWidth: .infinity, alignment: .leading).background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
                     }
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("TẠO KEY MỚI (từ máy tính)").font(.caption.bold()).foregroundStyle(.secondary)
-                        Text("""
-                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/create \\
-                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
-                          -H "Content-Type: application/json" \\
-                          -d '{"email":"user@example.com","duration_days":365}'
-                        """)
-                        .font(.system(size: 10, design: .monospaced))
-                        .padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(6)
-                        .textSelection(.enabled)
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(10)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("LỆNH QUẢN LÝ (curl)").font(.caption.bold()).foregroundStyle(.secondary)
-                        Text("""
-                        # Thu hồi key
-                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/disable \\
-                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
-                          -d '{"license_key":"QT-XXXXX-XXXXX"}'
-                        """)
-                        .font(.system(size: 10, design: .monospaced))
-                        .padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(6)
-                        .textSelection(.enabled)
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(10)
 
                     Button(role: .destructive) {
                         license.deactivate()
                         dismiss()
                     } label: {
-                        Label("Xoá key hiện tại", systemImage: "trash")
-                            .frame(maxWidth: .infinity).padding(10)
-                    }
-                    .background(Color.red.opacity(0.15)).foregroundStyle(.red)
-                    .cornerRadius(8)
-                }
-                .padding()
+                        Label("Xoá key hiện tại", systemImage: "trash").frame(maxWidth: .infinity).padding(10)
+                    }.background(Color.red.opacity(0.15)).foregroundStyle(.red).cornerRadius(8)
+                }.padding()
             }
-            .navigationTitle("Admin Info")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Đóng") { dismiss() }
-                }
-            }
+            .navigationTitle("Admin Info").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Đóng") { dismiss() } } }
         }
     }
 }
@@ -1806,136 +1843,72 @@ struct AboutView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 20) {
-                    
-                    // MARK: License Card
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("LICENSE INFORMATION")
-                            .font(.caption.bold())
-                            .foregroundStyle(.secondary)
-                        
+                        Text("LICENSE INFORMATION").font(.caption.bold()).foregroundStyle(.secondary)
                         HStack {
-                            Text("License Key")
-                                .font(.subheadline)
+                            Text("License Key").font(.subheadline)
                             Spacer()
-                            Text(maskedKey)
-                                .font(.system(.subheadline, design: .monospaced))
-                                .foregroundStyle(.indigo)
-                            
-                            Toggle("", isOn: $showFullKey)
-                                .labelsHidden()
-                                .tint(.indigo)
-                                .scaleEffect(0.8)
+                            Text(maskedKey).font(.system(.subheadline, design: .monospaced)).foregroundStyle(.indigo)
+                            Toggle("", isOn: $showFullKey).labelsHidden().tint(.indigo).scaleEffect(0.8)
                         }
                         Divider()
-                        
                         HStack {
-                            Text("Activated On")
-                                .font(.subheadline)
+                            Text("Activated On").font(.subheadline)
                             Spacer()
-                            Text(license.activatedAt != nil ? license.formatDate(license.activatedAt!) : "N/A")
-                                .font(.subheadline.bold())
-                                .foregroundStyle(.secondary)
+                            Text(license.activatedAt != nil ? license.formatDate(license.activatedAt!) : "N/A").font(.subheadline.bold()).foregroundStyle(.secondary)
                         }
                         Divider()
-                        
                         HStack {
-                            Text("Expires On")
-                                .font(.subheadline)
+                            Text("Expires On").font(.subheadline)
                             Spacer()
                             if case .valid(let exp) = license.status {
-                                Text(license.formatDate(exp))
-                                    .font(.subheadline.bold())
-                                    .foregroundStyle(.green)
+                                Text(license.formatDate(exp)).font(.subheadline.bold()).foregroundStyle(.green)
                             } else if case .expired(let exp) = license.status {
-                                Text(license.formatDate(exp))
-                                    .font(.subheadline.bold())
-                                    .foregroundStyle(.red)
+                                Text(license.formatDate(exp)).font(.subheadline.bold()).foregroundStyle(.red)
                             } else {
-                                Text("N/A")
-                                    .font(.subheadline.bold())
-                                    .foregroundStyle(.secondary)
+                                Text("N/A").font(.subheadline.bold()).foregroundStyle(.secondary)
                             }
                         }
-                    }
-                    .padding()
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(15)
-                    
-                    // MARK: App Info Card
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
-                            Image(systemName: "info.circle.fill")
-                                .foregroundStyle(.blue)
-                            Text("About This App")
-                                .font(.headline)
+                            Image(systemName: "info.circle.fill").foregroundStyle(.blue)
+                            Text("About This App").font(.headline)
                         }
-                        
-                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning, and Voice Room integration. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(15)
-                    
-                    // MARK: Admin Info Card
+                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }.padding().frame(maxWidth: .infinity, alignment: .leading).background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
-                            Image(systemName: "crown.fill")
-                                .foregroundStyle(.yellow)
-                            Text("Admin Services")
-                                .font(.headline)
+                            Image(systemName: "crown.fill").foregroundStyle(.yellow)
+                            Text("Admin Services").font(.headline)
                         }
-                        
                         Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile. Whether you need account registration tools, server nukers, mass DM tools, or any other automation, we can build it for you.")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        
+                            .font(.subheadline).foregroundStyle(.secondary)
                         Divider()
-                        
                         HStack {
-                            Image(systemName: "message.fill")
-                                .foregroundStyle(.indigo)
-                            Text("Contact Admin (Discord):")
-                                .font(.subheadline.bold())
+                            Image(systemName: "message.fill").foregroundStyle(.indigo)
+                            Text("Contact Admin (Discord):").font(.subheadline.bold())
                             Spacer()
-                            Text("@thaitu_thanhhoa")
-                                .font(.system(.subheadline, design: .monospaced))
-                                .foregroundStyle(.indigo)
-                                .textSelection(.enabled)
-                        }
-                        .padding()
-                        .background(Color.indigo.opacity(0.1))
-                        .cornerRadius(10)
-                    }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(15)
-                    
-                    Text("Version 1.0.0")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                        .padding(.top)
-                }
-                .padding()
+                            Text("@thaitu_thanhhoa").font(.system(.subheadline, design: .monospaced)).foregroundStyle(.indigo).textSelection(.enabled)
+                        }.padding().background(Color.indigo.opacity(0.1)).cornerRadius(10)
+                    }.padding().frame(maxWidth: .infinity, alignment: .leading).background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                    Text("Version 1.0.0").font(.caption).foregroundStyle(.tertiary).padding(.top)
+                }.padding()
             }
             .background(Color(UIColor.systemGroupedBackground))
-            .navigationTitle("Information")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Information").navigationBarTitleDisplayMode(.inline)
         }
     }
-    
-    // Hàm che Key
+
     private var maskedKey: String {
         guard let key = license.licenseKey else { return "No Key" }
         if showFullKey { return key }
-        
         let parts = key.split(separator: "-")
-        if parts.count == 3 {
-            return "\(parts[0])-***-\(parts[2])"
-        }
+        if parts.count == 3 { return "\(parts[0])-***-\(parts[2])" }
         return "\(key.prefix(4))***\(key.suffix(4))"
     }
 }
@@ -1967,9 +1940,7 @@ struct SpamDiscordApp: App {
             }
             .onChange(of: scenePhase) { phase in
                 if phase == .active {
-                    Task { @MainActor in
-                        await license.refreshStatus()
-                    }
+                    Task { @MainActor in await license.refreshStatus() }
                 }
             }
             .onChange(of: license.isUnlocked) { isUnlocked in
@@ -1978,6 +1949,7 @@ struct SpamDiscordApp: App {
                     bot.stopNuke()
                     userNuke.stop()
                     BackgroundManager.shared.stop()
+                    NowPlayingManager.shared.stop()
                 }
             }
         }
@@ -2025,7 +1997,7 @@ struct EmptyStateView: View {
 }
 
 // ==========================================
-// MARK: - TOKEN VIEWS
+// MARK: - TOKEN VIEWS (ĐA CHỌN)
 // ==========================================
 struct TokenListView: View {
     @EnvironmentObject var app: AppState
@@ -2038,10 +2010,16 @@ struct TokenListView: View {
                     EmptyStateView(title: "Chưa có Token", systemImage: "key.slash", description: "Thêm token để bắt đầu.")
                 } else {
                     List {
-                        Section(header: Text("Danh sách")) {
+                        Section(header: Text("Danh sách (Chọn nhiều token để Spam)")) {
                             ForEach(app.tokens) { t in
-                                Button { app.setActiveToken(t) } label: {
+                                Button {
+                                    app.toggleTokenSelection(t)
+                                } label: {
                                     HStack(spacing: 12) {
+                                        Image(systemName: app.selectedTokenIds.contains(t.id) ? "checkmark.circle.fill" : "circle")
+                                            .foregroundStyle(app.selectedTokenIds.contains(t.id) ? .indigo : .secondary)
+                                            .font(.title3)
+                                        
                                         if let url = t.avatarURL {
                                             AsyncImage(url: url) { img in img.resizable().scaledToFill() }
                                             placeholder: { Circle().fill(Color.gray.opacity(0.3)) }
@@ -2056,9 +2034,6 @@ struct TokenListView: View {
                                                 .foregroundStyle(t.isValid ? .green : .red)
                                         }
                                         Spacer()
-                                        if app.activeToken?.id == t.id {
-                                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo).font(.title3)
-                                        }
                                     }.padding(.vertical, 4)
                                 }.buttonStyle(.plain).disabled(!t.isValid)
                             }.onDelete(perform: app.deleteToken)
@@ -2125,10 +2100,14 @@ struct SpamView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if app.activeToken == nil {
+                if app.selectedTokenIds.isEmpty {
                     EmptyStateView(title: "Chưa chọn Token", systemImage: "exclamationmark.triangle",
-                                   description: "Vào tab Tokens để thêm.")
-                } else if app.isLoading { ProgressView("Đang tải...") }
+                                   description: "Vào tab Tokens để chọn ít nhất 1 token.")
+                } else if app.isLoading { ProgressView("Đang tải server chung...") }
+                else if app.guilds.isEmpty {
+                    EmptyStateView(title: "Không có Server chung", systemImage: "server.rack",
+                                   description: "Tất cả token được chọn phải cùng ở trong một server.")
+                }
                 else {
                     List(filtered) { g in
                         NavigationLink(value: g) {
@@ -2252,8 +2231,8 @@ struct SendView: View {
                 if app.isSending {
                     VStack(spacing: 12) {
                         ProgressView().scaleEffect(1.5).tint(.indigo).padding(.top)
-                        Text("Đang gửi vô hạn...").font(.headline)
-                        Text("Tổng: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Đang gửi đa luồng (\(app.selectedTokenIds.count) token)...").font(.headline)
+                        Text("Tổng đã gửi: \(app.totalSent)").font(.subheadline).foregroundStyle(.secondary)
                         Text(app.currentMessageStr).font(.caption).foregroundStyle(.gray)
                             .lineLimit(2).multilineTextAlignment(.center).padding(.horizontal)
                         if let e = app.lastError { Text(e).font(.caption).foregroundStyle(.red) }
@@ -2263,7 +2242,7 @@ struct SendView: View {
                     }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
                 } else {
                     Button { app.startSending(channel: channel) } label: {
-                        Text("BẮT ĐẦU GỬI").bold().frame(maxWidth: .infinity).padding()
+                        Text("BẮT ĐẦU GỬI (\(app.selectedTokenIds.count) Token)").bold().frame(maxWidth: .infinity).padding()
                     }.background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
                     .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty))
                     .opacity((app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty)) ? 0.5 : 1)
