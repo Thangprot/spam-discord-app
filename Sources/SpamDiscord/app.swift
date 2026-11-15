@@ -75,6 +75,7 @@ struct GuildRole: Codable { let id, name: String; let position: Int }
 struct BotMember: Codable { let user: BotMemberUser?; let roles: [String]? }
 struct BotMemberUser: Codable { let id: String; let username: String?; let bot: Bool? }
 
+// NukeGuild: permission per action
 struct NukeGuild: Codable {
     let id, name: String
     let icon: String?
@@ -87,20 +88,31 @@ struct NukeGuild: Codable {
     var canManageChannels: Bool { bits & (1 << 4) != 0 }
     var canBan: Bool { bits & (1 << 2) != 0 }
     var canManageRoles: Bool { bits & (1 << 28) != 0 }
+
+    // Per-action
     var canMassBan: Bool { isOwner || isAdmin || canBan }
     var canDeleteChannels: Bool { isOwner || isAdmin || canManageChannels }
     var canCreateChannels: Bool { isOwner || isAdmin || canManageChannels }
     var canCreateRoles: Bool { isOwner || isAdmin || canManageRoles }
     var canRenameGuild: Bool { isOwner || isAdmin || canManageGuild }
+
+    // Show guild if ANY permission is available
     var canDoAnything: Bool {
         canMassBan || canDeleteChannels || canCreateChannels || canCreateRoles || canRenameGuild
     }
 }
 
+// Effective permissions after union of all selected tokens
 struct GuildPermissions {
-    var massBan = false, deleteChannels = false, createChannels = false
-    var createRoles = false, renameGuild = false
-    var any: Bool { massBan || deleteChannels || createChannels || createRoles || renameGuild }
+    var massBan: Bool = false
+    var deleteChannels: Bool = false
+    var createChannels: Bool = false
+    var createRoles: Bool = false
+    var renameGuild: Bool = false
+
+    var any: Bool {
+        massBan || deleteChannels || createChannels || createRoles || renameGuild
+    }
 }
 
 enum NukeStepType: String, CaseIterable, Identifiable {
@@ -124,13 +136,15 @@ enum NukeStepType: String, CaseIterable, Identifiable {
 struct NukeConfig {
     var enabledSteps: Set<NukeStepType> = [.createChannels]
     var stepOrder: [NukeStepType] = NukeStepType.allCases
+
     var banDelay: Double = 0.02
     var deleteDelay: Double = 0.05
     var createChDelay: Double = 0.10
     var createRoleDelay: Double = 0.10
     var msgDelay: Double = 0.10
+
     var banRoleId = ""
-    var roleName = "Quoc Thang Tools"
+    var roleName = "Quoc Thang Tools"      // ✅ Đổi tên role mặc định
     var roleCount = 50
     var channelName = "nuked-by-tool"
     var channelCount = 50
@@ -139,17 +153,8 @@ struct NukeConfig {
     var newGuildName = ""
 }
 
-struct VoiceChannelInfo: Codable, Identifiable, Hashable {
-    let id: String
-    let name: String
-    let guildId: String
-    let type: Int
-    var isVoice: Bool { type == 2 || type == 13 }
-    var icon: String { type == 13 ? "mic.badge.plus" : "speaker.wave.2.fill" }
-}
-
 // ==========================================
-// MARK: - BACKGROUND MANAGER
+// MARK: - BACKGROUND
 // ==========================================
 class BackgroundManager {
     static let shared = BackgroundManager()
@@ -481,7 +486,7 @@ class BotClient {
 }
 
 // ==========================================
-// MARK: - USER NUKE CLIENT
+// MARK: - USER NUKE CLIENT (WS)
 // ==========================================
 class UserNukeClient {
     let token: String; let session: URLSession
@@ -576,9 +581,7 @@ class UserNukeClient {
         let total = (detail["approximate_member_count"] as? Int) ?? (detail["member_count"] as? Int) ?? 1000
 
         guard let url = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else { return }
-        let ws = session.webSocketTask(with: url)
-        ws.maximumMessageSize = 16 * 1024 * 1024
-        ws.resume()
+        let ws = session.webSocketTask(with: url); ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
 
         guard case .string(let hs) = try await ws.receive(),
@@ -686,357 +689,6 @@ class UserNukeClient {
 }
 
 // ==========================================
-// MARK: - VOICE ROOM CLIENT
-// ==========================================
-class VoiceRoomClient {
-    let token: String
-    private let session: URLSession
-    private var gatewayWS: URLSessionWebSocketTask?
-    private var voiceWS: URLSessionWebSocketTask?
-    private var gatewayHB: Task<Void, Never>?
-    private var voiceHB: Task<Void, Never>?
-    private var speakingRefresh: Task<Void, Never>?
-    private var voiceReceiveTask: Task<Void, Never>?
-
-    private(set) var sessionId: String?
-    private(set) var userId: String?
-    private(set) var username: String?
-    private(set) var guildId: String?
-    private(set) var channelId: String?
-    private(set) var ssrc: Int = 0
-    private(set) var isJoined = false
-
-    private var isMicOn = true
-    private var isSpeakerOn = true
-
-    var log: ((String) -> Void)?
-    var onStateChange: ((Bool) -> Void)?
-
-    init(token: String) {
-        self.token = token
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 30
-        cfg.timeoutIntervalForResource = 60
-        cfg.waitsForConnectivity = true
-        let sp = """
-        {"os":"iOS","browser":"Safari","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0 (iPhone)","browser_version":"17.0","os_version":"17.0","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
-        """
-        cfg.httpAdditionalHeaders = [
-            "Authorization": token, "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "X-Super-Properties": Data(sp.utf8).base64EncodedString(),
-            "X-Discord-Locale": "en-US", "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
-            "Origin": "https://discord.com", "Referer": "https://discord.com/channels/@me"
-        ]
-        self.session = URLSession(configuration: cfg)
-    }
-
-    func validate() async throws -> DiscordUser {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me")!)
-        guard let h = r as? HTTPURLResponse, h.statusCode == 200 else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Token không hợp lệ"])
-        }
-        return try JSONDecoder().decode(DiscordUser.self, from: d)
-    }
-
-    func getGuilds() async throws -> [Guild] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me/guilds")!)
-        guard let h = r as? HTTPURLResponse, h.statusCode == 200 else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không lấy được guilds"])
-        }
-        return try JSONDecoder().decode([Guild].self, from: d)
-    }
-
-    func getVoiceChannels(guildId: String) async throws -> [VoiceChannelInfo] {
-        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
-        let status = (r as? HTTPURLResponse)?.statusCode ?? -1
-        guard status == 200 else {
-            throw NSError(domain: "Room", code: status, userInfo: [NSLocalizedDescriptionKey: "HTTP \(status) khi lấy channels"])
-        }
-        let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]] ?? []
-        return arr.compactMap { ch in
-            guard let id = ch["id"] as? String, let name = ch["name"] as? String, let type = ch["type"] as? Int, (type == 2 || type == 13) else { return nil }
-            return VoiceChannelInfo(id: id, name: name, guildId: guildId, type: type)
-        }
-    }
-
-    func joinVoice(guildId: String, channelId: String) async throws {
-        self.guildId = guildId
-        self.channelId = channelId
-
-        log?("Mở gateway WS...")
-        let gw = session.webSocketTask(with: URL(string: "wss://gateway.discord.gg/?v=10&encoding=json")!)
-        gw.maximumMessageSize = 16 * 1024 * 1024
-        gw.resume()
-        gatewayWS = gw
-
-        guard let hello = try await recvJSON(gw) as? [String: Any],
-              let hbInt = ((hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int) else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Gateway Hello missing"])
-        }
-
-        gatewayHB = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: UInt64(hbInt) * 1_000_000)
-                try? await gw.send(.string("{\"op\":1,\"d\":null}"))
-                _ = self
-            }
-        }
-
-        try await sendJSON(gw, ["op": 2, "d": [
-            "token": token, "capabilities": 125,
-            "properties": ["os": "iOS", "browser": "Safari", "device": "iPhone"],
-            "compress": false,
-            "presence": ["status": "online", "since": 0, "activities": [], "afk": false]
-        ]])
-
-        while true {
-            let msg = try await recvJSON(gw) as? [String: Any]
-            if (msg?["t"] as? String) == "READY" {
-                let d = msg?["d"] as? [String: Any]
-                sessionId = d?["session_id"] as? String
-                let u = d?["user"] as? [String: Any]
-                userId = u?["id"] as? String
-                break
-            }
-            if let op = msg?["op"] as? Int, op == 9 {
-                throw NSError(domain: "Room", code: 9, userInfo: [NSLocalizedDescriptionKey: "Invalid Session"])
-            }
-        }
-
-        try await sendJSON(gw, ["op": 4, "d": [
-            "guild_id": guildId, "channel_id": channelId, "self_mute": false, "self_deaf": false
-        ]])
-
-        var vsEndpoint: String?
-        var vsToken: String?
-        while vsEndpoint == nil {
-            if let msg = try await recvJSON(gw) as? [String: Any], (msg["t"] as? String) == "VOICE_SERVER_UPDATE" {
-                let d = msg["d"] as? [String: Any]
-                vsEndpoint = d?["endpoint"] as? String
-                vsToken = d?["token"] as? String
-            }
-        }
-        guard let ep = vsEndpoint, let vt = vsToken else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice server missing"])
-        }
-
-        var cleanEp = ep.replacingOccurrences(of: "wss://", with: "").replacingOccurrences(of: "https://", with: "")
-        var portSuffix = ""
-        if let colonIdx = cleanEp.lastIndex(of: ":") {
-            let afterColon = cleanEp.suffix(from: cleanEp.index(after: colonIdx))
-            if let _ = Int(afterColon) {
-                portSuffix = String(afterColon)
-                cleanEp = String(cleanEp.prefix(upTo: colonIdx))
-            }
-        }
-        cleanEp = cleanEp.replacingOccurrences(of: "/?v=4", with: "").replacingOccurrences(of: "/", with: "")
-
-        var candidateURLs: [String] = []
-        candidateURLs.append("wss://\(cleanEp)/?v=8")
-        if !portSuffix.isEmpty { candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=8") }
-        candidateURLs.append("wss://\(cleanEp)/?v=4")
-        if !portSuffix.isEmpty { candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=4") }
-
-        var vws: URLSessionWebSocketTask? = nil
-        for candidateURL in candidateURLs {
-            guard let url = URL(string: candidateURL) else { continue }
-            var req = URLRequest(url: url)
-            req.setValue("https://discord.com", forHTTPHeaderField: "Origin")
-            let task = session.webSocketTask(with: req)
-            task.maximumMessageSize = 16 * 1024 * 1024
-            task.resume()
-            do {
-                try await Task.sleep(nanoseconds: 500_000_000)
-                let helloMsg = try await recvJSON(task)
-                if let h = helloMsg as? [String: Any], (h["op"] as? Int) == 8 {
-                    vws = task
-                    break
-                } else {
-                    task.cancel(with: .goingAway, reason: nil)
-                }
-            } catch {
-                task.cancel(with: .goingAway, reason: nil)
-            }
-        }
-
-        guard let voiceSocket = vws else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS"])
-        }
-        voiceWS = voiceSocket
-
-        try await sendJSON(voiceSocket, ["op": 0, "d": [
-            "server_id": guildId, "user_id": userId ?? "", "session_id": sessionId ?? "", "token": vt
-        ]])
-
-        var readyAttempts = 0
-        while readyAttempts < 20 {
-            readyAttempts += 1
-            if let msg = try await recvJSON(voiceSocket) as? [String: Any], (msg["op"] as? Int) == 2 {
-                ssrc = ((msg["d"] as? [String: Any])?["ssrc"] as? Int) ?? 0
-                break
-            }
-        }
-
-        guard ssrc != 0 else {
-            log?("⚠️ Voice Ready nhưng ssrc = 0")
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice ssrc = 0"])
-        }
-
-        voiceHB = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 13_750_000_000)
-                try? await voiceSocket.send(.string("{\"op\":3,\"d\":\(Int(Date().timeIntervalSince1970 * 1000))}"))
-            }
-        }
-
-        voiceReceiveTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    _ = try await self?.recvJSON(voiceSocket)
-                } catch {
-                    break
-                }
-            }
-        }
-
-        isMicOn = true
-        do {
-            try await setSpeaking(1)
-        } catch {
-            log?("Không thể bật speaking ban đầu: \(error.localizedDescription)")
-        }
-        startSpeakingRefresh()
-
-        isJoined = true
-        onStateChange?(true)
-        log?("Đã vào voice ✓")
-    }
-
-    private func startSpeakingRefresh() {
-        speakingRefresh?.cancel()
-        speakingRefresh = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                guard let self = self else { break }
-                if self.isMicOn && self.voiceWS?.state == .running && self.ssrc != 0 {
-                    try? await self.setSpeaking(1)
-                }
-            }
-        }
-    }
-
-    func setSpeaking(_ flag: Int) async throws {
-        guard let vws = voiceWS, vws.state == .running, ssrc != 0 else {
-            throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Voice WS chưa sẵn sàng hoặc ssrc = 0"])
-        }
-        try await sendJSON(vws, [
-            "op": 5,
-            "d": [
-                "speaking": flag,
-                "delay": 0,
-                "ssrc": ssrc
-            ]
-        ])
-    }
-
-    func setMic(_ on: Bool) async {
-        isMicOn = on
-        do {
-            try await setSpeaking(on ? 1 : 0)
-            log?(on ? "🎤 Mic ON" : "🔇 Mic OFF")
-        } catch {
-            log?("Mic Error: \(error.localizedDescription)")
-        }
-    }
-
-    func setSpeaker(_ on: Bool) async {
-        isSpeakerOn = on
-        guard let gw = gatewayWS, gw.state == .running,
-              let gid = guildId, let cid = channelId else {
-            log?("Gateway WS chưa kết nối, không thể đổi loa")
-            return
-        }
-        do {
-            try await sendJSON(gw, ["op": 4, "d": [
-                "guild_id": gid, "channel_id": cid, "self_mute": !isMicOn, "self_deaf": !on
-            ]])
-            log?(on ? "🔊 Loa ON" : "🔈 Loa OFF")
-        } catch {
-            log?("Loa Error: \(error.localizedDescription)")
-        }
-    }
-
-    func setCam(_ on: Bool) async {
-        guard let vws = voiceWS, vws.state == .running, ssrc != 0 else {
-            log?("Voice WS chưa sẵn sàng, không thể đổi Cam")
-            return
-        }
-        let videoSSRC = ssrc + 1
-        let payload: [String: Any] = [
-            "op": 12, "d": [
-                "audio_ssrc": ssrc, "video_ssrc": on ? videoSSRC : 0, "rtx_ssrc": 0,
-                "streams": on ? [[
-                    "type": "video", "rid": "100", "ssrc": videoSSRC, "active": true, "quality": 100, "rtx_ssrc": 0,
-                    "max_bitrate": 2500000, "max_framerate": 30, "max_resolution": ["type": "fixed", "width": 1280, "height": 720]
-                ]] : []
-            ]
-        ]
-        do {
-            try await sendJSON(vws, payload)
-            log?(on ? "📷 Cam ON" : "📷 Cam OFF")
-        } catch { log?("Cam Error: \(error.localizedDescription)") }
-    }
-
-    func setStream(_ on: Bool) async {
-        guard let vws = voiceWS, vws.state == .running else {
-            log?("Voice WS chưa sẵn sàng, không thể đổi Stream")
-            return
-        }
-        do {
-            if on {
-                try await sendJSON(vws, ["op": 18, "d": ["type": "go-live", "paused": false]])
-                log?("📡 Stream ON")
-            } else {
-                try await sendJSON(vws, ["op": 20, "d": ["stream_key": "go-live"]])
-                log?("📡 Stream OFF")
-            }
-        } catch { log?("Stream Error: \(error.localizedDescription)") }
-    }
-
-    func leave() async {
-        gatewayHB?.cancel(); voiceHB?.cancel(); speakingRefresh?.cancel(); voiceReceiveTask?.cancel()
-        gatewayHB = nil; voiceHB = nil; speakingRefresh = nil; voiceReceiveTask = nil
-        if voiceWS?.state == .running && ssrc != 0 {
-            try? await setSpeaking(0)
-        }
-        gatewayWS?.cancel(with: .normalClosure, reason: nil)
-        voiceWS?.cancel(with: .normalClosure, reason: nil)
-        gatewayWS = nil; voiceWS = nil
-        isJoined = false
-        onStateChange?(false)
-    }
-
-    private func recvJSON(_ ws: URLSessionWebSocketTask) async throws -> Any {
-        let msg = try await ws.receive()
-        switch msg {
-        case .string(let s): return try JSONSerialization.jsonObject(with: Data(s.utf8))
-        case .data(let d): return try JSONSerialization.jsonObject(with: d)
-        @unknown default: throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "WS msg invalid"])
-        }
-    }
-
-    private func sendJSON(_ ws: URLSessionWebSocketTask, _ obj: [String: Any]) async throws {
-        guard ws.state == .running else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Socket is not connected"])
-        }
-        let data = try JSONSerialization.data(withJSONObject: obj)
-        try await ws.send(.string(String(data: data, encoding: .utf8)!))
-    }
-}
-
-// ==========================================
 // MARK: - BOT MANAGER
 // ==========================================
 @MainActor
@@ -1102,6 +754,7 @@ class BotManager: ObservableObject {
         BackgroundManager.shared.start()
         let gid = guild.id
         log("Bắt đầu nuke: \(guild.name)")
+
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
 
@@ -1111,6 +764,7 @@ class BotManager: ObservableObject {
             currentPhase = step.rawValue
             phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
             log("--- \(step.rawValue) ---")
+
             switch step {
             case .massBan: await doMassBan(c, gid, options: options)
             case .deleteChannels: await doDeleteChannels(c, gid, options: options)
@@ -1129,6 +783,7 @@ class BotManager: ObservableObject {
             }
             stepDone += 1
         }
+
         currentPhase = isCancelled ? "Đã dừng" : "Hoàn tất"
         phaseProgress = 1.0
         log(isCancelled ? "Đã dừng" : "XONG")
@@ -1300,6 +955,8 @@ class UserNukeManager: ObservableObject {
         if let d = UserDefaults.standard.data(forKey: key),
            let s = try? JSONDecoder().decode([TokenInfo].self, from: d) { tokens = s }
     }
+
+    // ✅ NEW: Add token manually (single)
     func addTokenManually(_ raw: String) async -> Bool {
         let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !tokens.contains(where: { $0.token == clean }) else { return false }
@@ -1317,6 +974,7 @@ class UserNukeManager: ObservableObject {
             return false
         }
     }
+
     func importFromFile(url: URL) async {
         let got = url.startAccessingSecurityScopedResource()
         defer { if got { url.stopAccessingSecurityScopedResource() } }
@@ -1349,12 +1007,14 @@ class UserNukeManager: ObservableObject {
         }
         isImporting = false
     }
+
     func removeToken(_ id: UUID) {
         tokens.removeAll { $0.id == id }
         selectedTokenIds.remove(id); tokenGuilds.removeValue(forKey: id); recomputeEligible()
     }
     func clearAll() { tokens = []; selectedTokenIds = []; tokenGuilds = [:]; eligibleGuilds = [] }
     func clearSelection() { selectedTokenIds = []; eligibleGuilds = [] }
+
     func toggleSelection(_ t: TokenInfo) {
         guard t.isValid else { return }
         if selectedTokenIds.contains(t.id) { selectedTokenIds.remove(t.id) }
@@ -1375,10 +1035,13 @@ class UserNukeManager: ObservableObject {
         catch { tokenGuilds[t.id] = [] }
         recomputeEligible()
     }
+
+    // ✅ CHANGED: eligibility = canDoAnything (union across tokens)
     func recomputeEligible() {
         guard !selectedTokenIds.isEmpty else { eligibleGuilds = []; return }
         var unionIds: Set<String> = []
         var unionMap: [String: NukeGuild] = [:]
+
         for id in selectedTokenIds {
             guard let gs = tokenGuilds[id] else { eligibleGuilds = []; return }
             for g in gs where g.canDoAnything {
@@ -1390,6 +1053,8 @@ class UserNukeManager: ObservableObject {
             .map { Guild(id: $0.id, name: $0.name, icon: $0.icon) }
             .sorted { $0.name < $1.name }
     }
+
+    // ✅ NEW: Compute effective permissions for a guild (union of all selected tokens)
     func permissionsForGuild(_ guildId: String) -> GuildPermissions {
         var perms = GuildPermissions()
         for tokenId in selectedTokenIds {
@@ -1403,21 +1068,30 @@ class UserNukeManager: ObservableObject {
         }
         return perms
     }
+
+    // ✅ NEW: Filter tokens that have a specific permission in a guild
     private func clientsWithBanPerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { id, _ in tokenGuilds[id]?.first(where: { $0.id == guildId })?.canMassBan ?? false }.map { $0.1 }
+        all.filter { tokenId, _ in
+            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canMassBan ?? false
+        }.map { $0.1 }
     }
     private func clientsWithChannelPerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { id, _ in
-            let g = tokenGuilds[id]?.first(where: { $0.id == guildId })
+        all.filter { tokenId, _ in
+            let g = tokenGuilds[tokenId]?.first(where: { $0.id == guildId })
             return g?.canDeleteChannels ?? false || g?.canCreateChannels ?? false
         }.map { $0.1 }
     }
     private func clientsWithRolePerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { id, _ in tokenGuilds[id]?.first(where: { $0.id == guildId })?.canCreateRoles ?? false }.map { $0.1 }
+        all.filter { tokenId, _ in
+            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canCreateRoles ?? false
+        }.map { $0.1 }
     }
     private func clientsWithRenamePerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { id, _ in tokenGuilds[id]?.first(where: { $0.id == guildId })?.canRenameGuild ?? false }.map { $0.1 }
+        all.filter { tokenId, _ in
+            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canRenameGuild ?? false
+        }.map { $0.1 }
     }
+
     func stop() { isCancelled = true }
     private func log(_ m: String) { nukeLog.append(m); if nukeLog.count > 800 { nukeLog.removeFirst(nukeLog.count - 800) } }
     private func reset() { banSuccess = 0; banFailed = 0; channelsDeleted = 0; channelsCreated = 0; messagesSent = 0; rolesCreated = 0; membersScanned = 0; phaseProgress = 0 }
@@ -1430,11 +1104,14 @@ class UserNukeManager: ObservableObject {
         isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start()
         let gid = guild.id
+
+        // ✅ Build tokenId ↔ client pairs to filter per permission
         let allClients: [(UUID, UserNukeClient)] = sel.map { ($0.id, UserNukeClient(token: $0.token)) }
         guard let scan = allClients.first?.1 else { return }
 
         log("Bắt đầu nuke: \(guild.name)")
         log("Dùng \(allClients.count) token")
+
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
 
@@ -1446,31 +1123,31 @@ class UserNukeManager: ObservableObject {
             log("--- \(step.rawValue) ---")
             switch step {
             case .massBan:
-                let bc = clientsWithBanPerm(guildId: gid, all: allClients)
-                if bc.isEmpty { log("  Bỏ qua: không token nào có quyền ban"); break }
-                await doMassBanScan(scan, clients: bc, gid: gid, options: options)
+                let banClients = clientsWithBanPerm(guildId: gid, all: allClients)
+                if banClients.isEmpty { log("  Bỏ qua: không token nào có quyền ban"); break }
+                await doMassBanScan(scan, clients: banClients, gid: gid, options: options)
             case .deleteChannels:
-                let cc = clientsWithChannelPerm(guildId: gid, all: allClients)
-                if cc.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
-                await doDeleteChannels(cc, gid, options: options)
+                let chClients = clientsWithChannelPerm(guildId: gid, all: allClients)
+                if chClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
+                await doDeleteChannels(chClients, gid, options: options)
             case .renameGuild:
-                let rc = clientsWithRenamePerm(guildId: gid, all: allClients)
-                if rc.isEmpty { log("  Bỏ qua: không token nào có quyền đổi tên"); break }
+                let rClients = clientsWithRenamePerm(guildId: gid, all: allClients)
+                if rClients.isEmpty { log("  Bỏ qua: không token nào có quyền đổi tên"); break }
                 if !options.newGuildName.isEmpty {
-                    do { try await rc[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
+                    do { try await rClients[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
                     catch { log("  Lỗi: \(error.localizedDescription)") }
                 }
             case .createRoles:
-                let rc = clientsWithRolePerm(guildId: gid, all: allClients)
-                if rc.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý role"); break }
-                rolesCreated = await doCreateRoles(rc, gid, options: options)
+                let roleClients = clientsWithRolePerm(guildId: gid, all: allClients)
+                if roleClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý role"); break }
+                rolesCreated = await doCreateRoles(roleClients, gid, options: options)
                 log("  Role đã tạo: \(rolesCreated)")
             case .createChannels:
-                let cc = clientsWithChannelPerm(guildId: gid, all: allClients)
-                if cc.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
-                let (c, s) = await doCreateChannels(cc, gid, options: options)
-                channelsCreated = c; messagesSent = s
-                log("  Kênh đã tạo: \(c), tin đã gửi: \(s)")
+                let chClients = clientsWithChannelPerm(guildId: gid, all: allClients)
+                if chClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
+                let (cc, ss) = await doCreateChannels(chClients, gid, options: options)
+                channelsCreated = cc; messagesSent = ss
+                log("  Kênh đã tạo: \(cc), tin đã gửi: \(ss)")
             }
             stepDone += 1
         }
@@ -1507,6 +1184,7 @@ class UserNukeManager: ObservableObject {
 
             var candidates: [String] = []
             let lock = NSLock()
+
             log("  Đang quét WS...")
             do {
                 try await scan.fetchMembersWS(guildId: gid, onMember: { m in
@@ -1652,315 +1330,6 @@ class UserNukeManager: ObservableObject {
     }
 }
 
-// ==========================================
-// MARK: - VOICE ROOM MANAGER
-// ==========================================
-@MainActor
-class VoiceRoomManager: ObservableObject {
-    @Published var tokens: [TokenInfo] = [] { didSet { saveTokens() } }
-    @Published var selectedTokenIds: Set<UUID> = []
-    @Published var isImporting = false
-    @Published var importError: String?
-
-    @Published var tokenGuilds: [UUID: [Guild]] = [:]
-    @Published var tokenChannels: [UUID: [String: [VoiceChannelInfo]]] = [:]
-    @Published var eligibleGuilds: [Guild] = []
-    @Published var eligibleChannels: [String: [VoiceChannelInfo]] = [:]
-    @Published var isLoading = false
-
-    @Published var selectedGuild: Guild?
-    @Published var selectedChannel: VoiceChannelInfo?
-
-    @Published var camEnabled = false
-    @Published var streamEnabled = false
-    @Published var micEnabled = true
-    @Published var speakerEnabled = true
-
-    @Published var isRunning = false
-    @Published var perTokenStatus: [UUID: String] = [:]
-    @Published var roomLog: [String] = []
-
-    private var clients: [UUID: VoiceRoomClient] = [:]
-    private var isCancelled = false
-    private let key = "RoomTokensV1"
-
-    init() { loadTokens() }
-
-    private func saveTokens() {
-        if let d = try? JSONEncoder().encode(tokens) { UserDefaults.standard.set(d, forKey: key) }
-    }
-    private func loadTokens() {
-        if let d = UserDefaults.standard.data(forKey: key),
-           let s = try? JSONDecoder().decode([TokenInfo].self, from: d) {
-            tokens = s
-        }
-    }
-
-    func addTokenManually(_ raw: String) async -> Bool {
-        let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !tokens.contains(where: { $0.token == clean }) else { return false }
-        isImporting = true
-        defer { isImporting = false }
-        do {
-            let u = try await VoiceRoomClient(token: clean).validate()
-            tokens.append(TokenInfo(token: clean, userId: u.id,
-                                    username: u.globalName ?? u.username,
-                                    avatarHash: u.avatar, isValid: true))
-            return true
-        } catch {
-            tokens.append(TokenInfo(token: clean, userId: "0",
-                                    username: "Token chết", avatarHash: nil, isValid: false))
-            return false
-        }
-    }
-    func importFromFile(url: URL) async {
-        let got = url.startAccessingSecurityScopedResource()
-        defer { if got { url.stopAccessingSecurityScopedResource() } }
-        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-        var data: Data?
-        let co = NSFileCoordinator(); var err: NSError?
-        co.coordinate(readingItemAt: url, options: [], error: &err) { u in data = try? Data(contentsOf: u) }
-        if data == nil { data = try? Data(contentsOf: url) }
-        guard let d = data else { importError = "Không đọc file"; return }
-        var text: String?
-        for enc in [String.Encoding.utf8, .utf16, .utf16LittleEndian, .utf16BigEndian, .windowsCP1252, .isoLatin1, .ascii] {
-            if let s = String(data: d, encoding: enc), !s.isEmpty { text = s; break }
-        }
-        if text == nil { text = String(decoding: d, as: UTF8.self) }
-        guard let t = text else { importError = "File rỗng"; return }
-        let lines = t.replacingOccurrences(of: "\u{FEFF}", with: "")
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !lines.isEmpty else { importError = "Không có token"; return }
-        isImporting = true; importError = nil
-        for line in lines {
-            if tokens.contains(where: { $0.token == line }) { continue }
-            do {
-                let u = try await VoiceRoomClient(token: line).validate()
-                tokens.append(TokenInfo(token: line, userId: u.id,
-                                        username: u.globalName ?? u.username,
-                                        avatarHash: u.avatar, isValid: true))
-            } catch {
-                tokens.append(TokenInfo(token: line, userId: "0",
-                                        username: "Token chết", avatarHash: nil, isValid: false))
-            }
-        }
-        isImporting = false
-    }
-
-    func removeToken(_ id: UUID) {
-        tokens.removeAll { $0.id == id }
-        selectedTokenIds.remove(id)
-        tokenGuilds.removeValue(forKey: id)
-        tokenChannels.removeValue(forKey: id)
-        recomputeEligibleGuilds()
-    }
-    func clearAll() {
-        tokens = []; selectedTokenIds = []
-        tokenGuilds = [:]; tokenChannels = [:]
-        eligibleGuilds = []; eligibleChannels = [:]
-        selectedGuild = nil; selectedChannel = nil
-    }
-    func clearSelection() {
-        selectedTokenIds = []
-        eligibleGuilds = []; eligibleChannels = [:]
-        selectedGuild = nil; selectedChannel = nil
-    }
-    func toggleSelection(_ t: TokenInfo) {
-        guard t.isValid else { return }
-        if selectedTokenIds.contains(t.id) { selectedTokenIds.remove(t.id) }
-        else { selectedTokenIds.insert(t.id) }
-        recomputeEligibleGuilds()
-    }
-
-    func loadGuildsForSelected() async {
-        isLoading = true
-        log("Bắt đầu tìm Server chung...")
-        
-        for id in selectedTokenIds {
-            guard let t = tokens.first(where: { $0.id == id }), t.isValid else { continue }
-            do {
-                let client = VoiceRoomClient(token: t.token)
-                let guilds = try await client.getGuilds()
-                tokenGuilds[t.id] = guilds
-                log("[\(t.username.prefix(12))] \(guilds.count) server")
-            } catch {
-                log("[\(t.username.prefix(12))] Lỗi: \(error.localizedDescription)")
-                tokenGuilds[t.id] = []
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        
-        recomputeEligibleGuilds()
-        isLoading = false
-        log("Quét xong: \(eligibleGuilds.count) server chung")
-    }
-
-    func loadChannelsForSelected(guild: Guild) async {
-        isLoading = true
-        log("Đang quét kênh của: \(guild.name)...")
-        
-        for id in selectedTokenIds {
-            tokenChannels[id]?[guild.id] = nil
-        }
-        
-        for id in selectedTokenIds {
-            guard let t = tokens.first(where: { $0.id == id }), t.isValid else { continue }
-            do {
-                let client = VoiceRoomClient(token: t.token)
-                let chs = try await client.getVoiceChannels(guildId: guild.id)
-                if tokenChannels[id] == nil { tokenChannels[id] = [:] }
-                tokenChannels[id]?[guild.id] = chs
-                log("  [\(t.username.prefix(12))] \(chs.count) kênh thoại")
-            } catch {
-                log("  [\(t.username.prefix(12))] Lỗi kênh: \(error.localizedDescription)")
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        
-        recomputeEligibleChannels(for: guild)
-        isLoading = false
-        log("Quét xong kênh của \(guild.name)")
-    }
-
-    func recomputeEligibleGuilds() {
-        guard !selectedTokenIds.isEmpty else { eligibleGuilds = []; return }
-        var guildSet: Set<String>? = nil
-        var guildMap: [String: Guild] = [:]
-        for id in selectedTokenIds {
-            guard let gs = tokenGuilds[id] else { eligibleGuilds = []; return }
-            let ids = Set(gs.map { $0.id })
-            for g in gs where guildMap[g.id] == nil { guildMap[g.id] = g }
-            guildSet = guildSet == nil ? ids : guildSet!.intersection(ids)
-        }
-        eligibleGuilds = (guildSet ?? []).compactMap { guildMap[$0] }.sorted { $0.name < $1.name }
-    }
-
-    func recomputeEligibleChannels(for guild: Guild) {
-        var chInfo: [String: VoiceChannelInfo] = [:]
-        for id in selectedTokenIds {
-            let chs = tokenChannels[id]?[guild.id] ?? []
-            for c in chs where chInfo[c.id] == nil { chInfo[c.id] = c }
-        }
-        eligibleChannels[guild.id] = Array(chInfo.values).sorted { $0.name < $1.name }
-    }
-
-    func tokensWithAccess(guildId: String, channelId: String) -> [TokenInfo] {
-        tokens.filter { t in
-            selectedTokenIds.contains(t.id) &&
-            (tokenChannels[t.id]?[guildId]?.contains(where: { $0.id == channelId }) ?? false)
-        }
-    }
-    func accessCount(guildId: String, channelId: String) -> Int {
-        tokensWithAccess(guildId: guildId, channelId: channelId).count
-    }
-
-    func toggleCam() async {
-        camEnabled.toggle()
-        for (_, c) in clients { await c.setCam(camEnabled) }
-    }
-    func toggleStream() async {
-        streamEnabled.toggle()
-        for (_, c) in clients { await c.setStream(streamEnabled) }
-    }
-    func toggleMic() async {
-        micEnabled.toggle()
-        for (_, c) in clients { await c.setMic(micEnabled) }
-    }
-    func toggleSpeaker() async {
-        speakerEnabled.toggle()
-        for (_, c) in clients { await c.setSpeaker(speakerEnabled) }
-    }
-
-    func startRoom() async {
-        guard let guild = selectedGuild, let channel = selectedChannel else { return }
-        guard !selectedTokenIds.isEmpty else { return }
-
-        isRunning = true; isCancelled = false
-        roomLog = []; perTokenStatus = [:]
-        camEnabled = false; streamEnabled = false
-        micEnabled = true; speakerEnabled = true
-        BackgroundManager.shared.start()
-
-        log("Bắt đầu join room")
-        log("Server: \(guild.name)")
-        log("Kênh: \(channel.name)")
-
-        let allSelected = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
-        let eligibleTokens = allSelected.filter { t in
-            tokenChannels[t.id]?[guild.id]?.contains(where: { $0.id == channel.id }) ?? false
-        }
-        let skippedTokens = allSelected.filter { t in
-            !(tokenChannels[t.id]?[guild.id]?.contains(where: { $0.id == channel.id }) ?? false)
-        }
-
-        log("Token có quyền vào: \(eligibleTokens.count)/\(allSelected.count)")
-
-        for t in skippedTokens {
-            perTokenStatus[t.id] = "Không có quyền vào kênh"
-        }
-
-        if eligibleTokens.isEmpty {
-            log("Không có token nào có quyền vào kênh này")
-            isRunning = false
-            BackgroundManager.shared.stop()
-            return
-        }
-
-        for t in eligibleTokens {
-            if isCancelled { break }
-            perTokenStatus[t.id] = "Đang join..."
-            let c = VoiceRoomClient(token: t.token)
-            let tid = t.id
-            c.log = { msg in
-                Task { @MainActor in
-                    if msg.contains("✓") || msg.contains("✗") || msg.contains("error") || msg.contains("Error") || msg.contains("ON") || msg.contains("OFF") || msg.contains("Lỗi") {
-                        self.log("[\(t.username.prefix(12))] \(msg)")
-                    }
-                }
-            }
-            c.onStateChange = { joined in
-                Task { @MainActor in
-                    self.perTokenStatus[tid] = joined ? "Đã join ✓" : "Đã rời"
-                }
-            }
-            clients[t.id] = c
-            do {
-                try await c.joinVoice(guildId: guild.id, channelId: channel.id)
-                perTokenStatus[t.id] = "Đã join ✓"
-                
-                await c.setMic(micEnabled)
-                await c.setSpeaker(speakerEnabled)
-                if camEnabled { await c.setCam(true) }
-                if streamEnabled { await c.setStream(true) }
-                
-            } catch {
-                perTokenStatus[t.id] = "Lỗi: \(error.localizedDescription.prefix(50))"
-                log("[\(t.username.prefix(12))] Lỗi: \(error.localizedDescription)")
-            }
-            try? await Task.sleep(nanoseconds: 500_000_000)
-        }
-
-        log("Hoàn tất join \(clients.count) token")
-    }
-
-    func stopRoom() async {
-        isCancelled = true
-        for (_, c) in clients { await c.leave() }
-        clients = [:]
-        for id in perTokenStatus.keys { perTokenStatus[id] = "Đã rời" }
-        isRunning = false
-        log("Đã rời tất cả voice")
-        BackgroundManager.shared.stop()
-    }
-
-    private func log(_ s: String) {
-        roomLog.append(s)
-        if roomLog.count > 500 { roomLog.removeFirst(roomLog.count - 500) }
-    }
-}
-
 final class IndexBox: @unchecked Sendable {
     private var value = 0
     private let lock = NSLock()
@@ -1975,14 +1344,12 @@ struct SpamDiscordApp: App {
     @StateObject private var app = AppState()
     @StateObject private var bot = BotManager()
     @StateObject private var userNuke = UserNukeManager()
-    @StateObject private var voiceRoom = VoiceRoomManager()
     var body: some Scene {
         WindowGroup {
             MainTabView()
                 .environmentObject(app)
                 .environmentObject(bot)
                 .environmentObject(userNuke)
-                .environmentObject(voiceRoom)
         }
     }
 }
@@ -1993,7 +1360,6 @@ struct MainTabView: View {
             SpamView().tabItem { Label("Spam", systemImage: "paperplane.fill") }
             TokenListView().tabItem { Label("Tokens", systemImage: "person.2.fill") }
             NukeTabView().tabItem { Label("Nuke", systemImage: "flame.fill") }
-            RoomTabView().tabItem { Label("Room", systemImage: "speaker.wave.2.fill") }
         }.tint(.indigo)
     }
 }
@@ -2407,7 +1773,7 @@ struct BotGuildListView: View {
 }
 
 // ==========================================
-// MARK: - NUKE OPTIONS
+// MARK: - NUKE OPTIONS (shared, permission-aware)
 // ==========================================
 enum NukeMode { case bot, user }
 
@@ -2417,13 +1783,14 @@ struct NukeOptionsView: View {
     let guild: Guild
     @Binding var selectedGuild: Guild?
     let mode: NukeMode
-    let permissions: GuildPermissions?
+    let permissions: GuildPermissions?   // nil = no gating (bot mode)
     @State private var options = NukeConfig()
 
     var canRun: Bool { !options.enabledSteps.isEmpty }
 
+    // ✅ NEW: Is a step enabled by permissions?
     func stepPermitted(_ step: NukeStepType) -> Bool {
-        guard let p = permissions else { return true }
+        guard let p = permissions else { return true }   // bot mode: all enabled
         switch step {
         case .massBan: return p.massBan
         case .deleteChannels: return p.deleteChannels
@@ -2457,6 +1824,7 @@ struct NukeOptionsView: View {
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
 
+                // Show permission summary for user mode
                 if let p = permissions {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("QUYỀN KHẢ DỤNG").font(.caption).bold().foregroundStyle(.secondary)
@@ -2479,6 +1847,7 @@ struct NukeOptionsView: View {
                 }
 
                 Button {
+                    // Auto-remove steps user has no perm for
                     if let p = permissions {
                         options.enabledSteps = options.enabledSteps.filter { s in
                             switch s {
@@ -2511,10 +1880,12 @@ struct NukeOptionsView: View {
     func permBadge(_ text: String, _ ok: Bool) -> some View {
         HStack(spacing: 3) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.caption2).foregroundStyle(ok ? .green : .red)
+                .font(.caption2)
+                .foregroundStyle(ok ? .green : .red)
             Text(text).font(.caption2).foregroundStyle(ok ? .primary : .secondary)
         }.padding(.horizontal, 6).padding(.vertical, 3)
-        .background((ok ? Color.green : Color.red).opacity(0.12)).cornerRadius(5)
+        .background((ok ? Color.green : Color.red).opacity(0.12))
+        .cornerRadius(5)
     }
 
     @ViewBuilder
@@ -2534,10 +1905,14 @@ struct NukeOptionsView: View {
                 }.foregroundStyle(.secondary)
 
                 Text("\(index + 1)").font(.caption.bold()).foregroundStyle(.secondary).frame(width: 18)
-                Image(systemName: step.icon).foregroundStyle(permitted ? .indigo : .gray).frame(width: 20)
+                Image(systemName: step.icon)
+                    .foregroundStyle(permitted ? .indigo : .gray)
+                    .frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(step.rawValue).font(.headline)
-                    if !permitted { Text("Không có quyền").font(.caption2).foregroundStyle(.red) }
+                    if !permitted {
+                        Text("Không có quyền").font(.caption2).foregroundStyle(.red)
+                    }
                 }
                 Spacer()
                 Toggle("", isOn: Binding(
@@ -2547,7 +1922,8 @@ struct NukeOptionsView: View {
                     }
                 )).labelsHidden().tint(.indigo)
                 .disabled(!permitted)
-            }.padding().opacity(permitted ? 1 : 0.6)
+            }.padding()
+            .opacity(permitted ? 1 : 0.6)
 
             if isOn && permitted {
                 Divider()
@@ -2742,6 +2118,7 @@ struct UserNukeView: View {
     }
 }
 
+// ✅ MODIFIED: Add "Thêm tay" button + sheet
 struct UserNukeTokenPickerView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Binding var selectedGuild: Guild?
@@ -2776,7 +2153,7 @@ struct UserNukeTokenPickerView: View {
 
             if userNuke.tokens.isEmpty {
                 EmptyStateView(title: "Chưa có token user", systemImage: "person.badge.key",
-                               description: "Import file .txt hoặc thêm tay.\nToken nuke lưu riêng.")
+                               description: "Thêm token bằng tay hoặc import file .txt.\nToken nuke lưu riêng, KHÔNG chung với token spam.")
             } else {
                 List {
                     Section(header: Text("Chọn token (\(userNuke.selectedTokenIds.count) đã chọn)")) {
@@ -2826,13 +2203,16 @@ struct UserNukeTokenPickerView: View {
         .sheet(isPresented: $showImport) {
             DocumentPicker(contentTypes: [.item]) { u in Task { await userNuke.importFromFile(url: u) } }
         }
-        .sheet(isPresented: $showManual) { UserNukeManualAddSheet() }
+        .sheet(isPresented: $showManual) {
+            UserNukeManualAddSheet()
+        }
         .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
         message: { Text(userNuke.importError ?? "") }
         .onChange(of: userNuke.importError) { v in if v != nil { showErr = true } }
     }
 }
 
+// ✅ NEW: Manual add token sheet for user nuke
 struct UserNukeManualAddSheet: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Environment(\.dismiss) var dismiss
@@ -2851,16 +2231,24 @@ struct UserNukeManualAddSheet: View {
                         .textInputAutocapitalization(.never)
                         .focused($focused)
                 }
+
                 if let e = errorMsg {
-                    Section { Text(e).font(.caption).foregroundStyle(.red) }
+                    Section {
+                        Text(e).font(.caption).foregroundStyle(.red)
+                    }
                 }
-                Section(footer: Text("Mỗi dòng 1 token.")) {
-                    Button("Thêm token") { Task { await addTokens() } }
-                        .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || userNuke.isImporting)
+
+                Section(footer: Text("Token sẽ được kiểm tra tính hợp lệ trước khi thêm. Có thể nhập nhiều dòng (mỗi dòng 1 token).")) {
+                    Button("Thêm token") {
+                        Task { await addTokens() }
+                    }
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || userNuke.isImporting)
                 }
             }
             .navigationTitle("Thêm token tay").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
+            }
             .onAppear { focused = true }
         }
     }
@@ -2871,10 +2259,16 @@ struct UserNukeManualAddSheet: View {
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { errorMsg = "Không có token"; return }
         errorMsg = nil
-        var ok = 0
-        for line in lines { if await userNuke.addTokenManually(line) { ok += 1 } }
-        if ok > 0 { dismiss() }
-        else { errorMsg = "Không thêm được (trùng hoặc token chết)." }
+        var okCount = 0
+        for line in lines {
+            let added = await userNuke.addTokenManually(line)
+            if added { okCount += 1 }
+        }
+        if okCount > 0 {
+            dismiss()
+        } else {
+            errorMsg = "Không thêm được token nào (có thể đã tồn tại hoặc token chết)."
+        }
     }
 }
 
@@ -2937,472 +2331,5 @@ struct UserNukeRunningView: View {
             msgSent: userNuke.messagesSent, roleCreate: userNuke.rolesCreated,
             log: userNuke.nukeLog, onStop: { userNuke.stop() }
         )
-    }
-}
-
-// ==========================================
-// MARK: - ROOM VIEWS
-// ==========================================
-struct RoomTabView: View {
-    @EnvironmentObject var room: VoiceRoomManager
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if room.isRunning { RoomRunningView() }
-                else if let g = room.selectedGuild { RoomConfigView(guild: g) }
-                else if room.selectedTokenIds.isEmpty { RoomTokenPickerView() }
-                else { RoomGuildListView() }
-            }
-            .navigationTitle(navTitle)
-            .navigationBarTitleDisplayMode(.inline)
-        }
-    }
-    private var navTitle: String {
-        if room.isRunning { return "Room đang chạy" }
-        if let g = room.selectedGuild { return g.name }
-        if room.selectedTokenIds.isEmpty { return "Room — Chọn Token" }
-        return "Room — Chọn Server"
-    }
-}
-
-struct RoomTokenPickerView: View {
-    @EnvironmentObject var room: VoiceRoomManager
-    @State private var showImport = false
-    @State private var showManual = false
-    @State private var showErr = false
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Button { showManual = true } label: {
-                    Label("Thêm tay", systemImage: "keyboard")
-                        .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(12)
-                }.background(Color.indigo).foregroundStyle(.white).cornerRadius(10)
-
-                Button { showImport = true } label: {
-                    Label("Import", systemImage: "doc.badge.plus")
-                        .font(.subheadline.bold()).frame(maxWidth: .infinity).padding(12)
-                }.background(Color.blue).foregroundStyle(.white).cornerRadius(10)
-
-                if !room.tokens.isEmpty {
-                    Menu {
-                        Button("Xóa tất cả", systemImage: "trash", role: .destructive) { room.clearAll() }
-                    } label: {
-                        Image(systemName: "ellipsis.circle").font(.title3).padding(12)
-                            .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
-                    }
-                }
-            }.padding(.horizontal).padding(.top, 8)
-
-            if room.isImporting { ProgressView("Đang kiểm tra...").padding(30) }
-
-            if room.tokens.isEmpty {
-                EmptyStateView(title: "Chưa có token room", systemImage: "speaker.wave.2",
-                               description: "Thêm token bằng tay hoặc import file.\nToken room lưu riêng với Spam & Nuke.")
-            } else {
-                List {
-                    Section(header: Text("Chọn token (\(room.selectedTokenIds.count) đã chọn)")) {
-                        ForEach(room.tokens) { t in
-                            HStack(spacing: 12) {
-                                Button { room.toggleSelection(t) } label: {
-                                    Image(systemName: room.selectedTokenIds.contains(t.id) ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(room.selectedTokenIds.contains(t.id) ? .indigo : .secondary)
-                                        .font(.title3)
-                                }.buttonStyle(.plain).disabled(!t.isValid)
-
-                                if let url = t.avatarURL {
-                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                    placeholder: { Circle().fill(Color.gray.opacity(0.3)) }
-                                        .frame(width: 36, height: 36).clipShape(Circle())
-                                } else {
-                                    Image(systemName: "person.circle.fill").resizable()
-                                        .frame(width: 36, height: 36).foregroundStyle(.gray)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(t.username).font(.subheadline.bold())
-                                    Text(t.isValid ? "Live" : "Die").font(.caption2).bold()
-                                        .foregroundStyle(t.isValid ? .green : .red)
-                                }
-                                Spacer()
-                                Button { room.removeToken(t.id) } label: {
-                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).font(.title3)
-                                }.buttonStyle(.plain)
-                            }.opacity(t.isValid ? 1 : 0.5)
-                        }
-                    }
-                }
-            }
-
-            if !room.roomLog.isEmpty {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(Array(room.roomLog.enumerated()), id: \.offset) { i, line in
-                                Text(line)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .id(i)
-                            }
-                        }.padding(8)
-                    }
-                    .frame(maxHeight: 100)
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(8).padding(.horizontal)
-                    .onChange(of: room.roomLog.count) { _ in
-                        if let last = room.roomLog.indices.last {
-                            withAnimation { proxy.scrollTo(last, anchor: .bottom) }
-                        }
-                    }
-                }
-            }
-
-            if !room.selectedTokenIds.isEmpty {
-                Button {
-                    Task { await room.loadGuildsForSelected() }
-                } label: {
-                    HStack {
-                        if room.isLoading { ProgressView().tint(.white) }
-                        Text("QUÉT SERVER (\(room.selectedTokenIds.count) token)").bold()
-                    }.frame(maxWidth: .infinity).padding()
-                }.background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
-                .padding(.horizontal).padding(.bottom, 8)
-                .disabled(room.isLoading)
-            }
-        }
-        .sheet(isPresented: $showImport) {
-            DocumentPicker(contentTypes: [.item]) { u in Task { await room.importFromFile(url: u) } }
-        }
-        .sheet(isPresented: $showManual) { RoomManualAddSheet() }
-        .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
-        message: { Text(room.importError ?? "") }
-        .onChange(of: room.importError) { v in if v != nil { showErr = true } }
-    }
-}
-
-struct RoomManualAddSheet: View {
-    @EnvironmentObject var room: VoiceRoomManager
-    @Environment(\.dismiss) var dismiss
-    @State private var input = ""
-    @State private var errorMsg: String? = nil
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section(header: Text("Nhập token room")) {
-                    TextEditor(text: $input)
-                        .frame(height: 100)
-                        .font(.system(.body, design: .monospaced))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .focused($focused)
-                }
-                if let e = errorMsg {
-                    Section { Text(e).font(.caption).foregroundStyle(.red) }
-                }
-                Section(footer: Text("Mỗi dòng 1 token.")) {
-                    Button("Thêm") { Task { await addTokens() } }
-                        .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || room.isImporting)
-                }
-            }
-            .navigationTitle("Thêm token room").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } } }
-            .onAppear { focused = true }
-        }
-    }
-
-    private func addTokens() async {
-        let lines = input.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !lines.isEmpty else { errorMsg = "Không có token"; return }
-        errorMsg = nil
-        var ok = 0
-        for line in lines { if await room.addTokenManually(line) { ok += 1 } }
-        if ok > 0 { dismiss() }
-        else { errorMsg = "Không thêm được (trùng hoặc token chết)." }
-    }
-}
-
-struct RoomGuildListView: View {
-    @EnvironmentObject var room: VoiceRoomManager
-    @State private var searchText = ""
-    var filtered: [Guild] {
-        searchText.isEmpty ? room.eligibleGuilds :
-            room.eligibleGuilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
-                Text("Server chung của \(room.selectedTokenIds.count) token")
-                    .font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button { room.clearSelection() } label: {
-                    Text("Đổi").font(.caption.bold()).padding(6)
-                        .background(Color.indigo.opacity(0.15)).cornerRadius(6)
-                }
-                Button { Task { await room.loadGuildsForSelected() } } label: {
-                    Image(systemName: "arrow.clockwise").padding(8)
-                }
-            }.padding(.horizontal).padding(.vertical, 8).background(Color.green.opacity(0.1))
-
-            if room.isLoading { ProgressView("Đang tải...").padding(40); Spacer() }
-            else if room.eligibleGuilds.isEmpty {
-                EmptyStateView(title: "Không có server chung",
-                               systemImage: "exclamationmark.triangle",
-                               description: "Tất cả token được chọn phải cùng ở server có voice channel.")
-            } else {
-                List(filtered) { g in
-                    Button {
-                        room.selectedGuild = g
-                        room.selectedChannel = nil
-                        Task { await room.loadChannelsForSelected(guild: g) }
-                    } label: {
-                        HStack(spacing: 12) {
-                            if let icon = g.icon,
-                               let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
-                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                placeholder: { Circle().fill(.gray.opacity(0.3)) }
-                                    .frame(width: 42, height: 42).clipShape(Circle())
-                            } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(g.name).font(.headline)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                        }.padding(.vertical, 4)
-                    }.buttonStyle(.plain)
-                }.searchable(text: $searchText, prompt: "Tìm server...")
-            }
-        }
-    }
-}
-
-struct RoomConfigView: View {
-    @EnvironmentObject var room: VoiceRoomManager
-    let guild: Guild
-
-    var channels: [VoiceChannelInfo] {
-        room.eligibleChannels[guild.id] ?? []
-    }
-    var canStart: Bool {
-        room.selectedChannel != nil && !room.selectedTokenIds.isEmpty
-    }
-
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                HStack(spacing: 12) {
-                    if let icon = guild.icon,
-                       let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
-                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                        placeholder: { Circle().fill(.gray.opacity(0.3)) }
-                            .frame(width: 48, height: 48).clipShape(Circle())
-                    } else { Circle().fill(.gray.opacity(0.3)).frame(width: 48, height: 48) }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(guild.name).font(.headline)
-                        if room.isLoading {
-                            Text("Đang tải kênh...").font(.caption2).foregroundStyle(.blue)
-                        } else {
-                            Text("\(channels.filter { $0.isVoice }.count) kênh thoại")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-                    }
-                    Spacer()
-                    Button { room.selectedGuild = nil } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary).font(.title3)
-                    }
-                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
-
-                if room.isLoading {
-                    ProgressView("Đang quét kênh thoại...")
-                        .padding(50)
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("CHỌN KÊNH THOẠI").font(.caption).bold().foregroundStyle(.secondary)
-                        if channels.isEmpty {
-                            Text("Không có kênh thoại chung").font(.caption).foregroundStyle(.red).padding()
-                        } else {
-                            ForEach(channels) { ch in
-                                let accessCount = room.accessCount(guildId: guild.id, channelId: ch.id)
-                                let totalTokens = room.selectedTokenIds.count
-                                let hasAccess = accessCount > 0
-
-                                Button {
-                                    room.selectedChannel = ch
-                                } label: {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: ch.icon).foregroundStyle(.indigo).frame(width: 22)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(ch.name).font(.subheadline)
-                                                .foregroundStyle(hasAccess ? .primary : .secondary)
-                                            Text("\(accessCount)/\(totalTokens) token có quyền")
-                                                .font(.caption2)
-                                                .foregroundStyle(accessCount == totalTokens ? .green :
-                                                                (hasAccess ? .orange : .red))
-                                        }
-                                        Spacer()
-                                        if room.selectedChannel?.id == ch.id {
-                                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo)
-                                        }
-                                    }
-                                    .padding(12)
-                                    .background(room.selectedChannel?.id == ch.id
-                                                ? Color.indigo.opacity(0.15)
-                                                : Color(UIColor.secondarySystemBackground))
-                                    .cornerRadius(10)
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(!hasAccess)
-                            }
-                        }
-                    }.padding().background(Color(UIColor.tertiarySystemBackground)).cornerRadius(12)
-                }
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("CHỨC NĂNG KHI ĐANG Ở TRONG VOICE").font(.caption).bold().foregroundStyle(.secondary)
-                    Text("Sau khi join, bật/tắt Cam / Stream / Mic / Loa bằng thanh toggle. Chỉ đổi trạng thái Discord (icon, ring xanh) — không có media packet thật.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }.padding().background(Color(UIColor.tertiarySystemBackground)).cornerRadius(12)
-
-                Button {
-                    Task { await room.startRoom() }
-                } label: {
-                    HStack {
-                        Image(systemName: "play.circle.fill")
-                        Text("BẮT ĐẦU ROOM").bold()
-                    }.frame(maxWidth: .infinity).padding()
-                }
-                .background(canStart ? Color.green : Color.gray)
-                .foregroundStyle(.white).cornerRadius(12)
-                .disabled(!canStart || room.isLoading)
-
-                if !canStart && !room.isLoading {
-                    Text("Chọn kênh thoại + ít nhất 1 token").font(.caption).foregroundStyle(.secondary)
-                }
-            }.padding()
-        }
-        .background(Color(UIColor.systemGroupedBackground))
-    }
-}
-
-struct RoomRunningView: View {
-    @EnvironmentObject var room: VoiceRoomManager
-
-    var body: some View {
-        VStack(spacing: 0) {
-            VStack(spacing: 8) {
-                HStack {
-                    Image(systemName: "waveform").foregroundStyle(.green).font(.title3)
-                    Text("ROOM LIVE").font(.title2.bold())
-                    Spacer()
-                    ProgressView().tint(.green)
-                }
-                if let g = room.selectedGuild, let c = room.selectedChannel {
-                    HStack(spacing: 6) {
-                        Circle().fill(.green).frame(width: 8, height: 8)
-                        Text("\(g.name) / \(c.name)").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-                        Spacer()
-                        Text("\(room.perTokenStatus.values.filter { $0.contains("✓") }.count)/\(room.selectedTokenIds.count)")
-                            .font(.caption.bold()).foregroundStyle(.green)
-                    }
-                }
-            }.padding().background(Color.green.opacity(0.08))
-
-            HStack(spacing: 8) {
-                toggleButton(icon: "video.fill", label: "Cam",
-                             isOn: room.camEnabled, color: .purple) {
-                    Task { await room.toggleCam() }
-                }
-                toggleButton(icon: "dot.radiowaves.left.and.right", label: "Stream",
-                             isOn: room.streamEnabled, color: .blue) {
-                    Task { await room.toggleStream() }
-                }
-                toggleButton(icon: room.micEnabled ? "mic.fill" : "mic.slash.fill", label: "Mic",
-                             isOn: room.micEnabled, color: .green) {
-                    Task { await room.toggleMic() }
-                }
-                toggleButton(icon: room.speakerEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill", label: "Loa",
-                             isOn: room.speakerEnabled, color: .orange) {
-                    Task { await room.toggleSpeaker() }
-                }
-            }.padding(.horizontal).padding(.vertical, 10)
-
-            ScrollView {
-                VStack(spacing: 6) {
-                    ForEach(room.tokens.filter { room.selectedTokenIds.contains($0.id) }) { t in
-                        HStack(spacing: 10) {
-                            Circle()
-                                .fill(statusColor(room.perTokenStatus[t.id] ?? "Chờ"))
-                                .frame(width: 8, height: 8)
-                            Text(t.username).font(.subheadline).lineLimit(1)
-                            Spacer()
-                            Text(room.perTokenStatus[t.id] ?? "Chờ")
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }.padding(10)
-                        .background(Color(UIColor.secondarySystemBackground)).cornerRadius(8)
-                    }
-                }.padding()
-            }
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(room.roomLog.enumerated()), id: \.offset) { i, line in
-                            Text(line)
-                                .font(.system(size: 11, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(i)
-                        }
-                    }.padding(12)
-                }
-                .frame(maxHeight: 140)
-                .background(Color(UIColor.secondarySystemBackground))
-                .cornerRadius(12).padding(.horizontal)
-                .onChange(of: room.roomLog.count) { _ in
-                    if let last = room.roomLog.indices.last {
-                        withAnimation { proxy.scrollTo(last, anchor: .bottom) }
-                    }
-                }
-            }
-
-            Button {
-                Task { await room.stopRoom() }
-            } label: {
-                HStack {
-                    Image(systemName: "stop.circle.fill")
-                    Text("DỪNG ROOM").bold()
-                }.frame(maxWidth: .infinity).padding()
-            }.background(Color.red).foregroundStyle(.white).cornerRadius(12).padding()
-        }
-        .background(Color(UIColor.systemGroupedBackground))
-        .navigationBarBackButtonHidden(true)
-    }
-
-    @ViewBuilder
-    func toggleButton(icon: String, label: String, isOn: Bool, color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon).font(.title3)
-                Text(label).font(.caption2).bold()
-            }
-            .frame(maxWidth: .infinity).padding(.vertical, 10)
-            .background(isOn ? color.opacity(0.2) : Color(UIColor.tertiarySystemBackground))
-            .foregroundStyle(isOn ? color : .secondary)
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(isOn ? color : Color.clear, lineWidth: 1.5)
-            )
-            .cornerRadius(10)
-        }.buttonStyle(.plain)
-    }
-
-    func statusColor(_ s: String) -> Color {
-        if s.contains("✓") { return .green }
-        if s.contains("Lỗi") || s.contains("Không có quyền") { return .red }
-        if s.contains("Đang") { return .orange }
-        return .gray
     }
 }
