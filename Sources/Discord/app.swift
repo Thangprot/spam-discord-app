@@ -1965,7 +1965,7 @@ struct AboutView: View {
                             Image(systemName: "info.circle.fill").foregroundStyle(.blue)
                             Text("About This App").font(.headline)
                         }
-                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users.")
+                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning, and Voice Room integration. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     .padding().frame(maxWidth: .infinity, alignment: .leading)
@@ -1976,6 +1976,8 @@ struct AboutView: View {
                             Image(systemName: "crown.fill").foregroundStyle(.yellow)
                             Text("Admin Services").font(.headline)
                         }
+                        Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile. Whether you need account registration tools, server nukers, mass DM tools, or any other automation, we can build it for you.")
+                            .font(.subheadline).foregroundStyle(.secondary)
                         Divider()
                         HStack {
                             Image(systemName: "message.fill").foregroundStyle(.indigo)
@@ -2840,7 +2842,7 @@ final class UsernameCheckClient {
         session = URLSession(configuration: cfg)
     }
 
-    // NOTE: iOS chỉ hỗ trợ HTTP proxy keys — HTTPS keys không có sẵn trên iOS.
+    // iOS chỉ hỗ trợ HTTP proxy keys — HTTPS keys không có sẵn trên iOS.
     // iOS tự tunnel HTTPS qua HTTP CONNECT khi chỉ set HTTP keys.
     static func parseProxy(_ str: String) -> [AnyHashable: Any]? {
         var s = str.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2929,9 +2931,23 @@ final class ProxyPool {
                 return idx
             }
         }
-        for i in entries.indices { entries[i].alive = true }
-        cursor = n > 1 ? 1 : 0
-        return 0
+        if entries.allSatisfy({ !$0.alive }) {
+            let minLastDead = entries.map { $0.lastDead }.min() ?? .distantPast
+            if now.timeIntervalSince(minLastDead) < cooldown {
+                return nil
+            }
+            for i in entries.indices { entries[i].alive = true }
+            cursor = n > 1 ? 1 : 0
+            return 0
+        }
+        for i in 0..<n {
+            let idx = (cursor + i) % n
+            if entries[idx].alive {
+                cursor = (idx + 1) % n
+                return idx
+            }
+        }
+        return nil
     }
 
     func markDead(_ idx: Int) {
@@ -2983,7 +2999,9 @@ final class UsernameChecker: ObservableObject {
     @Published var maxLength: Int = 4
     @Published var threads: Int = 50
     @Published var rpsLimit: Int = 0
-    @Published var proxyText: String = ""
+    @Published var proxyText: String = "" {
+        didSet { validateProxyText() }
+    }
     @Published var notifyOnAvailable: Bool = true
 
     @Published var isRunning = false
@@ -2996,6 +3014,7 @@ final class UsernameChecker: ObservableObject {
     @Published var proxyAlive = 0
     @Published var proxyTotal = 0
     @Published var notificationDenied = false
+    @Published var errorMessage: String? = nil
     @Published var startedAt: Date? = nil
 
     private var isCancelled = false
@@ -3006,13 +3025,53 @@ final class UsernameChecker: ObservableObject {
     private var lastNotify = Date.distantPast
     private let maxResults = 500
 
+    private func validateProxyText() {
+        let trimmed = proxyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            proxyTotal = 0
+            proxyAlive = 0
+            if !isRunning { errorMessage = nil }
+        } else if UsernameCheckClient.parseProxy(trimmed) != nil {
+            proxyTotal = 1
+            proxyAlive = 1
+            if !isRunning { errorMessage = nil }
+        } else {
+            proxyTotal = 0
+            proxyAlive = 0
+            errorMessage = "Proxy không đúng định dạng"
+        }
+    }
+
     func start() {
         guard !isRunning else { return }
+        errorMessage = nil
+
+        let proxyLine = proxyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !proxyLine.isEmpty else {
+            errorMessage = "Vui lòng nhập proxy trước khi Start"
+            return
+        }
+        guard UsernameCheckClient.parseProxy(proxyLine) != nil else {
+            errorMessage = "Proxy không đúng định dạng (VD: host:port hoặc host:port:user:pass)"
+            return
+        }
+        guard minLength >= 3, maxLength >= minLength else {
+            errorMessage = "Độ dài username không hợp lệ (Min ≥ 3 và ≤ Max)"
+            return
+        }
+        guard threads >= 1, threads <= 500 else {
+            errorMessage = "Số luồng phải từ 1 đến 500"
+            return
+        }
+
         proxyPool = ProxyPool()
-        for line in proxyText.components(separatedBy: .newlines) { proxyPool.add(line) }
+        proxyPool.add(proxyLine)
         proxyTotal = proxyPool.size()
         proxyAlive = proxyPool.aliveCount()
-        guard proxyTotal > 0 else { return }
+        guard proxyTotal > 0 else {
+            errorMessage = "Không thể nạp proxy"
+            return
+        }
 
         isRunning = true; isCancelled = false
         results = []; totalChecked = 0; totalAvailable = 0
@@ -3166,6 +3225,12 @@ struct UsernameCheckerView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 statsHeader
+                if let err = checker.errorMessage, !checker.isRunning {
+                    Text("⚠️ \(err)")
+                        .font(.caption.bold()).foregroundStyle(.red)
+                        .frame(maxWidth: .infinity).padding(8)
+                        .background(Color.red.opacity(0.1))
+                }
                 controlBar
                 resultsArea
             }
@@ -3210,7 +3275,7 @@ struct UsernameCheckerView: View {
                     Text("Chưa có proxy — bấm ⚙️ để thêm")
                         .font(.caption2).foregroundStyle(.orange)
                 } else {
-                    Text("Sẵn sàng · \(checker.proxyTotal) proxy")
+                    Text("Sẵn sàng · 1 proxy")
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 if checker.notificationDenied {
@@ -3236,9 +3301,7 @@ struct UsernameCheckerView: View {
                     Label("Start", systemImage: "play.fill")
                         .frame(maxWidth: .infinity).padding(.vertical, 10)
                 }
-                .background(checker.proxyTotal > 0 ? Color.green : Color.gray)
-                .foregroundStyle(.white).cornerRadius(10)
-                .disabled(checker.proxyTotal == 0)
+                .background(Color.green).foregroundStyle(.white).cornerRadius(10)
             }
 
             Button {
@@ -3315,18 +3378,32 @@ private struct StatBadge: View {
 struct CheckerConfigSheet: View {
     @EnvironmentObject var checker: UsernameChecker
     @Environment(\.dismiss) var dismiss
+    @FocusState private var focus: Field?
+    enum Field { case proxy, threads, rps, minLen, maxLen }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section(header: Text("Độ dài Username")) {
                     HStack {
-                        Text("Min"); Spacer()
-                        Stepper("\(checker.minLength)", value: $checker.minLength, in: 3...20)
+                        Text("Min")
+                        Spacer()
+                        TextField("3", value: $checker.minLength, format: .number)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 60)
+                            .focused($focus, equals: .minLen)
+                        Stepper("", value: $checker.minLength, in: 3...20).labelsHidden()
                     }
                     HStack {
-                        Text("Max"); Spacer()
-                        Stepper("\(checker.maxLength)", value: $checker.maxLength, in: 3...20)
+                        Text("Max")
+                        Spacer()
+                        TextField("4", value: $checker.maxLength, format: .number)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 60)
+                            .focused($focus, equals: .maxLen)
+                        Stepper("", value: $checker.maxLength, in: 3...20).labelsHidden()
                     }
                     if checker.minLength > checker.maxLength {
                         Text("⚠️ Min > Max").font(.caption).foregroundStyle(.red)
@@ -3335,8 +3412,13 @@ struct CheckerConfigSheet: View {
 
                 Section(header: Text("Hiệu năng")) {
                     HStack {
-                        Text("Threads"); Spacer()
-                        Stepper("\(checker.threads)", value: $checker.threads, in: 1...500)
+                        Text("Threads")
+                        Spacer()
+                        TextField("50", value: $checker.threads, format: .number)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 80)
+                            .focused($focus, equals: .threads)
                     }
                     HStack {
                         Text("Rate limit (RQ/s)")
@@ -3345,6 +3427,7 @@ struct CheckerConfigSheet: View {
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
                             .frame(width: 80)
+                            .focused($focus, equals: .rps)
                     }
                     Text(checker.rpsLimit == 0 ? "0 = không giới hạn" : "~\(checker.rpsLimit) request/giây")
                         .font(.caption2).foregroundStyle(.secondary)
@@ -3356,16 +3439,26 @@ struct CheckerConfigSheet: View {
                 }
 
                 Section {
-                    TextEditor(text: $checker.proxyText)
-                        .frame(minHeight: 180)
+                    TextField("host:port hoặc host:port:user:pass", text: $checker.proxyText)
                         .font(.system(.caption, design: .monospaced))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    Text("Mỗi dòng 1 proxy. Định dạng:\nhost:port\nhost:port:user:pass\nhttp://user:pass@host:port")
+                        .keyboardType(.URL)
+                        .focused($focus, equals: .proxy)
+                        .submitLabel(.done)
+                        .onSubmit { focus = nil }
+                    if let err = checker.errorMessage {
+                        Text("⚠️ \(err)")
+                            .font(.caption).foregroundStyle(.red)
+                    } else if !checker.proxyText.trimmingCharacters(in: .whitespaces).isEmpty {
+                        Text("✓ Proxy hợp lệ")
+                            .font(.caption).foregroundStyle(.green)
+                    }
+                    Text("Chỉ nhập 1 proxy duy nhất. Định dạng:\n• host:port\n• host:port:user:pass\n• http://user:pass@host:port")
                         .font(.caption2).foregroundStyle(.secondary)
                 } header: {
                     HStack {
-                        Text("Danh sách Proxy")
+                        Text("Proxy")
                         Spacer()
                         Link(destination: URL(string: "https://discord.gg/sdn9NedNJ")!) {
                             Label("Mua Proxy", systemImage: "cart.fill")
@@ -3378,7 +3471,14 @@ struct CheckerConfigSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Xong") { dismiss() }.disabled(checker.isRunning)
+                    Button("Xong") {
+                        focus = nil
+                        dismiss()
+                    }.disabled(checker.isRunning)
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Xong") { focus = nil }
                 }
             }
         }
