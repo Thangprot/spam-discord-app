@@ -627,6 +627,7 @@ class AppState: ObservableObject {
         lastError = nil
         tokenSendCount = Dictionary(uniqueKeysWithValues: selectedTokens.map { ($0.id, 0) })
         let channelId = channel.id
+        let totalTokens = selectedTokens.count
 
         BackgroundManager.shared.start()
         NowPlayingHelper.shared.start(onStop: { [weak self] in
@@ -637,10 +638,11 @@ class AppState: ObservableObject {
         sendTask = Task { [weak self] in
             guard let self = self else { return }
             await withTaskGroup(of: Void.self) { group in
-                for token in selectedTokens {
+                for (index, token) in selectedTokens.enumerated() {
                     group.addTask { [weak self] in
                         guard let self = self else { return }
-                        await self.spamLoop(token: token, channelId: channelId)
+                        // Truyền index và tổng số token để chia đều nội dung
+                        await self.spamLoop(token: token, channelId: channelId, startIndex: index, step: totalTokens)
                     }
                 }
             }
@@ -651,9 +653,9 @@ class AppState: ObservableObject {
         }
     }
 
-    private func spamLoop(token: TokenInfo, channelId: String) async {
+    private func spamLoop(token: TokenInfo, channelId: String, startIndex: Int, step: Int) async {
         var client = DiscordClient(token: token.token)
-        var i = 0
+        var i = startIndex
         var consecutiveErrors = 0
         var perTokenTotal = 0
 
@@ -691,7 +693,7 @@ class AppState: ObservableObject {
                 continue
             }
 
-            i += 1
+            i += step // Nhảy cách để không trùng nội dung với token khác
             let d = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
             do { try await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) } catch { break }
         }
