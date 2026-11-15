@@ -1334,8 +1334,8 @@ enum LicenseStatus: Equatable {
 final class LicenseAPIClient {
     static let shared = LicenseAPIClient()
 
-    // ⚠️ ĐỔI URL NÀY thành URL Worker của bạn
-    let baseURL = "key.nqtaff01.workers.dev"
+    // ⚠️ ĐÃ THÊM https:// VÀO ĐẦU LINK
+    let baseURL = "https://key.nqtaff01.workers.dev"
 
     private func machineID() -> String {
         let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? "unknown")-\(Bundle.main.bundleIdentifier ?? "app")"
