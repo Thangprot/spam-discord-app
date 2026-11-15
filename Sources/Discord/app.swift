@@ -2840,6 +2840,8 @@ final class UsernameCheckClient {
         session = URLSession(configuration: cfg)
     }
 
+    // NOTE: iOS chỉ hỗ trợ HTTP proxy keys — HTTPS keys không có sẵn trên iOS.
+    // iOS tự tunnel HTTPS qua HTTP CONNECT khi chỉ set HTTP keys.
     static func parseProxy(_ str: String) -> [AnyHashable: Any]? {
         var s = str.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { return nil }
@@ -2861,12 +2863,9 @@ final class UsernameCheckClient {
         } else { return nil }
         guard !host.isEmpty, (1...65535).contains(port) else { return nil }
         var dict: [AnyHashable: Any] = [
-            kCFNetworkProxiesHTTPEnable:  true,
-            kCFNetworkProxiesHTTPProxy:   host,
-            kCFNetworkProxiesHTTPPort:    port,
-            kCFNetworkProxiesHTTPSEnable: true,
-            kCFNetworkProxiesHTTPSProxy:  host,
-            kCFNetworkProxiesHTTPSPort:   port,
+            kCFNetworkProxiesHTTPEnable: true,
+            kCFNetworkProxiesHTTPProxy:  host,
+            kCFNetworkProxiesHTTPPort:   port,
         ]
         if let u = user, let p = pass {
             dict[kCFProxyUsernameKey] = u
