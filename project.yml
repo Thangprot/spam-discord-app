@@ -1,18 +1,32 @@
-name: SpamDiscord
+name: Discord
 options:
   bundleIdPrefix: com.tenban
   deploymentTarget:
     iOS: "16.0"
+
 settings:
   base:
-    PRODUCT_BUNDLE_IDENTIFIER: com.tenban.spamdiscord
+    PRODUCT_BUNDLE_IDENTIFIER: com.quocthang.discord
     SWIFT_VERSION: "5.0"
+
 targets:
-  SpamDiscord:
+  discord:
     type: application
     platform: iOS
     sources:
-      - path: Sources/SpamDiscord
+      # 1. Đường dẫn chứa code Swift
+      - path: Sources/discord
+      
+      # 2. ĐƯỜNG DẪN CHỨA LOGO (Quan trọng)
+      # Giả sử thư mục Assets.xcassets của bạn nằm ngang hàng với thư mục Sources
+      - path: Assets.xcassets 
+      
     settings:
       base:
         INFOPLIST_FILE: info.plist
+        
+        # Ép Xcode phải sử dụng bộ icon có tên là "AppIcon"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        
+        # (Tùy chọn) Đổi tên app hiển thị trên màn hình nếu bạn không muốn sửa trong info.plist
+        # INFOPLIST_KEY_CFBundleDisplayName: Discord 
