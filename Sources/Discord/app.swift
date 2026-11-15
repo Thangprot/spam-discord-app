@@ -6,7 +6,6 @@ import UniformTypeIdentifiers
 import UIKit
 import CryptoKit
 import MediaPlayer
-import UserNotifications
 
 // ==========================================
 // MARK: - DOCUMENT PICKER
@@ -35,7 +34,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
 }
 
 // ==========================================
-// MARK: - KEYCHAIN HELPER
+// MARK: - KEYCHAIN HELPER (LƯU TRỮ VĨNH VIỄN)
 // ==========================================
 class KeychainHelper {
     static let standard = KeychainHelper()
@@ -196,20 +195,24 @@ struct NukeConfig {
 }
 
 // ==========================================
-// MARK: - NOW PLAYING HELPER
+// MARK: - NOW PLAYING HELPER (LOCK SCREEN)
 // ==========================================
 final class NowPlayingHelper {
     static let shared = NowPlayingHelper()
     private init() {}
     private var isActive = false
     private var onStopCB: (() -> Void)?
-
+    
+    // Cache ảnh
     private lazy var defaultArtwork: MPMediaItemArtwork? = {
         let size = CGSize(width: 512, height: 512)
         let renderer = UIGraphicsImageRenderer(size: size)
         let image = renderer.image { ctx in
+            // Nền màu tối giống app
             UIColor(red: 0.08, green: 0.08, blue: 0.16, alpha: 1.0).setFill()
             ctx.fill(CGRect(origin: .zero, size: size))
+            
+            // Vẽ logo (Ngọn lửa màu đỏ)
             let config = UIImage.SymbolConfiguration(pointSize: 300, weight: .bold)
             if let symbol = UIImage(systemName: "flame.fill", withConfiguration: config)?.withTintColor(.red, renderingMode: .alwaysOriginal) {
                 let symbolSize = symbol.size
@@ -223,7 +226,9 @@ final class NowPlayingHelper {
     func start(onStop: (() -> Void)? = nil) {
         isActive = true
         onStopCB = onStop
+
         UIApplication.shared.beginReceivingRemoteControlEvents()
+
         let cc = MPRemoteCommandCenter.shared()
         cc.playCommand.isEnabled = false
         cc.nextTrackCommand.isEnabled = false
@@ -231,6 +236,7 @@ final class NowPlayingHelper {
         cc.togglePlayPauseCommand.isEnabled = false
         cc.pauseCommand.removeTarget(nil)
         cc.stopCommand.removeTarget(nil)
+
         if onStop != nil {
             cc.pauseCommand.isEnabled = true
             cc.stopCommand.isEnabled = true
@@ -244,6 +250,7 @@ final class NowPlayingHelper {
             cc.pauseCommand.isEnabled = false
             cc.stopCommand.isEnabled = false
         }
+
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.update(title: "Quoc Thang Tools", detail: "Đang chuẩn bị...")
         }
@@ -256,15 +263,20 @@ final class NowPlayingHelper {
         info[MPMediaItemPropertyArtist] = detail
         info[MPMediaItemPropertyAlbumTitle] = "Quoc Thang Tools"
         info[MPMediaItemPropertyPlaybackDuration] = 0
+        
+        // Thêm ảnh
         info[MPMediaItemPropertyArtwork] = defaultArtwork
+        
         info[MPNowPlayingInfoPropertyIsLiveStream] = true
         info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
         info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
         info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+        
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         if #available(iOS 16.0, *) {
             MPNowPlayingInfoCenter.default().playbackState = .playing
         }
+        print("[NP] Updated: \(title) — \(detail)")
     }
 
     func stop() {
@@ -275,6 +287,7 @@ final class NowPlayingHelper {
             MPNowPlayingInfoCenter.default().playbackState = .stopped
         }
         UIApplication.shared.endReceivingRemoteControlEvents()
+        print("[NP] Stopped")
     }
 }
 
@@ -293,14 +306,23 @@ class BackgroundManager {
                 self?.stop()
             }
         }
+
         do {
             let session = AVAudioSession.sharedInstance()
+            // KHÔNG dùng .mixWithOthers để iOS cho phép hiện Now Playing
             try session.setCategory(.playback, mode: .default, options: [])
             try session.setActive(true, options: [])
-        } catch { }
+            print("[BG] Audio session OK")
+        } catch {
+            print("[BG] AVAudioSession FAIL: \(error)")
+        }
+
         if engine?.isRunning == true { return }
+
         let eng = AVAudioEngine()
         let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+        
+        // Phát ra âm thanh cực nhỏ để đánh thức phần cứng
         let node = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
             let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
             for buf in abl {
@@ -309,14 +331,19 @@ class BackgroundManager {
             }
             return noErr
         }
+        
         eng.attach(node)
         eng.connect(node, to: eng.mainMixerNode, format: format)
         eng.mainMixerNode.outputVolume = 0.01
+        
         do {
             try eng.start()
             engine = eng
             sourceNode = node
-        } catch { }
+            print("[BG] AVAudioEngine started: \(eng.isRunning)")
+        } catch {
+            print("[BG] AVAudioEngine FAIL: \(error)")
+        }
     }
 
     func stop() {
@@ -331,7 +358,7 @@ class BackgroundManager {
 }
 
 // ==========================================
-// MARK: - DISCORD CLIENT
+// MARK: - DISCORD CLIENT (SPAM)
 // ==========================================
 class DiscordClient {
     let token: String; let session: URLSession
@@ -517,14 +544,8 @@ class AppState: ObservableObject {
         await withTaskGroup(of: [Guild]?.self) { group in
             for t in selected {
                 group.addTask {
-                    for attempt in 0..<3 {
-                        do { return try await DiscordClient(token: t.token).getAllGuilds() }
-                        catch {
-                            if attempt < 2 { try? await Task.sleep(nanoseconds: 500_000_000); continue }
-                            return nil
-                        }
-                    }
-                    return nil
+                    do { return try await DiscordClient(token: t.token).getAllGuilds() }
+                    catch { return nil }
                 }
             }
             for await gs in group {
@@ -620,6 +641,7 @@ class AppState: ObservableObject {
                 for (index, token) in selectedTokens.enumerated() {
                     group.addTask { [weak self] in
                         guard let self = self else { return }
+                        // Truyền index và tổng số token để chia đều nội dung
                         await self.spamLoop(token: token, channelId: channelId, startIndex: index, step: totalTokens)
                     }
                 }
@@ -656,13 +678,14 @@ class AppState: ObservableObject {
             } catch {
                 consecutiveErrors += 1
                 if consecutiveErrors >= 2 {
+                    // Silent re-login
                     do {
                         _ = try await DiscordClient(token: token.token).validateToken()
                         client = DiscordClient(token: token.token)
                         consecutiveErrors = 0
                         try? await Task.sleep(nanoseconds: 800_000_000)
                     } catch {
-                        return
+                        return // Token chết, dừng riêng token này
                     }
                 } else {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
@@ -670,7 +693,7 @@ class AppState: ObservableObject {
                 continue
             }
 
-            i += step
+            i += step // Nhảy cách để không trùng nội dung với token khác
             let d = max(0.1, delaySeconds + Double.random(in: -0.3...0.3) * delaySeconds)
             do { try await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000)) } catch { break }
         }
@@ -878,14 +901,17 @@ class UserNukeClient {
         guard let ref = channels.first(where: { $0.type == 0 || $0.type == 5 })?.id else { return }
         let detail = try await getGuildDetail(guildId)
         let total = (detail["approximate_member_count"] as? Int) ?? (detail["member_count"] as? Int) ?? 1000
+
         guard let url = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else { return }
         let ws = session.webSocketTask(with: url); ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
+
         guard case .string(let hs) = try await ws.receive(),
               let hd = hs.data(using: .utf8),
               let hello = try? JSONSerialization.jsonObject(with: hd) as? [String: Any],
               let hbi = (hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int else { return }
         let hbInt = Double(hbi) / 1000.0
+
         let hbTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(hbInt * 1_000_000_000))
@@ -893,6 +919,7 @@ class UserNukeClient {
             }
         }
         defer { hbTask.cancel() }
+
         let identify: [String: Any] = ["op": 2, "d": [
             "token": token, "capabilities": 125,
             "properties": ["os": "iOS", "browser": "Safari", "device": "iPhone"],
@@ -901,6 +928,7 @@ class UserNukeClient {
         ]]
         let idData = try JSONSerialization.data(withJSONObject: identify)
         try await ws.send(.string(String(data: idData, encoding: .utf8)!))
+
         var ready = false; var att = 0
         while !ready && att < 50 {
             att += 1
@@ -911,10 +939,12 @@ class UserNukeClient {
             }
         }
         guard ready else { return }
+
         var seen = Set<String>()
         var start = 0, end = 99
         var empty = 0
         let maxIter = max(50, total / 100 + 20); var iter = 0
+
         while empty < 2 && iter < maxIter && !Task.isCancelled {
             iter += 1
             let req: [String: Any] = ["op": 14, "d": [
@@ -922,6 +952,7 @@ class UserNukeClient {
             ]]
             let rData = try JSONSerialization.data(withJSONObject: req)
             try await ws.send(.string(String(data: rData, encoding: .utf8)!))
+
             var gotNew = false
             let deadline = Date().addingTimeInterval(3.0)
             while Date() < deadline && !Task.isCancelled {
@@ -1050,6 +1081,7 @@ class BotManager: ObservableObject {
         log("Bắt đầu nuke: \(guild.name)")
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
+
         for step in options.stepOrder {
             if isCancelled { break }
             guard options.enabledSteps.contains(step) else { continue }
@@ -1376,6 +1408,7 @@ class UserNukeManager: ObservableObject {
         guard !selectedTokenIds.isEmpty else { return }
         let sel = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
         guard !sel.isEmpty else { return }
+
         isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start()
         NowPlayingHelper.shared.start(onStop: { [weak self] in
@@ -1384,10 +1417,12 @@ class UserNukeManager: ObservableObject {
         let gid = guild.id
         let allClients: [(UUID, UserNukeClient)] = sel.map { ($0.id, UserNukeClient(token: $0.token)) }
         guard let scan = allClients.first?.1 else { return }
+
         log("Bắt đầu nuke: \(guild.name)")
         log("Dùng \(allClients.count) token")
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
+
         for step in options.stepOrder {
             if isCancelled { break }
             guard options.enabledSteps.contains(step) else { continue }
@@ -1452,12 +1487,14 @@ class UserNukeManager: ObservableObject {
             let myM = try await scan.getMember(gid, uid: myUser.id)
             let myMax = (myM.roles ?? []).compactMap { roleMap[$0]?.position }.max() ?? 0
             log("  Scan role pos: \(myMax)")
+
             var rolePosition = 0
             var filterByRole = false
             if !options.banRoleId.isEmpty, let tr = roleMap[options.banRoleId] {
                 rolePosition = tr.position; filterByRole = true
                 log("  Ban theo role: \(tr.name) (pos \(rolePosition))")
             }
+
             var candidates: [String] = []
             let lock = NSLock()
             log("  Đang quét WS...")
@@ -1490,12 +1527,15 @@ class UserNukeManager: ObservableObject {
                     lock.lock(); candidates.append(uid); lock.unlock()
                 }, onProgress: { c in Task { @MainActor in self.membersScanned = c } })
             }
+
             log("  Tìm thấy \(candidates.count) target")
             guard !candidates.isEmpty else { log("  Không có ai để ban"); return }
+
             let queue = candidates
             let idxBox = IndexBox()
             let delay = options.banDelay
             let manager = self
+
             await withTaskGroup(of: Void.self) { group in
                 for client in clients {
                     group.addTask {
@@ -1616,6 +1656,7 @@ struct LicenseActivationResponse: Codable {
     let expiresAt: Int64?
     let message: String?
     let error: String?
+
     enum CodingKeys: String, CodingKey {
         case valid, message, error
         case expiresAt = "expires_at"
@@ -1626,6 +1667,7 @@ struct LicenseValidationResponse: Codable {
     let valid: Bool?
     let expiresAt: Int64?
     let error: String?
+
     enum CodingKeys: String, CodingKey {
         case valid, error
         case expiresAt = "expires_at"
@@ -1885,6 +1927,7 @@ struct LicenseAdminInfoView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("THÔNG TIN ADMIN").font(.headline)
+
                     VStack(alignment: .leading, spacing: 8) {
                         Text("API Endpoint").font(.caption.bold()).foregroundStyle(.secondary)
                         Text(LicenseAPIClient.shared.baseURL)
@@ -1902,6 +1945,36 @@ struct LicenseAdminInfoView: View {
                         .padding().frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
                     }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("TẠO KEY MỚI (từ máy tính)").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text("""
+                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/create \\
+                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
+                          -H "Content-Type: application/json" \\
+                          -d '{"email":"user@example.com","duration_days":365}'
+                        """)
+                        .font(.system(size: 10, design: .monospaced)).padding(8)
+                        .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        .textSelection(.enabled)
+                    }
+                    .padding().frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("LỆNH QUẢN LÝ (curl)").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text("""
+                        # Thu hồi key
+                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/disable \\
+                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
+                          -d '{"license_key":"QT-XXXXX-XXXXX"}'
+                        """)
+                        .font(.system(size: 10, design: .monospaced)).padding(8)
+                        .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        .textSelection(.enabled)
+                    }
+                    .padding().frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
 
                     Button(role: .destructive) {
                         license.deactivate(); dismiss()
@@ -1965,7 +2038,7 @@ struct AboutView: View {
                             Image(systemName: "info.circle.fill").foregroundStyle(.blue)
                             Text("About This App").font(.headline)
                         }
-                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users.")
+                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning, and Voice Room integration. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     .padding().frame(maxWidth: .infinity, alignment: .leading)
@@ -1976,6 +2049,8 @@ struct AboutView: View {
                             Image(systemName: "crown.fill").foregroundStyle(.yellow)
                             Text("Admin Services").font(.headline)
                         }
+                        Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile. Whether you need account registration tools, server nukers, mass DM tools, or any other automation, we can build it for you.")
+                            .font(.subheadline).foregroundStyle(.secondary)
                         Divider()
                         HStack {
                             Image(systemName: "message.fill").foregroundStyle(.indigo)
@@ -2004,6 +2079,80 @@ struct AboutView: View {
         let parts = key.split(separator: "-")
         if parts.count == 3 { return "\(parts[0])-***-\(parts[2])" }
         return "\(key.prefix(4))***\(key.suffix(4))"
+    }
+}
+
+// ==========================================
+// MARK: - APP ENTRY
+// ==========================================
+@main
+struct SpamDiscordApp: App {
+    @StateObject private var app = AppState()
+    @StateObject private var bot = BotManager()
+    @StateObject private var userNuke = UserNukeManager()
+    @StateObject private var license = LicenseManager.shared
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some Scene {
+        WindowGroup {
+            Group {
+                if license.isUnlocked {
+                    MainTabView()
+                        .environmentObject(app)
+                        .environmentObject(bot)
+                        .environmentObject(userNuke)
+                        .environmentObject(license)
+                } else {
+                    LockView().environmentObject(license)
+                }
+            }
+            .onChange(of: scenePhase) { phase in
+                if phase == .active {
+                    Task { @MainActor in await license.refreshStatus() }
+                    if app.isSending {
+                        BackgroundManager.shared.start()
+                        NowPlayingHelper.shared.update(
+                            title: "Quoc Thang Spam",
+                            detail: "\(app.totalSent) tin | \(app.selectedTokenIds.count) token"
+                        )
+                    }
+                }
+            }
+            .onChange(of: license.isUnlocked) { isUnlocked in
+                if !isUnlocked {
+                    app.stopSending()
+                    bot.stopNuke()
+                    userNuke.stop()
+                    BackgroundManager.shared.stop()
+                    NowPlayingHelper.shared.stop()
+                }
+            }
+        }
+    }
+}
+
+struct MainTabView: View {
+    var body: some View {
+        TabView {
+            SpamView().tabItem { Label("Spam", systemImage: "paperplane.fill") }
+            TokenListView().tabItem { Label("Tokens", systemImage: "person.2.fill") }
+            NukeTabView().tabItem { Label("Nuke", systemImage: "flame.fill") }
+            AboutView().tabItem { Label("Info", systemImage: "info.circle.fill") }
+        }.tint(.indigo)
+    }
+}
+
+struct NukeTabView: View {
+    @State private var mode: Mode = .bot
+    enum Mode { case bot, user }
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $mode) {
+                Text("Bot").tag(Mode.bot)
+                Text("User Token").tag(Mode.user)
+            }.pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 6)
+            if mode == .bot { BotNukeView() } else { UserNukeView() }
+        }
     }
 }
 
@@ -2293,1171 +2442,627 @@ struct SendView: View {
                                     HStack {
                                         Text(t.username).font(.caption).lineLimit(1)
                                         Spacer()
-                                        Text("\(app.tokenSendCount[t.id] ?? 0)").font(.caption.bold()).foregroundStyle(.indigo)
+                                        Text("\(app.tokenSendCount[t.id] ?? 0)")
+                                            .font(.system(.caption, design: .monospaced).bold())
+                                            .foregroundStyle(.indigo)
                                     }
                                 }
                             }
-                            .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
+                            .padding(10)
+                            .background(Color(UIColor.tertiarySystemBackground))
+                            .cornerRadius(8)
                         }
 
-                        if !app.currentMessageStr.isEmpty {
-                            Text("Tin cuối: \(app.currentMessageStr.prefix(80))")
-                                .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                                .padding(.horizontal)
-                        }
+                        Text(app.currentMessageStr).font(.caption).foregroundStyle(.gray)
+                            .lineLimit(2).multilineTextAlignment(.center).padding(.horizontal)
+                        if let e = app.lastError { Text(e).font(.caption).foregroundStyle(.red) }
 
                         Button { app.stopSending() } label: {
-                            Label("Dừng gửi", systemImage: "stop.circle.fill")
-                                .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        }
-                        .background(Color.red).foregroundStyle(.white).cornerRadius(10)
-                        .padding(.horizontal)
-                    }.padding(.vertical)
+                            Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
+                        }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
                 } else {
-                    Button {
-                        guard !app.messages.isEmpty else { showErr = true; return }
-                        app.startSending(channel: channel)
-                    } label: {
-                        Label("Bắt đầu gửi", systemImage: "paperplane.fill")
-                            .frame(maxWidth: .infinity).padding(.vertical, 12)
-                    }
-                    .background(Color.indigo).foregroundStyle(.white).cornerRadius(10)
+                    Button { app.startSending(channel: channel) } label: {
+                        Text("BẮT ĐẦU GỬI").bold().frame(maxWidth: .infinity).padding()
+                    }.background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
+                    .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty)
+                              || app.selectedTokenIds.isEmpty)
+                    .opacity((app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty)
+                              || app.selectedTokenIds.isEmpty) ? 0.5 : 1)
                 }
-            }
-            .padding()
+            }.padding()
         }
-        .navigationTitle("Gửi tin nhắn")
-        .navigationBarTitleDisplayMode(.inline)
+        .background(Color(UIColor.systemGroupedBackground))
+        .navigationTitle("Gửi tin nhắn").navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Xong") { app.hideKeyboard() } } }
         .sheet(isPresented: $showImport) {
-            DocumentPicker(contentTypes: [.text]) { u in app.parseFile(url: u) }
+            DocumentPicker(contentTypes: [.item]) { u in
+                app.parseFile(url: u)
+                if app.lastError != nil { showErr = true }
+            }
         }
-        .alert("Lỗi", isPresented: $showErr) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("Chưa có nội dung tin nhắn.")
-        }
+        .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
+        message: { Text(app.lastError ?? "Lỗi") }
     }
 }
 
 // ==========================================
-// MARK: - BOT NUKE VIEW
+// MARK: - BOT NUKE VIEWS
 // ==========================================
 struct BotNukeView: View {
     @EnvironmentObject var bot: BotManager
-    @State private var tokenInput = ""
-    @State private var selectedGuild: Guild? = nil
-    @State private var cfg = NukeConfig()
-    @State private var showConfig = false
+    @State private var selectedGuild: Guild?
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    botCard
-                    if bot.config != nil { guildCard; nukeConfigCard; statsCard; logCard }
-                }.padding()
+            Group {
+                if bot.config == nil { BotSetupView() }
+                else if bot.isNuking { BotNukeRunningView() }
+                else if let g = selectedGuild {
+                    NukeOptionsView(guild: g, selectedGuild: $selectedGuild, mode: .bot, permissions: nil)
+                } else { BotGuildListView(selectedGuild: $selectedGuild) }
             }
-            .background(Color(UIColor.systemGroupedBackground))
-            .navigationTitle("Bot Nuke")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(navTitle).navigationBarTitleDisplayMode(.inline)
         }
     }
+    private var navTitle: String {
+        if bot.config == nil { return "Bot Nuke" }
+        if bot.isNuking { return "Đang chạy..." }
+        if let g = selectedGuild { return g.name }
+        return "Chọn Server"
+    }
+}
 
-    private var botCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "key.fill").foregroundStyle(.indigo)
-                Text("Bot Token").font(.headline)
-                Spacer()
-                if bot.config != nil {
-                    Button(role: .destructive) { bot.removeConfig(); selectedGuild = nil } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-                    }
+struct BotSetupView: View {
+    @EnvironmentObject var bot: BotManager
+    @State private var tokenInput = ""
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: "server.rack").font(.system(size: 60)).foregroundStyle(.red).padding(.top, 30)
+                Text("BOT NUKE").font(.largeTitle.bold())
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("BOT TOKEN").font(.caption).bold().foregroundStyle(.secondary)
+                    SecureField("Dán bot token...", text: $tokenInput)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .padding(12).background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(10).font(.system(.body, design: .monospaced))
+                    Text("Developer Portal → Applications → Bot → Reset Token")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                if let e = bot.tokenError {
+                    Text(e).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
                 }
-            }
-            if let c = bot.config {
-                HStack {
-                    if let url = c.avatarURL {
-                        AsyncImage(url: url) { $0.resizable().scaledToFill() }
-                        placeholder: { Circle().fill(.gray) }.frame(width: 40, height: 40).clipShape(Circle())
-                    }
-                    VStack(alignment: .leading) {
-                        Text(c.displayName).bold()
-                        Text("Bot · \(c.userId)").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            } else {
-                TextField("Dán bot token...", text: $tokenInput)
-                    .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    .padding(10).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
-                Button {
-                    Task { await bot.setToken(tokenInput); tokenInput = "" }
-                } label: {
+
+                Button { Task { await bot.setToken(tokenInput) } } label: {
                     HStack {
                         if bot.isCheckingToken { ProgressView().tint(.white) }
-                        Text(bot.isCheckingToken ? "Đang check..." : "Lưu Bot Token")
-                    }.frame(maxWidth: .infinity).padding(.vertical, 10)
-                }
-                .background(Color.indigo).foregroundStyle(.white).cornerRadius(8)
+                        else { Image(systemName: "checkmark.shield.fill") }
+                        Text(bot.isCheckingToken ? "Đang kiểm tra..." : "KẾT NỐI BOT").bold()
+                    }.frame(maxWidth: .infinity).padding()
+                }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
                 .disabled(tokenInput.isEmpty || bot.isCheckingToken)
-                if let err = bot.tokenError {
-                    Text(err).font(.caption).foregroundStyle(.red)
-                }
-            }
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
+                .opacity(tokenInput.isEmpty ? 0.5 : 1)
 
-    private var guildCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "server.rack").foregroundStyle(.indigo)
-                Text("Chọn Server").font(.headline)
-                Spacer()
-                if bot.isLoadingGuilds { ProgressView().scaleEffect(0.7) }
-            }
-            if bot.botGuilds.isEmpty {
-                Text("Không có server").font(.caption).foregroundStyle(.secondary)
-            } else {
-                Picker("Server", selection: $selectedGuild) {
-                    Text("— Chọn —").tag(Guild?.none)
-                    ForEach(bot.botGuilds) { g in Text(g.name).tag(Optional(g)) }
-                }.pickerStyle(.menu).tint(.indigo)
-            }
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
-
-    private var nukeConfigCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "flame.fill").foregroundStyle(.red)
-                Text("Cấu hình Nuke").font(.headline)
-                Spacer()
-                Button("Sửa") { showConfig = true }.font(.caption.bold())
-            }
-            ForEach(NukeStepType.allCases) { step in
-                HStack {
-                    Image(systemName: step.icon).foregroundStyle(cfg.enabledSteps.contains(step) ? .indigo : .gray)
-                        .frame(width: 24)
-                    Text(step.rawValue).font(.subheadline)
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { cfg.enabledSteps.contains(step) },
-                        set: { on in
-                            if on { cfg.enabledSteps.insert(step) }
-                            else { cfg.enabledSteps.remove(step) }
-                        }
-                    )).labelsHidden().tint(.indigo).scaleEffect(0.8)
-                }
-            }
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-        .sheet(isPresented: $showConfig) { nukeConfigSheet }
-    }
-
-    private var nukeConfigSheet: some View {
-        NavigationStack {
-            Form {
-                Section("Mass Ban") {
-                    HStack { Text("Delay"); Spacer(); TextField("0.02", value: $cfg.banDelay, format: .number).frame(width: 80) }
-                }
-                Section("Xóa kênh") {
-                    HStack { Text("Delay"); Spacer(); TextField("0.05", value: $cfg.deleteDelay, format: .number).frame(width: 80) }
-                }
-                Section("Đổi tên server") {
-                    TextField("Tên mới", text: $cfg.newGuildName)
-                }
-                Section("Tạo Role") {
-                    TextField("Tên role", text: $cfg.roleName)
-                    HStack { Text("Số lượng"); Spacer(); TextField("50", value: $cfg.roleCount, format: .number).frame(width: 80) }
-                    HStack { Text("Delay"); Spacer(); TextField("0.10", value: $cfg.createRoleDelay, format: .number).frame(width: 80) }
-                }
-                Section("Tạo kênh + Spam") {
-                    TextField("Tên kênh", text: $cfg.channelName)
-                    HStack { Text("Số lượng"); Spacer(); TextField("50", value: $cfg.channelCount, format: .number).frame(width: 80) }
-                    TextField("Nội dung tin nhắn", text: $cfg.messageContent, axis: .vertical).lineLimit(3...6)
-                    Toggle("Tag @everyone", isOn: $cfg.tagEveryone).tint(.indigo)
-                    HStack { Text("Delay tạo"); Spacer(); TextField("0.10", value: $cfg.createChDelay, format: .number).frame(width: 80) }
-                    HStack { Text("Delay tin"); Spacer(); TextField("0.10", value: $cfg.msgDelay, format: .number).frame(width: 80) }
-                }
-            }
-            .navigationTitle("Cấu hình Nuke").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Xong") { showConfig = false } }
-            }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("YÊU CẦU").font(.caption).bold().foregroundStyle(.secondary)
+                    Label("Bot đã vào server", systemImage: "checkmark.circle")
+                    Label("Bật Server Members Intent", systemImage: "checkmark.circle")
+                    Label("Quyền Administrator", systemImage: "checkmark.circle")
+                }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+                .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
+            }.padding()
         }
     }
+}
 
-    private var statsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Bắt đầu").font(.headline)
-                Spacer()
-                if bot.isNuking {
-                    Button(role: .destructive) { bot.stopNuke() } label: {
-                        Label("Dừng", systemImage: "stop.fill").font(.caption.bold())
-                    }
-                }
-            }
-            if bot.isNuking {
-                ProgressView(value: bot.phaseProgress).tint(.indigo)
-                Text(bot.currentPhase).font(.caption).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 8) {
-                statPill("Ban", "\(bot.banSuccess)", .red)
-                statPill("Kênh -", "\(bot.channelsDeleted)", .orange)
-                statPill("Kênh +", "\(bot.channelsCreated)", .green)
-                statPill("Tin", "\(bot.messagesSent)", .blue)
-            }
-            Button {
-                guard let g = selectedGuild else { return }
-                Task { await bot.runNuke(guild: g, options: cfg) }
-            } label: {
-                HStack {
-                    Image(systemName: "bolt.fill")
-                    Text(bot.isNuking ? "Đang nuke..." : "BẮT ĐẦU NUKE")
-                }.frame(maxWidth: .infinity).padding(.vertical, 12)
-            }
-            .background(selectedGuild == nil ? Color.gray : Color.red)
-            .foregroundStyle(.white).cornerRadius(10)
-            .disabled(selectedGuild == nil || bot.isNuking)
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+struct BotGuildListView: View {
+    @EnvironmentObject var bot: BotManager
+    @Binding var selectedGuild: Guild?
+    @State private var searchText = ""
+    var filtered: [Guild] {
+        searchText.isEmpty
+            ? bot.botGuilds
+            : bot.botGuilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-
-    private var logCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "doc.text.fill").foregroundStyle(.indigo)
-                Text("Log").font(.headline)
-                Spacer()
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(bot.nukeLog.indices, id: \.self) { i in
-                        Text(bot.nukeLog[i])
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
+    var body: some View {
+        VStack(spacing: 0) {
+            if let c = bot.config {
+                HStack(spacing: 12) {
+                    if let url = c.avatarURL {
+                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                        placeholder: { Circle().fill(.gray.opacity(0.3)) }
+                            .frame(width: 42, height: 42).clipShape(Circle())
+                    } else { Image(systemName: "cpu").font(.title2).frame(width: 42, height: 42) }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(c.displayName).font(.subheadline.bold())
+                        Text("Bot ID: \(c.userId)").font(.caption2).foregroundStyle(.secondary)
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }.frame(height: 200)
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
-
-    private func statPill(_ t: String, _ v: String, _ c: Color) -> some View {
-        VStack(spacing: 2) {
-            Text(v).font(.system(.subheadline, weight: .bold)).foregroundStyle(c)
-            Text(t).font(.system(size: 9)).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity).padding(.vertical, 6)
-        .background(c.opacity(0.1)).cornerRadius(8)
+                    Spacer()
+                    Menu {
+                        Button("Đổi token", systemImage: "key") { bot.removeConfig() }
+                        Button("Refresh", systemImage: "arrow.clockwise") { Task { await bot.loadGuilds() } }
+                    } label: { Image(systemName: "ellipsis.circle").font(.title3) }
+                }.padding().background(Color(UIColor.secondarySystemBackground))
+            }
+            if bot.isLoadingGuilds { ProgressView("Đang tải...").padding(.top, 40); Spacer() }
+            else if bot.botGuilds.isEmpty {
+                EmptyStateView(title: "Bot chưa vào server nào", systemImage: "server.rack",
+                               description: "Mời bot rồi Refresh.")
+            } else {
+                List(filtered) { g in
+                    Button { selectedGuild = g } label: {
+                        HStack(spacing: 12) {
+                            if let icon = g.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
+                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                placeholder: { Circle().fill(.gray.opacity(0.3)) }
+                                    .frame(width: 42, height: 42).clipShape(Circle())
+                            } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(g.name).font(.headline)
+                                Text(g.id).font(.caption2).foregroundStyle(.secondary).monospaced()
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                        }.padding(.vertical, 4)
+                    }.buttonStyle(.plain)
+                }.searchable(text: $searchText, prompt: "Tìm...")
+            }
+        }
     }
 }
 
 // ==========================================
-// MARK: - USER NUKE VIEW
+// MARK: - NUKE OPTIONS
+// ==========================================
+enum NukeMode { case bot, user }
+
+struct NukeOptionsView: View {
+    @EnvironmentObject var bot: BotManager
+    @EnvironmentObject var userNuke: UserNukeManager
+    let guild: Guild
+    @Binding var selectedGuild: Guild?
+    let mode: NukeMode
+    let permissions: GuildPermissions?
+    @State private var options = NukeConfig()
+
+    var canRun: Bool { !options.enabledSteps.isEmpty }
+
+    func stepPermitted(_ step: NukeStepType) -> Bool {
+        guard let p = permissions else { return true }
+        switch step {
+        case .massBan: return p.massBan
+        case .deleteChannels: return p.deleteChannels
+        case .createChannels: return p.createChannels
+        case .createRoles: return p.createRoles
+        case .renameGuild: return p.renameGuild
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                HStack(spacing: 12) {
+                    if let icon = guild.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
+                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                        placeholder: { Circle().fill(.gray) }.frame(width: 50, height: 50).clipShape(Circle())
+                    } else { Circle().fill(.gray.opacity(0.3)).frame(width: 50, height: 50) }
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(guild.name).font(.title3.bold())
+                        Text(mode == .bot ? "BOT NUKE" : "USER TOKEN NUKE")
+                            .font(.caption).bold().foregroundStyle(.red)
+                    }
+                    Spacer()
+                    Button {
+                        selectedGuild = nil
+                    } label: { Image(systemName: "xmark.circle.fill").font(.title3).foregroundStyle(.gray) }
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("CHỌN HÀNH ĐỘNG").font(.caption).bold().foregroundStyle(.secondary)
+                    ForEach(NukeStepType.allCases) { step in
+                        let permitted = stepPermitted(step)
+                        HStack {
+                            Image(systemName: step.icon).foregroundStyle(permitted ? .red : .gray).frame(width: 24)
+                            Text(step.rawValue).foregroundStyle(permitted ? .primary : .secondary)
+                            Spacer()
+                            if !permitted {
+                                Text("Không đủ quyền").font(.caption2).foregroundStyle(.secondary)
+                            } else {
+                                Toggle("", isOn: Binding(
+                                    get: { options.enabledSteps.contains(step) },
+                                    set: { on in
+                                        if on { options.enabledSteps.insert(step) }
+                                        else { options.enabledSteps.remove(step) }
+                                    }
+                                )).labelsHidden().tint(.red)
+                            }
+                        }.padding(.vertical, 4)
+                        if step != NukeStepType.allCases.last { Divider() }
+                    }
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                if options.enabledSteps.contains(.massBan) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("MASS BAN").font(.caption).bold().foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Delay ban:").font(.caption)
+                                Spacer()
+                                Text("\(String(format: "%.2f", options.banDelay))s").bold().font(.caption)
+                            }
+                            Slider(value: $options.banDelay, in: 0.0...1.0, step: 0.01).tint(.red)
+                        }
+                        TextField("Role ID filter (để trống = tất cả)", text: $options.banRoleId)
+                            .keyboardType(.numberPad).padding(8)
+                            .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                            .font(.system(.caption, design: .monospaced))
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }
+
+                if options.enabledSteps.contains(.deleteChannels) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("XÓA KÊNH").font(.caption).bold().foregroundStyle(.secondary)
+                        HStack {
+                            Text("Delay xoá:").font(.caption)
+                            Spacer()
+                            Text("\(String(format: "%.2f", options.deleteDelay))s").bold().font(.caption)
+                        }
+                        Slider(value: $options.deleteDelay, in: 0.0...1.0, step: 0.01).tint(.red)
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }
+
+                if options.enabledSteps.contains(.renameGuild) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("ĐỔI TÊN SERVER").font(.caption).bold().foregroundStyle(.secondary)
+                        TextField("Tên mới", text: $options.newGuildName)
+                            .padding(8).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }
+
+                if options.enabledSteps.contains(.createRoles) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("TẠO ROLE").font(.caption).bold().foregroundStyle(.secondary)
+                        TextField("Tên role", text: $options.roleName)
+                            .padding(8).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        HStack {
+                            Text("Số lượng:").font(.caption)
+                            Spacer()
+                            TextField("50", value: $options.roleCount, format: .number)
+                                .keyboardType(.numberPad).multilineTextAlignment(.trailing)
+                                .frame(width: 80).padding(6)
+                                .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        }
+                        HStack {
+                            Text("Delay:").font(.caption)
+                            Spacer()
+                            Text("\(String(format: "%.2f", options.createRoleDelay))s").bold().font(.caption)
+                        }
+                        Slider(value: $options.createRoleDelay, in: 0.0...1.0, step: 0.01).tint(.red)
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }
+
+                if options.enabledSteps.contains(.createChannels) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("TẠO KÊNH + SPAM").font(.caption).bold().foregroundStyle(.secondary)
+                        TextField("Tên kênh", text: $options.channelName)
+                            .padding(8).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        HStack {
+                            Text("Số kênh:").font(.caption)
+                            Spacer()
+                            TextField("50", value: $options.channelCount, format: .number)
+                                .keyboardType(.numberPad).multilineTextAlignment(.trailing)
+                                .frame(width: 80).padding(6)
+                                .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        }
+                        HStack {
+                            Text("Delay tạo:").font(.caption)
+                            Spacer()
+                            Text("\(String(format: "%.2f", options.createChDelay))s").bold().font(.caption)
+                        }
+                        Slider(value: $options.createChDelay, in: 0.0...1.0, step: 0.01).tint(.red)
+                        HStack {
+                            Text("Delay tin nhắn:").font(.caption)
+                            Spacer()
+                            Text("\(String(format: "%.2f", options.msgDelay))s").bold().font(.caption)
+                        }
+                        Slider(value: $options.msgDelay, in: 0.0...1.0, step: 0.01).tint(.red)
+                        TextEditor(text: $options.messageContent)
+                            .frame(height: 80).padding(6)
+                            .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
+                        Toggle("Tag @everyone", isOn: $options.tagEveryone).tint(.red)
+                    }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                }
+
+                Button {
+                    Task {
+                        if mode == .bot { await bot.runNuke(guild: guild, options: options) }
+                        else { await userNuke.runNuke(guild: guild, options: options) }
+                    }
+                } label: {
+                    HStack {
+                        Image(systemName: "flame.fill")
+                        Text("BẮT ĐẦU NUKE").bold()
+                    }.frame(maxWidth: .infinity).padding()
+                }
+                .background(Color.red).foregroundStyle(.white).cornerRadius(12)
+                .disabled(!canRun)
+                .opacity(canRun ? 1 : 0.5)
+            }.padding()
+        }
+        .background(Color(UIColor.systemGroupedBackground))
+    }
+}
+
+// ==========================================
+// MARK: - BOT NUKE RUNNING
+// ==========================================
+struct BotNukeRunningView: View {
+    @EnvironmentObject var bot: BotManager
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                VStack(spacing: 8) {
+                    ProgressView(value: bot.phaseProgress).tint(.red).scaleEffect(1.2)
+                    Text(bot.currentPhase).font(.headline).foregroundStyle(.red)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                HStack(spacing: 10) {
+                    StatBox(value: "\(bot.banSuccess)", label: "Ban OK", color: .green)
+                    StatBox(value: "\(bot.banFailed)", label: "Ban Fail", color: .red)
+                    StatBox(value: "\(bot.channelsDeleted)", label: "Xoá", color: .orange)
+                }
+                HStack(spacing: 10) {
+                    StatBox(value: "\(bot.channelsCreated)", label: "Kênh tạo", color: .blue)
+                    StatBox(value: "\(bot.messagesSent)", label: "Tin nhắn", color: .purple)
+                    StatBox(value: "\(bot.rolesCreated)", label: "Role", color: .indigo)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("LOG").font(.caption).bold().foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(bot.nukeLog.enumerated()), id: \.offset) { _, l in
+                                Text(l).font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }.frame(height: 260)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                Button { bot.stopNuke() } label: {
+                    Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
+                }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
+            }.padding()
+        }.background(Color(UIColor.systemGroupedBackground))
+    }
+}
+
+struct StatBox: View {
+    let value: String; let label: String; let color: Color
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(value).font(.title2.bold()).foregroundStyle(color)
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity).padding(10)
+        .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
+    }
+}
+
+// ==========================================
+// MARK: - USER NUKE VIEWS
 // ==========================================
 struct UserNukeView: View {
     @EnvironmentObject var userNuke: UserNukeManager
-    @State private var showAddToken = false
+    @State private var selectedGuild: Guild?
+    @State private var showAdd = false
     @State private var showImport = false
-    @State private var tokenInput = ""
-    @State private var selectedGuild: Guild? = nil
-    @State private var cfg = NukeConfig()
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    tokensCard
-                    if !userNuke.selectedTokenIds.isEmpty {
-                        guildCard
-                        if let g = selectedGuild { nukeCard(guild: g) }
-                    }
-                    statsCard
-                    logCard
-                }.padding()
+            Group {
+                if userNuke.isNuking { UserNukeRunningView() }
+                else if userNuke.tokens.isEmpty { userSetupView }
+                else if let g = selectedGuild {
+                    let perms = userNuke.permissionsForGuild(g.id)
+                    NukeOptionsView(guild: g, selectedGuild: $selectedGuild, mode: .user, permissions: perms)
+                } else { userGuildListView }
             }
-            .background(Color(UIColor.systemGroupedBackground))
-            .navigationTitle("User Nuke")
-            .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $showAddToken) { addTokenSheet }
+            .navigationTitle(navTitle).navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if !userNuke.isNuking && !userNuke.tokens.isEmpty && selectedGuild == nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Button("Thêm token", systemImage: "key") { showAdd = true }
+                            Button("Nhập file", systemImage: "doc.text") { showImport = true }
+                            Button("Xoá hết", systemImage: "trash", role: .destructive) { userNuke.clearAll() }
+                        } label: { Image(systemName: "plus.circle.fill") }
+                    }
+                }
+            }
+            .sheet(isPresented: $showAdd) {
+                UserNukeAddSheet().environmentObject(userNuke)
+            }
             .sheet(isPresented: $showImport) {
-                DocumentPicker(contentTypes: [.text]) { u in Task { await userNuke.importFromFile(url: u) } }
+                DocumentPicker(contentTypes: [.item]) { u in
+                    Task { await userNuke.importFromFile(url: u) }
+                }
             }
         }
     }
 
-    private var tokensCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "person.2.fill").foregroundStyle(.indigo)
-                Text("Tokens (\(userNuke.tokens.count))").font(.headline)
-                Spacer()
-                Menu {
-                    Button("Thêm tay", systemImage: "keyboard") { showAddToken = true }
-                    Button("Import file", systemImage: "doc.text") { showImport = true }
-                    if !userNuke.tokens.isEmpty {
-                        Divider()
-                        Button("Xoá tất cả", systemImage: "trash", role: .destructive) { userNuke.clearAll() }
-                    }
-                } label: { Image(systemName: "plus.circle.fill").foregroundStyle(.indigo) }
-            }
-            if userNuke.isImporting { ProgressView("Đang import...").scaleEffect(0.8) }
-            ForEach(userNuke.tokens) { t in
-                HStack {
-                    Image(systemName: t.isValid ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundStyle(t.isValid ? .green : .red)
-                    Text(t.username).font(.caption).lineLimit(1)
-                    Spacer()
-                    if t.isValid {
-                        Button {
-                            userNuke.toggleSelection(t)
-                        } label: {
-                            Image(systemName: userNuke.selectedTokenIds.contains(t.id)
-                                  ? "checkmark.square.fill" : "square")
-                                .foregroundStyle(.indigo)
-                        }
-                    }
-                    Button(role: .destructive) { userNuke.removeToken(t.id) } label: {
-                        Image(systemName: "trash").font(.caption).foregroundStyle(.red)
-                    }
-                }
-            }
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+    private var navTitle: String {
+        if userNuke.isNuking { return "Đang chạy..." }
+        if selectedGuild != nil { return selectedGuild!.name }
+        return "User Nuke"
     }
 
-    private var addTokenSheet: some View {
+    private var userSetupView: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: "person.badge.key.fill").font(.system(size: 60)).foregroundStyle(.red)
+                    .padding(.top, 30)
+                Text("USER NUKE").font(.largeTitle.bold())
+                Text("Chọn token để bắt đầu").font(.subheadline).foregroundStyle(.secondary)
+
+                Button { showAdd = true } label: {
+                    Label("Thêm token", systemImage: "plus.circle.fill")
+                        .frame(maxWidth: .infinity).padding()
+                }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
+
+                Button { showImport = true } label: {
+                    Label("Nhập từ file", systemImage: "doc.badge.plus")
+                        .frame(maxWidth: .infinity).padding()
+                }.background(Color.indigo).foregroundStyle(.white).cornerRadius(12)
+
+                if let e = userNuke.importError {
+                    Text(e).font(.caption).foregroundStyle(.red)
+                }
+            }.padding()
+        }
+    }
+
+    private var userGuildListView: some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("TOKEN (\(userNuke.selectedTokenIds.count)/\(userNuke.tokens.count))")
+                        .font(.caption).bold().foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Load") { Task { await userNuke.loadAllGuildsForSelected() } }
+                        .font(.caption)
+                        .disabled(userNuke.selectedTokenIds.isEmpty || userNuke.isLoadingGuilds)
+                }.padding(.horizontal).padding(.top, 8)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(userNuke.tokens) { t in
+                            Button { userNuke.toggleSelection(t) } label: {
+                                VStack(spacing: 4) {
+                                    if let url = t.avatarURL {
+                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                        placeholder: { Circle().fill(.gray.opacity(0.3)) }
+                                            .frame(width: 40, height: 40).clipShape(Circle())
+                                    } else {
+                                        Image(systemName: "person.circle.fill").resizable()
+                                            .frame(width: 40, height: 40).foregroundStyle(.gray)
+                                    }
+                                    Text(t.username).font(.caption2).lineLimit(1)
+                                        .foregroundStyle(userNuke.selectedTokenIds.contains(t.id) ? .indigo : .primary)
+                                }
+                                .padding(6)
+                                .background(userNuke.selectedTokenIds.contains(t.id)
+                                            ? Color.indigo.opacity(0.15) : Color.clear)
+                                .cornerRadius(10)
+                                .overlay(RoundedRectangle(cornerRadius: 10)
+                                    .stroke(userNuke.selectedTokenIds.contains(t.id) ? Color.indigo : Color.clear, lineWidth: 2))
+                            }.buttonStyle(.plain).disabled(!t.isValid)
+                        }
+                    }.padding(.horizontal)
+                }
+            }
+            .padding(.bottom, 8)
+            .background(Color(UIColor.secondarySystemBackground))
+
+            if userNuke.isLoadingGuilds {
+                ProgressView("Đang tải...").padding(.top, 40); Spacer()
+            } else if userNuke.selectedTokenIds.isEmpty {
+                EmptyStateView(title: "Chọn token", systemImage: "person.crop.circle.badge.questionmark",
+                               description: "Chọn 1 hoặc nhiều token ở trên.")
+            } else if userNuke.eligibleGuilds.isEmpty {
+                EmptyStateView(title: "Không có server khả dụng", systemImage: "server.rack",
+                               description: "Các token không cùng ở server nào có quyền.")
+            } else {
+                List(userNuke.eligibleGuilds) { g in
+                    Button { selectedGuild = g } label: {
+                        HStack(spacing: 12) {
+                            if let icon = g.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(g.id)/\(icon).png?size=64") {
+                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                placeholder: { Circle().fill(.gray.opacity(0.3)) }
+                                    .frame(width: 42, height: 42).clipShape(Circle())
+                            } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(g.name).font(.headline)
+                                Text(g.id).font(.caption2).foregroundStyle(.secondary).monospaced()
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+                        }.padding(.vertical, 4)
+                    }.buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
+struct UserNukeAddSheet: View {
+    @EnvironmentObject var userNuke: UserNukeManager
+    @Environment(\.dismiss) var dismiss
+    @State private var input = ""
+    var body: some View {
         NavigationStack {
             Form {
-                Section("User Token") {
-                    TextField("Dán token...", text: $tokenInput, axis: .vertical).lineLimit(2...4)
+                Section(header: Text("Nhập Token")) {
+                    TextField("Dán token...", text: $input)
                         .autocorrectionDisabled().textInputAutocapitalization(.never)
+                        .font(.system(.body, design: .monospaced))
                 }
             }
             .navigationTitle("Thêm Token").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Huỷ") { tokenInput = ""; showAddToken = false }
-                }
+                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Lưu") {
-                        Task { _ = await userNuke.addTokenManually(tokenInput); tokenInput = ""; showAddToken = false }
-                    }.disabled(tokenInput.isEmpty)
+                    Button("Lưu") { Task { _ = await userNuke.addTokenManually(input); dismiss() } }
+                        .disabled(input.isEmpty || userNuke.isImporting)
                 }
             }
         }
     }
-
-    private var guildCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "server.rack").foregroundStyle(.indigo)
-                Text("Chọn Server").font(.headline)
-                Spacer()
-                if userNuke.isLoadingGuilds { ProgressView().scaleEffect(0.7) }
-            }
-            if userNuke.eligibleGuilds.isEmpty {
-                Button("Tải server khả dụng") {
-                    Task { await userNuke.loadAllGuildsForSelected() }
-                }.font(.caption.bold())
-            } else {
-                Picker("Server", selection: $selectedGuild) {
-                    Text("— Chọn —").tag(Guild?.none)
-                    ForEach(userNuke.eligibleGuilds) { g in Text(g.name).tag(Optional(g)) }
-                }.pickerStyle(.menu).tint(.indigo)
-            }
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
-
-    private func nukeCard(guild: Guild) -> some View {
-        let perms = userNuke.permissionsForGuild(guild.id)
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "flame.fill").foregroundStyle(.red)
-                Text("Nuke: \(guild.name)").font(.headline).lineLimit(1)
-            }
-            HStack(spacing: 6) {
-                if perms.massBan { tag("Ban", .red) }
-                if perms.deleteChannels { tag("Xóa kênh", .orange) }
-                if perms.createChannels { tag("Tạo kênh", .green) }
-                if perms.createRoles { tag("Role", .blue) }
-                if perms.renameGuild { tag("Rename", .purple) }
-            }
-            ForEach(NukeStepType.allCases) { step in
-                let allowed: Bool = {
-                    switch step {
-                    case .massBan: return perms.massBan
-                    case .deleteChannels, .createChannels: return perms.deleteChannels || perms.createChannels
-                    case .createRoles: return perms.createRoles
-                    case .renameGuild: return perms.renameGuild
-                    }
-                }()
-                HStack {
-                    Image(systemName: step.icon).foregroundStyle(cfg.enabledSteps.contains(step) ? .indigo : .gray).frame(width: 24)
-                    Text(step.rawValue).font(.subheadline).foregroundStyle(allowed ? .primary : .secondary)
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { cfg.enabledSteps.contains(step) && allowed },
-                        set: { on in
-                            if on { cfg.enabledSteps.insert(step) }
-                            else { cfg.enabledSteps.remove(step) }
-                        }
-                    )).labelsHidden().tint(.indigo).scaleEffect(0.8).disabled(!allowed)
-                }
-            }
-            Button {
-                Task { await userNuke.runNuke(guild: guild, options: cfg) }
-            } label: {
-                HStack {
-                    if userNuke.isNuking { ProgressView().tint(.white) }
-                    Image(systemName: "bolt.fill")
-                    Text(userNuke.isNuking ? "Đang nuke..." : "BẮT ĐẦU NUKE")
-                }.frame(maxWidth: .infinity).padding(.vertical, 12)
-            }
-            .background(perms.any ? Color.red : Color.gray).foregroundStyle(.white).cornerRadius(10)
-            .disabled(!perms.any || userNuke.isNuking)
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
-
-    private var statsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Tiến độ").font(.headline)
-                Spacer()
-                if userNuke.isNuking {
-                    Button(role: .destructive) { userNuke.stop() } label: {
-                        Label("Dừng", systemImage: "stop.fill").font(.caption.bold())
-                    }
-                }
-            }
-            if userNuke.isNuking {
-                ProgressView(value: userNuke.phaseProgress).tint(.indigo)
-                Text(userNuke.currentPhase).font(.caption).foregroundStyle(.secondary)
-                Text("Scan: \(userNuke.membersScanned)").font(.caption2).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 8) {
-                smallPill("Ban", "\(userNuke.banSuccess)", .red)
-                smallPill("Kênh -", "\(userNuke.channelsDeleted)", .orange)
-                smallPill("Kênh +", "\(userNuke.channelsCreated)", .green)
-                smallPill("Tin", "\(userNuke.messagesSent)", .blue)
-            }
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
-
-    private var logCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Log").font(.headline)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(userNuke.nukeLog.indices, id: \.self) { i in
-                        Text(userNuke.nukeLog[i])
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }.frame(height: 200)
-        }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-    }
-
-    private func tag(_ t: String, _ c: Color) -> some View {
-        Text(t).font(.system(size: 10, weight: .bold))
-            .padding(.horizontal, 6).padding(.vertical, 2)
-            .background(c.opacity(0.2)).foregroundStyle(c).cornerRadius(4)
-    }
-    private func smallPill(_ t: String, _ v: String, _ c: Color) -> some View {
-        VStack(spacing: 2) {
-            Text(v).font(.system(.subheadline, weight: .bold)).foregroundStyle(c)
-            Text(t).font(.system(size: 9)).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity).padding(.vertical, 6)
-        .background(c.opacity(0.1)).cornerRadius(8)
-    }
 }
 
-struct NukeTabView: View {
-    @State private var mode: Mode = .bot
-    enum Mode { case bot, user }
+struct UserNukeRunningView: View {
+    @EnvironmentObject var userNuke: UserNukeManager
     var body: some View {
-        VStack(spacing: 0) {
-            Picker("", selection: $mode) {
-                Text("Bot").tag(Mode.bot)
-                Text("User Token").tag(Mode.user)
-            }.pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 6)
-            if mode == .bot { BotNukeView() } else { UserNukeView() }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - LOCAL NOTIFICATIONS
-// ==========================================
-final class NotificationHelper: NSObject, UNUserNotificationCenterDelegate {
-    static let shared = NotificationHelper()
-    private override init() { super.init() }
-
-    func setup() { UNUserNotificationCenter.current().delegate = self }
-
-    func requestPermission() async -> Bool {
-        do {
-            return try await UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .sound, .badge])
-        } catch { return false }
-    }
-
-    func notifyAvailable(username: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "🎉 Username Available!"
-        content.body  = "'\(username)' chưa được sử dụng"
-        content.sound = .default
-        content.badge = 1
-        let req = UNNotificationRequest(identifier: UUID().uuidString,
-                                        content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req)
-    }
-
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler:
-                                @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound])
-    }
-}
-
-// ==========================================
-// MARK: - USERNAME CHECK CLIENT
-// ==========================================
-final class UsernameCheckClient {
-    let session: URLSession
-
-    init(proxy: String?) {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest  = 10
-        cfg.timeoutIntervalForResource = 15
-        cfg.httpAdditionalHeaders = [
-            "Content-Type": "application/json",
-            "Accept": "*/*",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ]
-        if let p = proxy, let dict = Self.parseProxy(p) {
-            cfg.connectionProxyDictionary = dict
-        }
-        session = URLSession(configuration: cfg)
-    }
-
-    static func parseProxy(_ str: String) -> [AnyHashable: Any]? {
-        var s = str.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty { return nil }
-        if let r = s.range(of: "://") { s = String(s[r.upperBound...]) }
-        var user: String? = nil, pass: String? = nil
-        if let at = s.lastIndex(of: "@") {
-            let creds = String(s[..<at])
-            s = String(s[s.index(after: at)...])
-            let parts = creds.split(separator: ":", maxSplits: 1)
-            if parts.count == 2 { user = String(parts[0]); pass = String(parts[1]) }
-        }
-        var host = s, port = 80
-        let parts = s.split(separator: ":")
-        if parts.count == 4 {
-            host = String(parts[0]); port = Int(parts[1]) ?? 80
-            user = String(parts[2]); pass = String(parts[3])
-        } else if parts.count == 2 {
-            host = String(parts[0]); port = Int(parts[1]) ?? 80
-        } else { return nil }
-        guard !host.isEmpty, (1...65535).contains(port) else { return nil }
-        var dict: [AnyHashable: Any] = [
-            kCFNetworkProxiesHTTPEnable:  true,
-            kCFNetworkProxiesHTTPProxy:   host,
-            kCFNetworkProxiesHTTPPort:    port,
-            kCFNetworkProxiesHTTPSEnable: true,
-            kCFNetworkProxiesHTTPSProxy:  host,
-            kCFNetworkProxiesHTTPSPort:   port,
-        ]
-        if let u = user, let p = pass {
-            dict[kCFProxyUsernameKey] = u
-            dict[kCFProxyPasswordKey] = p
-        }
-        return dict
-    }
-
-    func check(username: String) async -> (Bool, Bool) {
-        do {
-            var req = URLRequest(url: URL(string:
-                "https://discord.com/api/v9/unique-username/username-attempt-unauthed")!)
-            req.httpMethod = "POST"
-            req.httpBody = try JSONSerialization.data(withJSONObject: ["username": username])
-            let (data, resp) = try await session.data(for: req)
-            guard let http = resp as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode) else { return (false, false) }
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let taken = json["taken"] as? Bool else { return (false, false) }
-            return (true, !taken)
-        } catch { return (false, false) }
-    }
-}
-
-// ==========================================
-// MARK: - PROXY POOL
-// ==========================================
-final class ProxyPool {
-    struct Entry {
-        var url: String
-        var alive: Bool
-        var failCount: Int
-        var lastDead: Date
-    }
-    private var entries: [Entry] = []
-    private var cursor = 0
-    private let lock = NSLock()
-    let cooldown: TimeInterval = 10.0
-
-    func add(_ url: String) {
-        lock.lock(); defer { lock.unlock() }
-        let t = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty else { return }
-        if entries.contains(where: { $0.url == t }) { return }
-        entries.append(Entry(url: t, alive: true, failCount: 0, lastDead: .distantPast))
-    }
-
-    func size()       -> Int { lock.lock(); defer { lock.unlock() }; return entries.count }
-    func aliveCount() -> Int { lock.lock(); defer { lock.unlock() }; return entries.filter { $0.alive }.count }
-
-    func acquire() -> Int? {
-        lock.lock(); defer { lock.unlock() }
-        let n = entries.count
-        guard n > 0 else { return nil }
-        let now = Date()
-        for i in 0..<n {
-            let idx = (cursor + i) % n
-            let e = entries[idx]
-            if e.alive && now.timeIntervalSince(e.lastDead) >= cooldown {
-                cursor = (idx + 1) % n
-                return idx
-            }
-        }
-        for i in entries.indices { entries[i].alive = true }
-        cursor = n > 1 ? 1 : 0
-        return 0
-    }
-
-    func markDead(_ idx: Int) {
-        lock.lock(); defer { lock.unlock() }
-        guard idx < entries.count else { return }
-        entries[idx].alive = false
-        entries[idx].failCount += 1
-        entries[idx].lastDead = Date()
-    }
-
-    func getURL(_ idx: Int) -> String {
-        lock.lock(); defer { lock.unlock() }
-        return idx < entries.count ? entries[idx].url : ""
-    }
-
-    func clear() { lock.lock(); defer { lock.unlock() }; entries = []; cursor = 0 }
-}
-
-// ==========================================
-// MARK: - RATE LIMITER
-// ==========================================
-actor RateLimiter {
-    let rps: Int
-    private var lastTime: Date = .distantPast
-    init(rps: Int) { self.rps = rps }
-    func acquire() async {
-        guard rps > 0 else { return }
-        let minGap = 1.0 / Double(rps)
-        let reserved = max(Date(), lastTime.addingTimeInterval(minGap))
-        lastTime = reserved
-        let wait = reserved.timeIntervalSinceNow
-        if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
-    }
-}
-
-// ==========================================
-// MARK: - USERNAME CHECKER MANAGER
-// ==========================================
-struct CheckResult: Identifiable {
-    let id = UUID()
-    let username: String
-    let available: Bool
-    let date: Date
-}
-
-@MainActor
-final class UsernameChecker: ObservableObject {
-    @Published var minLength: Int = 3
-    @Published var maxLength: Int = 4
-    @Published var threads: Int = 50
-    @Published var rpsLimit: Int = 0
-    @Published var proxyText: String = ""
-    @Published var notifyOnAvailable: Bool = true
-
-    @Published var isRunning = false
-    @Published var results: [CheckResult] = []
-    @Published var totalChecked = 0
-    @Published var totalAvailable = 0
-    @Published var totalRequests = 0
-    @Published var total429 = 0
-    @Published var showOnlyAvailable = false
-    @Published var proxyAlive = 0
-    @Published var proxyTotal = 0
-    @Published var notificationDenied = false
-    @Published var startedAt: Date? = nil
-
-    private var isCancelled = false
-    private var tasks: [Task<Void, Never>] = []
-    private var rateLimiter: RateLimiter?
-    private var proxyPool = ProxyPool()
-    private var lastNPUpdate = Date.distantPast
-    private var lastNotify = Date.distantPast
-    private let maxResults = 500
-
-    func start() {
-        guard !isRunning else { return }
-        proxyPool = ProxyPool()
-        for line in proxyText.components(separatedBy: .newlines) { proxyPool.add(line) }
-        proxyTotal = proxyPool.size()
-        proxyAlive = proxyPool.aliveCount()
-        guard proxyTotal > 0 else { return }
-
-        isRunning = true; isCancelled = false
-        results = []; totalChecked = 0; totalAvailable = 0
-        totalRequests = 0; total429 = 0
-        startedAt = Date()
-        rateLimiter = RateLimiter(rps: rpsLimit)
-
-        BackgroundManager.shared.start()
-        NowPlayingHelper.shared.start(onStop: { [weak self] in
-            Task { @MainActor in self?.stop() }
-        })
-        updateNowPlaying(force: true)
-
-        if notifyOnAvailable {
-            Task { @MainActor [weak self] in
-                let ok = await NotificationHelper.shared.requestPermission()
-                if !ok { self?.notificationDenied = true }
-            }
-        }
-
-        tasks = (0..<max(1, threads)).map { i in
-            Task { [weak self] in await self?.workerLoop(workerId: i) }
-        }
-    }
-
-    func stop() {
-        isCancelled = true
-        tasks.forEach { $0.cancel() }
-        tasks = []
-        isRunning = false
-        BackgroundManager.shared.stop()
-        NowPlayingHelper.shared.stop()
-    }
-
-    private func workerLoop(workerId: Int) async {
-        while !isCancelled && !Task.isCancelled {
-            guard let proxyIdx = proxyPool.acquire() else {
-                try? await Task.sleep(nanoseconds: 500_000_000); continue
-            }
-            let proxyURL = proxyPool.getURL(proxyIdx)
-            let client = UsernameCheckClient(proxy: proxyURL)
-
-            while !isCancelled && !Task.isCancelled {
-                let username = generateUsername()
-                guard !username.isEmpty else { break }
-
-                await rateLimiter?.acquire()
-                totalRequests += 1
-
-                let (success, available) = await client.check(username: username)
-
-                if !success {
-                    proxyPool.markDead(proxyIdx)
-                    proxyAlive = proxyPool.aliveCount()
-                    break
-                }
-
-                totalChecked += 1
-                let r = CheckResult(username: username, available: available, date: Date())
-                results.insert(r, at: 0)
-                if results.count > maxResults { results.removeLast(results.count - maxResults) }
-
-                if available {
-                    totalAvailable += 1
-                    sendAvailableNotification(username)
-                }
-
-                proxyAlive = proxyPool.aliveCount()
-                updateNowPlaying()
-                try? await Task.sleep(nanoseconds: UInt64.random(in: 5_000_000...20_000_000))
-            }
-        }
-    }
-
-    private func generateUsername() -> String {
-        let letters  = Array("abcdefghijklmnopqrstuvwxyz")
-        let allChars = Array("abcdefghijklmnopqrstuvwxyz0123456789_.")
-        let lo = max(3, min(minLength, maxLength))
-        let hi = max(lo, maxLength)
-        let len = Int.random(in: lo...hi)
-        var chars: [Character] = []
-        var hasLetter = false
-        for i in 0..<len {
-            let c: Character
-            if i == len - 1 && !hasLetter { c = letters.randomElement()! }
-            else { c = allChars.randomElement()! }
-            chars.append(c)
-            if c.isLetter { hasLetter = true }
-        }
-        return String(chars)
-    }
-
-    private func sendAvailableNotification(_ username: String) {
-        guard notifyOnAvailable else { return }
-        let now = Date()
-        guard now.timeIntervalSince(lastNotify) >= 2.0 else { return }
-        lastNotify = now
-        NotificationHelper.shared.notifyAvailable(username: username)
-    }
-
-    private func updateNowPlaying(force: Bool = false) {
-        let now = Date()
-        guard force || now.timeIntervalSince(lastNPUpdate) >= 1.0 else { return }
-        lastNPUpdate = now
-        let elapsed = startedAt.map { now.timeIntervalSince($0) } ?? 0
-        let rps = elapsed > 0 ? Double(totalRequests) / elapsed : 0
-        NowPlayingHelper.shared.update(
-            title:  "🔍 Checker · \(totalAvailable) avail",
-            detail: "\(totalChecked) checked · \(String(format: "%.1f", rps)) rq/s · \(proxyAlive)/\(proxyTotal) proxy"
-        )
-    }
-
-    var filteredResults: [CheckResult] {
-        showOnlyAvailable ? results.filter { $0.available } : results
-    }
-
-    func copyAvailable() -> Int {
-        let all = results.filter { $0.available }.map { $0.username }
-        UIPasteboard.general.string = all.joined(separator: "\n")
-        return all.count
-    }
-
-    func clearResults() {
-        results = []
-        totalChecked = 0; totalAvailable = 0
-        totalRequests = 0; total429 = 0
-        startedAt = nil
-    }
-
-    var rpsString: String {
-        guard let s = startedAt else { return "0.0" }
-        let e = Date().timeIntervalSince(s)
-        return e > 0 ? String(format: "%.1f", Double(totalRequests) / e) : "0.0"
-    }
-
-    var elapsedString: String {
-        guard let s = startedAt else { return "0s" }
-        return "\(Int(Date().timeIntervalSince(s)))s"
-    }
-}
-
-// ==========================================
-// MARK: - USERNAME CHECKER VIEW
-// ==========================================
-struct UsernameCheckerView: View {
-    @EnvironmentObject var checker: UsernameChecker
-    @State private var showConfig = false
-    @State private var copiedToast = false
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                statsHeader
-                controlBar
-                resultsArea
-            }
-            .navigationTitle("Username Checker")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { checker.clearResults() } label: { Image(systemName: "trash") }
-                        .disabled(checker.isRunning || checker.results.isEmpty)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showConfig = true } label: { Image(systemName: "gearshape.fill") }
-                }
-            }
-            .sheet(isPresented: $showConfig) { CheckerConfigSheet() }
-            .overlay(alignment: .top) {
-                if copiedToast {
-                    Text("Đã copy!")
-                        .font(.caption.bold()).padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(.top, 8)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            }
-        }
-    }
-
-    private var statsHeader: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 4) {
-                StatBadge(title: "Checked",   value: "\(checker.totalChecked)",   color: .blue)
-                StatBadge(title: "Available", value: "\(checker.totalAvailable)", color: .green)
-                StatBadge(title: "RPS",       value: checker.rpsString,           color: .purple)
-                StatBadge(title: "429",       value: "\(checker.total429)",       color: .red)
-                StatBadge(title: "Proxy",     value: "\(checker.proxyAlive)/\(checker.proxyTotal)", color: .orange)
-            }
-            HStack(spacing: 6) {
-                if checker.isRunning {
-                    ProgressView().scaleEffect(0.6)
-                    Text("Đang chạy · \(checker.elapsedString)")
-                        .font(.caption2).foregroundStyle(.secondary)
-                } else if checker.proxyTotal == 0 {
-                    Text("Chưa có proxy — bấm ⚙️ để thêm")
-                        .font(.caption2).foregroundStyle(.orange)
-                } else {
-                    Text("Sẵn sàng · \(checker.proxyTotal) proxy")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-                if checker.notificationDenied {
-                    Text("· 🔕 Thông báo bị tắt")
-                        .font(.caption2).foregroundStyle(.red)
-                }
-            }
-        }
-        .padding(.vertical, 8).padding(.horizontal)
-        .background(Color(UIColor.secondarySystemBackground))
-    }
-
-    private var controlBar: some View {
-        HStack(spacing: 8) {
-            if checker.isRunning {
-                Button { checker.stop() } label: {
-                    Label("Stop", systemImage: "stop.fill")
-                        .frame(maxWidth: .infinity).padding(.vertical, 10)
-                }
-                .background(Color.red).foregroundStyle(.white).cornerRadius(10)
-            } else {
-                Button { checker.start() } label: {
-                    Label("Start", systemImage: "play.fill")
-                        .frame(maxWidth: .infinity).padding(.vertical, 10)
-                }
-                .background(checker.proxyTotal > 0 ? Color.green : Color.gray)
-                .foregroundStyle(.white).cornerRadius(10)
-                .disabled(checker.proxyTotal == 0)
-            }
-
-            Button {
-                let n = checker.copyAvailable()
-                if n > 0 {
-                    withAnimation { copiedToast = true }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                        withAnimation { copiedToast = false }
+        ScrollView {
+            VStack(spacing: 16) {
+                VStack(spacing: 8) {
+                    ProgressView(value: userNuke.phaseProgress).tint(.red).scaleEffect(1.2)
+                    Text(userNuke.currentPhase).font(.headline).foregroundStyle(.red)
+                    if userNuke.membersScanned > 0 {
+                        Text("Đã quét: \(userNuke.membersScanned) members")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+
+                HStack(spacing: 10) {
+                    StatBox(value: "\(userNuke.banSuccess)", label: "Ban OK", color: .green)
+                    StatBox(value: "\(userNuke.banFailed)", label: "Ban Fail", color: .red)
+                    StatBox(value: "\(userNuke.channelsDeleted)", label: "Xoá", color: .orange)
                 }
-            } label: {
-                Image(systemName: "doc.on.doc.fill").padding(.vertical, 10).padding(.horizontal, 14)
-            }
-            .background(Color.indigo).foregroundStyle(.white).cornerRadius(10)
+                HStack(spacing: 10) {
+                    StatBox(value: "\(userNuke.channelsCreated)", label: "Kênh tạo", color: .blue)
+                    StatBox(value: "\(userNuke.messagesSent)", label: "Tin nhắn", color: .purple)
+                    StatBox(value: "\(userNuke.rolesCreated)", label: "Role", color: .indigo)
+                }
 
-            Button { checker.showOnlyAvailable.toggle() } label: {
-                Image(systemName: checker.showOnlyAvailable
-                      ? "line.3.horizontal.decrease.circle.fill"
-                      : "line.3.horizontal.decrease.circle")
-                    .padding(.vertical, 10).padding(.horizontal, 14)
-            }
-            .background(checker.showOnlyAvailable ? Color.green : Color.gray.opacity(0.3))
-            .foregroundStyle(.white).cornerRadius(10)
-        }
-        .padding(.horizontal).padding(.vertical, 6)
-    }
-
-    private var resultsArea: some View {
-        Group {
-            if checker.filteredResults.isEmpty {
-                EmptyStateView(title: "Chưa có kết quả",
-                               systemImage: "magnifyingglass",
-                               description: checker.proxyTotal == 0
-                                    ? "Nhập proxy và bấm Start."
-                                    : "Bấm Start để bắt đầu check username.")
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(checker.filteredResults) { r in
-                            HStack {
-                                Text(r.username)
-                                    .font(.system(.body, design: .monospaced))
-                                    .foregroundStyle(r.available ? .green : .red)
-                                Spacer()
-                                Text(r.available ? "AVAILABLE" : "TAKEN")
-                                    .font(.caption2.bold())
-                                    .foregroundStyle(r.available ? .green : .red)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("LOG").font(.caption).bold().foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(userNuke.nukeLog.enumerated()), id: \.offset) { _, l in
+                                Text(l).font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .padding(.horizontal).padding(.vertical, 7)
-                            Divider()
                         }
-                    }
-                }
-            }
-        }
-    }
-}
+                    }.frame(height: 260)
+                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
-private struct StatBadge: View {
-    let title: String; let value: String; let color: Color
-    var body: some View {
-        VStack(spacing: 1) {
-            Text(value).font(.system(.subheadline, weight: .bold))
-                .foregroundStyle(color).lineLimit(1).minimumScaleFactor(0.7)
-            Text(title).font(.system(size: 9)).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-    }
-}
-
-// ==========================================
-// MARK: - CHECKER CONFIG SHEET
-// ==========================================
-struct CheckerConfigSheet: View {
-    @EnvironmentObject var checker: UsernameChecker
-    @Environment(\.dismiss) var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section(header: Text("Độ dài Username")) {
-                    HStack {
-                        Text("Min"); Spacer()
-                        Stepper("\(checker.minLength)", value: $checker.minLength, in: 3...20)
-                    }
-                    HStack {
-                        Text("Max"); Spacer()
-                        Stepper("\(checker.maxLength)", value: $checker.maxLength, in: 3...20)
-                    }
-                    if checker.minLength > checker.maxLength {
-                        Text("⚠️ Min > Max").font(.caption).foregroundStyle(.red)
-                    }
-                }
-
-                Section(header: Text("Hiệu năng")) {
-                    HStack {
-                        Text("Threads"); Spacer()
-                        Stepper("\(checker.threads)", value: $checker.threads, in: 1...500)
-                    }
-                    HStack {
-                        Text("Rate limit (RQ/s)")
-                        Spacer()
-                        TextField("0", value: $checker.rpsLimit, format: .number)
-                            .keyboardType(.numberPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(width: 80)
-                    }
-                    Text(checker.rpsLimit == 0 ? "0 = không giới hạn" : "~\(checker.rpsLimit) request/giây")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-
-                Section(header: Text("Thông báo")) {
-                    Toggle("Báo khi tìm được username available", isOn: $checker.notifyOnAvailable)
-                        .tint(.indigo)
-                }
-
-                Section {
-                    TextEditor(text: $checker.proxyText)
-                        .frame(minHeight: 180)
-                        .font(.system(.caption, design: .monospaced))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                    Text("Mỗi dòng 1 proxy. Định dạng:\nhost:port\nhost:port:user:pass\nhttp://user:pass@host:port")
-                        .font(.caption2).foregroundStyle(.secondary)
-                } header: {
-                    HStack {
-                        Text("Danh sách Proxy")
-                        Spacer()
-                        Link(destination: URL(string: "https://discord.gg/sdn9NedNJ")!) {
-                            Label("Mua Proxy", systemImage: "cart.fill")
-                                .font(.caption.bold())
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Cấu hình Checker")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Xong") { dismiss() }.disabled(checker.isRunning)
-                }
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - APP ENTRY
-// ==========================================
-@main
-struct SpamDiscordApp: App {
-    @StateObject private var app      = AppState()
-    @StateObject private var bot      = BotManager()
-    @StateObject private var userNuke = UserNukeManager()
-    @StateObject private var checker  = UsernameChecker()
-    @StateObject private var license  = LicenseManager.shared
-    @Environment(\.scenePhase) private var scenePhase
-
-    init() {
-        NotificationHelper.shared.setup()
-    }
-
-    var body: some Scene {
-        WindowGroup {
-            Group {
-                if license.isUnlocked {
-                    MainTabView()
-                        .environmentObject(app)
-                        .environmentObject(bot)
-                        .environmentObject(userNuke)
-                        .environmentObject(checker)
-                        .environmentObject(license)
-                } else {
-                    LockView().environmentObject(license)
-                }
-            }
-            .onChange(of: scenePhase) { phase in
-                if phase == .active {
-                    Task { @MainActor in await license.refreshStatus() }
-                    if app.isSending {
-                        BackgroundManager.shared.start()
-                        NowPlayingHelper.shared.update(
-                            title: "Quoc Thang Spam",
-                            detail: "\(app.totalSent) tin | \(app.selectedTokenIds.count) token"
-                        )
-                    }
-                    if checker.isRunning {
-                        BackgroundManager.shared.start()
-                    }
-                }
-            }
-            .onChange(of: license.isUnlocked) { isUnlocked in
-                if !isUnlocked {
-                    app.stopSending()
-                    bot.stopNuke()
-                    userNuke.stop()
-                    checker.stop()
-                    BackgroundManager.shared.stop()
-                    NowPlayingHelper.shared.stop()
-                }
-            }
-        }
-    }
-}
-
-struct MainTabView: View {
-    var body: some View {
-        TabView {
-            SpamView()
-                .tabItem { Label("Spam", systemImage: "paperplane.fill") }
-            TokenListView()
-                .tabItem { Label("Tokens", systemImage: "person.2.fill") }
-            NukeTabView()
-                .tabItem { Label("Nuke", systemImage: "flame.fill") }
-            UsernameCheckerView()
-                .tabItem { Label("Checker", systemImage: "magnifyingglass.circle.fill") }
-            AboutView()
-                .tabItem { Label("Info", systemImage: "info.circle.fill") }
-        }.tint(.indigo)
+                Button { userNuke.stop() } label: {
+                    Text("DỪNG LẠI").bold().frame(maxWidth: .infinity).padding()
+                }.background(Color.red).foregroundStyle(.white).cornerRadius(12)
+            }.padding()
+        }.background(Color(UIColor.systemGroupedBackground))
     }
 }
