@@ -576,7 +576,9 @@ class UserNukeClient {
         let total = (detail["approximate_member_count"] as? Int) ?? (detail["member_count"] as? Int) ?? 1000
 
         guard let url = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else { return }
-        let ws = session.webSocketTask(with: url); ws.resume()
+        let ws = session.webSocketTask(with: url)
+        ws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX LỖI MESSAGE TOO LONG
+        ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
 
         guard case .string(let hs) = try await ws.receive(),
@@ -741,7 +743,6 @@ class VoiceRoomClient {
         return try JSONDecoder().decode([Guild].self, from: d)
     }
 
-    // ✅ FIX: bind status code trước khi dùng
     func getVoiceChannels(guildId: String) async throws -> [VoiceChannelInfo] {
         let (d, r) = try await session.data(
             from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
@@ -766,6 +767,7 @@ class VoiceRoomClient {
 
         log?("Mở gateway WS...")
         let gw = session.webSocketTask(with: URL(string: "wss://gateway.discord.gg/?v=10&encoding=json")!)
+        gw.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX LỖI MESSAGE TOO LONG
         gw.resume()
         gatewayWS = gw
 
@@ -837,6 +839,7 @@ class VoiceRoomClient {
 
         log?("Mở voice WS...")
         let vws = session.webSocketTask(with: URL(string: "wss://\(ep)/?v=4")!)
+        vws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX LỖI MESSAGE TOO LONG
         vws.resume()
         voiceWS = vws
 
@@ -933,7 +936,7 @@ class VoiceRoomClient {
                     "active": true,
                     "quality": 100,
                     "rtx_ssrc": 0,
-                    "max_bitrate": 2_500_000,
+                    "max_bitrate": 2500000,
                     "max_framerate": 30,
                     "max_resolution": ["type": "fixed", "width": 1280, "height": 720]
                 ]] : []
@@ -1726,6 +1729,8 @@ class VoiceRoomManager: ObservableObject {
         else { selectedTokenIds.insert(t.id) }
         recomputeEligibility()
     }
+    
+    // ✅ FIX: Quét song song tất cả server của 1 token
     func loadAllForSelected() async {
         isLoading = true
         log("Bắt đầu quét \(selectedTokenIds.count) token...")
@@ -1737,27 +1742,37 @@ class VoiceRoomManager: ObservableObject {
         isLoading = false
         log("Quét xong: \(eligibleGuilds.count) server, \(eligibleChannels.values.reduce(0) { $0 + $1.count }) kênh")
     }
+    
     private func loadForToken(_ t: TokenInfo) async {
         let client = VoiceRoomClient(token: t.token)
         do {
             let guilds = try await client.getGuilds()
             tokenGuilds[t.id] = guilds
             log("[\(t.username.prefix(12))] \(guilds.count) server")
+            
             var channelMap: [String: [VoiceChannelInfo]] = [:]
-            for g in guilds {
-                do {
-                    let chs = try await client.getVoiceChannels(guildId: g.id)
-                    channelMap[g.id] = chs
-                    if !chs.isEmpty {
-                        log("  [\(g.name.prefix(20))] \(chs.count) kênh thoại")
+            
+            // ✅ FIX: Dùng TaskGroup quét song song
+            await withTaskGroup(of: (String, [VoiceChannelInfo]).self) { group in
+                for g in guilds {
+                    group.addTask {
+                        do {
+                            let chs = try await client.getVoiceChannels(guildId: g.id)
+                            return (g.id, chs)
+                        } catch {
+                            return (g.id, [])
+                        }
                     }
-                } catch {
-                    log("  [\(g.name.prefix(20))] LỖI: \(error.localizedDescription.prefix(60))")
-                    channelMap[g.id] = []
                 }
-                try? await Task.sleep(nanoseconds: 200_000_000)
+                for await (guildId, chs) in group {
+                    channelMap[guildId] = chs
+                }
             }
+            
             tokenChannels[t.id] = channelMap
+            let totalChannels = channelMap.values.reduce(0) { $0 + $1.count }
+            log("  [\(t.username.prefix(12))] Đã quét xong \(totalChannels) kênh thoại")
+            
         } catch {
             log("[\(t.username.prefix(12))] LỖI guilds: \(error.localizedDescription)")
             tokenGuilds[t.id] = []
@@ -1765,6 +1780,7 @@ class VoiceRoomManager: ObservableObject {
         }
         recomputeEligibility()
     }
+    
     func recomputeEligibility() {
         guard !selectedTokenIds.isEmpty else {
             eligibleGuilds = []; eligibleChannels = [:]
@@ -1892,7 +1908,9 @@ class VoiceRoomManager: ObservableObject {
                 perTokenStatus[t.id] = "Lỗi: \(error.localizedDescription.prefix(50))"
                 log("[\(t.username.prefix(12))] Lỗi: \(error.localizedDescription)")
             }
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            
+            // ✅ FIX: Giảm thời gian chờ join
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
         log("Hoàn tất join \(clients.count) token")
