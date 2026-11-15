@@ -767,15 +767,20 @@ class VoiceRoomClient {
         self.guildId = guildId
         self.channelId = channelId
 
+        // --- BƯỚC 1: KẾT NỐI GATEWAY CHÍNH ---
         log?("Mở gateway WS...")
-        let gw = session.webSocketTask(with: URL(string: "wss://gateway.discord.gg/?v=10&encoding=json")!)
+        guard let gatewayURL = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else {
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Gateway URL invalid"])
+        }
+        let gw = session.webSocketTask(with: gatewayURL)
         gw.maximumMessageSize = 16 * 1024 * 1024
         gw.resume()
         gatewayWS = gw
 
+        // Chờ Hello (op 10)
         guard let hello = try await recvJSON(gw) as? [String: Any],
               let hbInt = ((hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int) else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Hello missing"])
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Gateway Hello missing"])
         }
 
         gatewayHB = Task { [weak self] in
@@ -798,6 +803,7 @@ class VoiceRoomClient {
             ]
         ])
 
+        // Chờ READY
         while true {
             let msg = try await recvJSON(gw) as? [String: Any]
             if (msg?["t"] as? String) == "READY" {
@@ -809,8 +815,7 @@ class VoiceRoomClient {
                 break
             }
             if let op = msg?["op"] as? Int, op == 9 {
-                throw NSError(domain: "Room", code: 9,
-                              userInfo: [NSLocalizedDescriptionKey: "Invalid Session"])
+                throw NSError(domain: "Room", code: 9, userInfo: [NSLocalizedDescriptionKey: "Invalid Session"])
             }
         }
 
@@ -825,6 +830,7 @@ class VoiceRoomClient {
             ]
         ])
 
+        // --- BƯỚC 2: CHỜ VOICE SERVER UPDATE ---
         var vsEndpoint: String?
         var vsToken: String?
         while vsEndpoint == nil {
@@ -839,12 +845,16 @@ class VoiceRoomClient {
             throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice server missing"])
         }
 
+        // ✅ FIX TRIỆT ĐỂ: Chuẩn hóa endpoint và thử nhiều biến thể URL
         var cleanEp = ep
             .replacingOccurrences(of: "wss://", with: "")
             .replacingOccurrences(of: "https://", with: "")
-        
+
+        var portSuffix = ""
         if let colonIdx = cleanEp.lastIndex(of: ":") {
-            if cleanEp.suffix(from: colonIdx).contains(":443") {
+            let afterColon = cleanEp.suffix(from: cleanEp.index(after: colonIdx))
+            if let _ = Int(afterColon) {
+                portSuffix = String(afterColon)
                 cleanEp = String(cleanEp.prefix(upTo: colonIdx))
             }
         }
@@ -852,31 +862,40 @@ class VoiceRoomClient {
             .replacingOccurrences(of: "/", with: "")
 
         log?("Endpoint gốc: \(ep)")
-        log?("Endpoint sạch: \(cleanEp)")
+        log?("Endpoint sạch: \(cleanEp) (port: \(portSuffix.isEmpty ? "mặc định" : portSuffix))")
+
+        var candidateURLs: [String] = []
+        candidateURLs.append("wss://\(cleanEp)/?v=4")
+        candidateURLs.append("wss://\(cleanEp)/?v=8")
+        if !portSuffix.isEmpty {
+            candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=4")
+            candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=8")
+        }
+        candidateURLs.append("wss://\(cleanEp)")
 
         var vws: URLSessionWebSocketTask? = nil
         var lastError: Error? = nil
-        let candidates = [
-            "wss://\(cleanEp)/?v=4",
-            "wss://\(cleanEp):443/?v=4"
-        ]
 
-        for candidateURL in candidates {
+        for candidateURL in candidateURLs {
             log?("Thử kết nối: \(candidateURL)")
             guard let url = URL(string: candidateURL) else {
                 log?("URL không hợp lệ: \(candidateURL)")
                 continue
             }
+
+            let task = session.webSocketTask(with: url)
+            task.maximumMessageSize = 16 * 1024 * 1024
+            task.resume()
+
             do {
-                let task = session.webSocketTask(with: url)
-                task.maximumMessageSize = 16 * 1024 * 1024
-                task.resume()
-                try await Task.sleep(nanoseconds: 500_000_000)
+                try await Task.sleep(nanoseconds: 800_000_000)
                 let helloMsg = try await recvJSON(task)
                 if let h = helloMsg as? [String: Any], (h["op"] as? Int) == 8 {
                     vws = task
                     log?("Kết nối thành công: \(candidateURL)")
                     break
+                } else {
+                    log?("Phản hồi không phải Hello op 8: \(helloMsg)")
                 }
             } catch {
                 log?("Kết nối thất bại: \(error.localizedDescription)")
@@ -886,10 +905,11 @@ class VoiceRoomClient {
 
         guard let voiceSocket = vws else {
             throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS: \(lastError?.localizedDescription ?? "unknown")"])
+                          userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS. Thử lại sau. Lỗi cuối: \(lastError?.localizedDescription ?? "unknown")"])
         }
         voiceWS = voiceSocket
 
+        // --- BƯỚC 3: GỬI IDENTIFY (OP 0) ---
         log?("Gửi Voice Identify (op 0)...")
         try await sendJSON(voiceSocket, [
             "op": 0,
@@ -1779,7 +1799,6 @@ class VoiceRoomManager: ObservableObject {
         recomputeEligibleGuilds()
     }
 
-    // ✅ BƯỚC 1: Chỉ load danh sách Server (nhẹ, nhanh)
     func loadGuildsForSelected() async {
         isLoading = true
         log("Bắt đầu tìm Server chung...")
@@ -1803,7 +1822,6 @@ class VoiceRoomManager: ObservableObject {
         log("Quét xong: \(eligibleGuilds.count) server chung")
     }
 
-    // ✅ BƯỚC 2: Chỉ load kênh của Server được chọn
     func loadChannelsForSelected(guild: Guild) async {
         isLoading = true
         log("Đang quét kênh của: \(guild.name)...")
