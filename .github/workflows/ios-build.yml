@@ -1,4 +1,4 @@
-name: Build Unsigned IPA
+name: Build iOS App
 
 on:
   push:
@@ -7,50 +7,38 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
-
+    runs-on: macos-14
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Select Xcode version
-      run: |
-        XCODE_PATH=$(ls -d /Applications/Xcode_16*.app | head -n 1)/Contents/Developer
-        if [ -d "$XCODE_PATH" ]; then
-          sudo xcode-select -s "$XCODE_PATH"
-        fi
-        xcodebuild -version
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
-    - name: Install XcodeGen
-      run: brew install xcodegen
+      - name: Generate Xcode Project
+        run: xcodegen generate
 
-    - name: Generate Xcode Project
-      run: xcodegen generate
-
-    - name: Build App (Unsigned)
-      run: |
-        xcodebuild build \
-          -project SpamDiscord.xcodeproj \
-          -scheme SpamDiscord \
+      - name: Build App
+        run: |
+          xcodebuild build \
+          -project Discord.xcodeproj \
+          -scheme discord \
           -configuration Release \
           -sdk iphoneos \
-          -destination 'generic/platform=iOS' \
-          -derivedDataPath "$RUNNER_TEMP/build" \
+          -destination generic/platform=iOS \
+          -derivedDataPath /Users/runner/work/_temp/build \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY=""
 
-    - name: Package into IPA
-      run: |
-        mkdir -p "$RUNNER_TEMP/Payload"
-        APP_PATH=$(find "$RUNNER_TEMP/build/Build/Products/Release-iphoneos" -name "*.app" | head -n 1)
-        cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
-        cd "$RUNNER_TEMP" && zip -qry SpamDiscord-unsigned.ipa Payload
-
-    - name: Upload IPA Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: SpamDiscord-unsigned-ipa
-        path: ${{ runner.temp }}/SpamDiscord-unsigned.ipa
-        if-no-files-found: error
-        retention-days: 7
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          mv /Users/runner/work/_temp/build/Build/Products/Release-iphoneos/Discord.app Payload/
+          zip -r Discord.ipa Payload
+          
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Discord-IPA
+          path: Discord.ipa

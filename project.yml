@@ -1,6 +1,6 @@
 name: Discord
 options:
-  bundleIdPrefix: com.tenban
+  bundleIdPrefix: com.quocthang
   deploymentTarget:
     iOS: "16.0"
 
@@ -14,19 +14,11 @@ targets:
     type: application
     platform: iOS
     sources:
-      # 1. Đường dẫn chứa code Swift
+      # Đường dẫn chứa code Swift (đảm bảo đúng chữ hoa/thường)
       - path: Sources/discord
-      
-      # 2. ĐƯỜNG DẪN CHỨA LOGO (Quan trọng)
-      # Giả sử thư mục Assets.xcassets của bạn nằm ngang hàng với thư mục Sources
-      - path: Assets.xcassets 
-      
+      # Đường dẫn chứa Logo
+      - path: Assets.xcassets
     settings:
       base:
         INFOPLIST_FILE: info.plist
-        
-        # Ép Xcode phải sử dụng bộ icon có tên là "AppIcon"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        
-        # (Tùy chọn) Đổi tên app hiển thị trên màn hình nếu bạn không muốn sửa trong info.plist
-        # INFOPLIST_KEY_CFBundleDisplayName: Discord 
