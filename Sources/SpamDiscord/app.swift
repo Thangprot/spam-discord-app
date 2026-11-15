@@ -4,6 +4,7 @@ import Security
 import AVFoundation
 import UniformTypeIdentifiers
 import UIKit
+import CryptoKit
 
 // ==========================================
 // MARK: - DOCUMENT PICKER
@@ -75,7 +76,6 @@ struct GuildRole: Codable { let id, name: String; let position: Int }
 struct BotMember: Codable { let user: BotMemberUser?; let roles: [String]? }
 struct BotMemberUser: Codable { let id: String; let username: String?; let bot: Bool? }
 
-// NukeGuild: permission per action
 struct NukeGuild: Codable {
     let id, name: String
     let icon: String?
@@ -88,31 +88,20 @@ struct NukeGuild: Codable {
     var canManageChannels: Bool { bits & (1 << 4) != 0 }
     var canBan: Bool { bits & (1 << 2) != 0 }
     var canManageRoles: Bool { bits & (1 << 28) != 0 }
-
-    // Per-action
     var canMassBan: Bool { isOwner || isAdmin || canBan }
     var canDeleteChannels: Bool { isOwner || isAdmin || canManageChannels }
     var canCreateChannels: Bool { isOwner || isAdmin || canManageChannels }
     var canCreateRoles: Bool { isOwner || isAdmin || canManageRoles }
     var canRenameGuild: Bool { isOwner || isAdmin || canManageGuild }
-
-    // Show guild if ANY permission is available
     var canDoAnything: Bool {
         canMassBan || canDeleteChannels || canCreateChannels || canCreateRoles || canRenameGuild
     }
 }
 
-// Effective permissions after union of all selected tokens
 struct GuildPermissions {
-    var massBan: Bool = false
-    var deleteChannels: Bool = false
-    var createChannels: Bool = false
-    var createRoles: Bool = false
-    var renameGuild: Bool = false
-
-    var any: Bool {
-        massBan || deleteChannels || createChannels || createRoles || renameGuild
-    }
+    var massBan = false, deleteChannels = false, createChannels = false
+    var createRoles = false, renameGuild = false
+    var any: Bool { massBan || deleteChannels || createChannels || createRoles || renameGuild }
 }
 
 enum NukeStepType: String, CaseIterable, Identifiable {
@@ -136,15 +125,13 @@ enum NukeStepType: String, CaseIterable, Identifiable {
 struct NukeConfig {
     var enabledSteps: Set<NukeStepType> = [.createChannels]
     var stepOrder: [NukeStepType] = NukeStepType.allCases
-
     var banDelay: Double = 0.02
     var deleteDelay: Double = 0.05
     var createChDelay: Double = 0.10
     var createRoleDelay: Double = 0.10
     var msgDelay: Double = 0.10
-
     var banRoleId = ""
-    var roleName = "Quoc Thang Tools"      // ✅ Đổi tên role mặc định
+    var roleName = "Quoc Thang Tools"
     var roleCount = 50
     var channelName = "nuked-by-tool"
     var channelCount = 50
@@ -486,7 +473,7 @@ class BotClient {
 }
 
 // ==========================================
-// MARK: - USER NUKE CLIENT (WS)
+// MARK: - USER NUKE CLIENT
 // ==========================================
 class UserNukeClient {
     let token: String; let session: URLSession
@@ -754,7 +741,6 @@ class BotManager: ObservableObject {
         BackgroundManager.shared.start()
         let gid = guild.id
         log("Bắt đầu nuke: \(guild.name)")
-
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
 
@@ -764,7 +750,6 @@ class BotManager: ObservableObject {
             currentPhase = step.rawValue
             phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
             log("--- \(step.rawValue) ---")
-
             switch step {
             case .massBan: await doMassBan(c, gid, options: options)
             case .deleteChannels: await doDeleteChannels(c, gid, options: options)
@@ -783,7 +768,6 @@ class BotManager: ObservableObject {
             }
             stepDone += 1
         }
-
         currentPhase = isCancelled ? "Đã dừng" : "Hoàn tất"
         phaseProgress = 1.0
         log(isCancelled ? "Đã dừng" : "XONG")
@@ -955,8 +939,6 @@ class UserNukeManager: ObservableObject {
         if let d = UserDefaults.standard.data(forKey: key),
            let s = try? JSONDecoder().decode([TokenInfo].self, from: d) { tokens = s }
     }
-
-    // ✅ NEW: Add token manually (single)
     func addTokenManually(_ raw: String) async -> Bool {
         let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !tokens.contains(where: { $0.token == clean }) else { return false }
@@ -974,7 +956,6 @@ class UserNukeManager: ObservableObject {
             return false
         }
     }
-
     func importFromFile(url: URL) async {
         let got = url.startAccessingSecurityScopedResource()
         defer { if got { url.stopAccessingSecurityScopedResource() } }
@@ -1007,14 +988,12 @@ class UserNukeManager: ObservableObject {
         }
         isImporting = false
     }
-
     func removeToken(_ id: UUID) {
         tokens.removeAll { $0.id == id }
         selectedTokenIds.remove(id); tokenGuilds.removeValue(forKey: id); recomputeEligible()
     }
     func clearAll() { tokens = []; selectedTokenIds = []; tokenGuilds = [:]; eligibleGuilds = [] }
     func clearSelection() { selectedTokenIds = []; eligibleGuilds = [] }
-
     func toggleSelection(_ t: TokenInfo) {
         guard t.isValid else { return }
         if selectedTokenIds.contains(t.id) { selectedTokenIds.remove(t.id) }
@@ -1035,13 +1014,10 @@ class UserNukeManager: ObservableObject {
         catch { tokenGuilds[t.id] = [] }
         recomputeEligible()
     }
-
-    // ✅ CHANGED: eligibility = canDoAnything (union across tokens)
     func recomputeEligible() {
         guard !selectedTokenIds.isEmpty else { eligibleGuilds = []; return }
         var unionIds: Set<String> = []
         var unionMap: [String: NukeGuild] = [:]
-
         for id in selectedTokenIds {
             guard let gs = tokenGuilds[id] else { eligibleGuilds = []; return }
             for g in gs where g.canDoAnything {
@@ -1053,8 +1029,6 @@ class UserNukeManager: ObservableObject {
             .map { Guild(id: $0.id, name: $0.name, icon: $0.icon) }
             .sorted { $0.name < $1.name }
     }
-
-    // ✅ NEW: Compute effective permissions for a guild (union of all selected tokens)
     func permissionsForGuild(_ guildId: String) -> GuildPermissions {
         var perms = GuildPermissions()
         for tokenId in selectedTokenIds {
@@ -1068,30 +1042,21 @@ class UserNukeManager: ObservableObject {
         }
         return perms
     }
-
-    // ✅ NEW: Filter tokens that have a specific permission in a guild
     private func clientsWithBanPerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { tokenId, _ in
-            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canMassBan ?? false
-        }.map { $0.1 }
+        all.filter { id, _ in tokenGuilds[id]?.first(where: { $0.id == guildId })?.canMassBan ?? false }.map { $0.1 }
     }
     private func clientsWithChannelPerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { tokenId, _ in
-            let g = tokenGuilds[tokenId]?.first(where: { $0.id == guildId })
+        all.filter { id, _ in
+            let g = tokenGuilds[id]?.first(where: { $0.id == guildId })
             return g?.canDeleteChannels ?? false || g?.canCreateChannels ?? false
         }.map { $0.1 }
     }
     private func clientsWithRolePerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { tokenId, _ in
-            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canCreateRoles ?? false
-        }.map { $0.1 }
+        all.filter { id, _ in tokenGuilds[id]?.first(where: { $0.id == guildId })?.canCreateRoles ?? false }.map { $0.1 }
     }
     private func clientsWithRenamePerm(guildId: String, all: [(UUID, UserNukeClient)]) -> [UserNukeClient] {
-        all.filter { tokenId, _ in
-            tokenGuilds[tokenId]?.first(where: { $0.id == guildId })?.canRenameGuild ?? false
-        }.map { $0.1 }
+        all.filter { id, _ in tokenGuilds[id]?.first(where: { $0.id == guildId })?.canRenameGuild ?? false }.map { $0.1 }
     }
-
     func stop() { isCancelled = true }
     private func log(_ m: String) { nukeLog.append(m); if nukeLog.count > 800 { nukeLog.removeFirst(nukeLog.count - 800) } }
     private func reset() { banSuccess = 0; banFailed = 0; channelsDeleted = 0; channelsCreated = 0; messagesSent = 0; rolesCreated = 0; membersScanned = 0; phaseProgress = 0 }
@@ -1104,14 +1069,11 @@ class UserNukeManager: ObservableObject {
         isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start()
         let gid = guild.id
-
-        // ✅ Build tokenId ↔ client pairs to filter per permission
         let allClients: [(UUID, UserNukeClient)] = sel.map { ($0.id, UserNukeClient(token: $0.token)) }
         guard let scan = allClients.first?.1 else { return }
 
         log("Bắt đầu nuke: \(guild.name)")
         log("Dùng \(allClients.count) token")
-
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
         var stepDone = 0
 
@@ -1123,31 +1085,31 @@ class UserNukeManager: ObservableObject {
             log("--- \(step.rawValue) ---")
             switch step {
             case .massBan:
-                let banClients = clientsWithBanPerm(guildId: gid, all: allClients)
-                if banClients.isEmpty { log("  Bỏ qua: không token nào có quyền ban"); break }
-                await doMassBanScan(scan, clients: banClients, gid: gid, options: options)
+                let bc = clientsWithBanPerm(guildId: gid, all: allClients)
+                if bc.isEmpty { log("  Bỏ qua: không token nào có quyền ban"); break }
+                await doMassBanScan(scan, clients: bc, gid: gid, options: options)
             case .deleteChannels:
-                let chClients = clientsWithChannelPerm(guildId: gid, all: allClients)
-                if chClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
-                await doDeleteChannels(chClients, gid, options: options)
+                let cc = clientsWithChannelPerm(guildId: gid, all: allClients)
+                if cc.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
+                await doDeleteChannels(cc, gid, options: options)
             case .renameGuild:
-                let rClients = clientsWithRenamePerm(guildId: gid, all: allClients)
-                if rClients.isEmpty { log("  Bỏ qua: không token nào có quyền đổi tên"); break }
+                let rc = clientsWithRenamePerm(guildId: gid, all: allClients)
+                if rc.isEmpty { log("  Bỏ qua: không token nào có quyền đổi tên"); break }
                 if !options.newGuildName.isEmpty {
-                    do { try await rClients[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
+                    do { try await rc[0].renameGuild(gid, newName: options.newGuildName); log("  Đổi tên OK") }
                     catch { log("  Lỗi: \(error.localizedDescription)") }
                 }
             case .createRoles:
-                let roleClients = clientsWithRolePerm(guildId: gid, all: allClients)
-                if roleClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý role"); break }
-                rolesCreated = await doCreateRoles(roleClients, gid, options: options)
+                let rc = clientsWithRolePerm(guildId: gid, all: allClients)
+                if rc.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý role"); break }
+                rolesCreated = await doCreateRoles(rc, gid, options: options)
                 log("  Role đã tạo: \(rolesCreated)")
             case .createChannels:
-                let chClients = clientsWithChannelPerm(guildId: gid, all: allClients)
-                if chClients.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
-                let (cc, ss) = await doCreateChannels(chClients, gid, options: options)
-                channelsCreated = cc; messagesSent = ss
-                log("  Kênh đã tạo: \(cc), tin đã gửi: \(ss)")
+                let cc = clientsWithChannelPerm(guildId: gid, all: allClients)
+                if cc.isEmpty { log("  Bỏ qua: không token nào có quyền quản lý kênh"); break }
+                let (c, s) = await doCreateChannels(cc, gid, options: options)
+                channelsCreated = c; messagesSent = s
+                log("  Kênh đã tạo: \(c), tin đã gửi: \(s)")
             }
             stepDone += 1
         }
@@ -1184,7 +1146,6 @@ class UserNukeManager: ObservableObject {
 
             var candidates: [String] = []
             let lock = NSLock()
-
             log("  Đang quét WS...")
             do {
                 try await scan.fetchMembersWS(guildId: gid, onMember: { m in
@@ -1337,6 +1298,400 @@ final class IndexBox: @unchecked Sendable {
 }
 
 // ==========================================
+// MARK: - LICENSE API
+// ==========================================
+struct LicenseActivationResponse: Codable {
+    let valid: Bool
+    let expiresAt: Int64?
+    let message: String?
+    let error: String?
+}
+
+struct LicenseValidationResponse: Codable {
+    let valid: Bool
+    let expiresAt: Int64?
+    let error: String?
+}
+
+enum LicenseStatus: Equatable {
+    case notActivated
+    case checking
+    case valid(expiresOn: Date)
+    case expired(expiresOn: Date)
+    case invalid(reason: String)
+}
+
+final class LicenseAPIClient {
+    static let shared = LicenseAPIClient()
+
+    // ⚠️ ĐỔI URL NÀY thành URL Worker của bạn
+    let baseURL = "https://key.nqtaf01.workers.dev"
+
+    private func machineID() -> String {
+        let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? "unknown")-\(Bundle.main.bundleIdentifier ?? "app")"
+        let hash = SHA256.hash(data: Data(raw.utf8))
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    func activate(key: String) async throws -> LicenseActivationResponse {
+        var req = URLRequest(url: URL(string: "\(baseURL)/activate")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 15
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "license_key": key,
+            "machine_id": machineID()
+        ])
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(LicenseActivationResponse.self, from: data)
+    }
+
+    func validate(key: String) async throws -> LicenseValidationResponse {
+        var req = URLRequest(url: URL(string: "\(baseURL)/validate")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 15
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["license_key": key])
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return try JSONDecoder().decode(LicenseValidationResponse.self, from: data)
+    }
+}
+
+@MainActor
+final class LicenseManager: ObservableObject {
+    static let shared = LicenseManager()
+
+    @Published var status: LicenseStatus = .notActivated
+    @Published var licenseKey: String? = nil
+    @Published var isChecking = false
+
+    private let keyStoreKey = "QT_LicenseKey_Server"
+    private let expiryStoreKey = "QT_LicenseExpiry"
+    private let lastCheckKey = "QT_LicenseLastCheck"
+
+    init() {
+        self.licenseKey = UserDefaults.standard.string(forKey: keyStoreKey)
+        if licenseKey == nil {
+            status = .notActivated
+        } else if let cachedExp = UserDefaults.standard.object(forKey: expiryStoreKey) as? Date {
+            status = Date() > cachedExp ? .expired(expiresOn: cachedExp) : .valid(expiresOn: cachedExp)
+        }
+        Task { @MainActor [weak self] in
+            await self?.refreshStatus()
+        }
+    }
+
+    func activate(key: String) async -> LicenseStatus {
+        let clean = key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !clean.isEmpty else {
+            status = .invalid(reason: "Key trống")
+            return status
+        }
+        isChecking = true
+        defer { isChecking = false }
+        do {
+            let res = try await LicenseAPIClient.shared.activate(key: clean)
+            if res.valid, let expMs = res.expiresAt {
+                let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
+                UserDefaults.standard.set(clean, forKey: keyStoreKey)
+                UserDefaults.standard.set(exp, forKey: expiryStoreKey)
+                UserDefaults.standard.set(Date(), forKey: lastCheckKey)
+                licenseKey = clean
+                status = .valid(expiresOn: exp)
+                return status
+            } else {
+                status = .invalid(reason: res.error ?? "Key không hợp lệ")
+                return status
+            }
+        } catch {
+            status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
+            return status
+        }
+    }
+
+    func refreshStatus() async {
+        guard let key = licenseKey else {
+            status = .notActivated
+            return
+        }
+        isChecking = true
+        defer { isChecking = false }
+
+        do {
+            let res = try await LicenseAPIClient.shared.validate(key: key)
+            if res.valid, let expMs = res.expiresAt {
+                let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
+                UserDefaults.standard.set(exp, forKey: expiryStoreKey)
+                UserDefaults.standard.set(Date(), forKey: lastCheckKey)
+                status = .valid(expiresOn: exp)
+                return
+            } else {
+                status = .invalid(reason: res.error ?? "Key không hợp lệ")
+                return
+            }
+        } catch {
+            if let cachedExp = UserDefaults.standard.object(forKey: expiryStoreKey) as? Date {
+                if Date() > cachedExp {
+                    status = .expired(expiresOn: cachedExp)
+                } else {
+                    status = .valid(expiresOn: cachedExp)
+                }
+            } else {
+                status = .invalid(reason: "Không kết nối được server")
+            }
+        }
+    }
+
+    func deactivate() {
+        UserDefaults.standard.removeObject(forKey: keyStoreKey)
+        UserDefaults.standard.removeObject(forKey: expiryStoreKey)
+        UserDefaults.standard.removeObject(forKey: lastCheckKey)
+        licenseKey = nil
+        status = .notActivated
+    }
+
+    var isUnlocked: Bool {
+        if case .valid = status { return true }
+        return false
+    }
+
+    var statusText: String {
+        switch status {
+        case .notActivated: return "Chưa kích hoạt"
+        case .checking: return "Đang kiểm tra..."
+        case .valid(let d): return "Còn hạn đến \(formatDate(d))"
+        case .expired(let d): return "Đã hết hạn ngày \(formatDate(d))"
+        case .invalid(let r): return r
+        }
+    }
+
+    private func formatDate(_ d: Date) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "dd/MM/yyyy"
+        return df.string(from: d)
+    }
+}
+
+// ==========================================
+// MARK: - LOCK VIEW
+// ==========================================
+struct LockView: View {
+    @EnvironmentObject var license: LicenseManager
+    @State private var input = ""
+    @State private var error: String? = nil
+    @State private var showAdminInfo = false
+    @State private var logoTapCount = 0
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [Color(red: 0.08, green: 0.08, blue: 0.16), Color.black],
+                startPoint: .top, endPoint: .bottom
+            ).ignoresSafeArea()
+
+            ScrollView {
+                VStack(spacing: 24) {
+                    Spacer(minLength: 40)
+
+                    VStack(spacing: 14) {
+                        Image(systemName: "lock.shield.fill")
+                            .font(.system(size: 80))
+                            .foregroundStyle(.red)
+                            .shadow(color: .red.opacity(0.4), radius: 20)
+                            .onTapGesture {
+                                logoTapCount += 1
+                                if logoTapCount >= 7 {
+                                    logoTapCount = 0
+                                    showAdminInfo = true
+                                }
+                            }
+
+                        Text("QUOC THANG TOOLS")
+                            .font(.system(size: 22, weight: .heavy))
+                            .foregroundStyle(.white)
+                            .tracking(1.5)
+
+                        Text("LICENSE REQUIRED")
+                            .font(.caption.bold())
+                            .foregroundStyle(.red.opacity(0.8))
+                            .tracking(3)
+                    }
+
+                    VStack(spacing: 14) {
+                        TextField("Nhập license key...", text: $input)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .font(.system(.body, design: .monospaced))
+                            .padding(14)
+                            .background(Color.white.opacity(0.08))
+                            .foregroundStyle(.white)
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.white.opacity(0.15), lineWidth: 1)
+                            )
+                            .onChange(of: input) { _ in error = nil }
+
+                        if let e = error {
+                            Text(e).font(.caption).foregroundStyle(.red)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
+                        }
+
+                        Button {
+                            Task {
+                                error = nil
+                                let st = await license.activate(key: input)
+                                switch st {
+                                case .valid:
+                                    error = nil
+                                case .invalid(let r):
+                                    error = r
+                                case .expired(let d):
+                                    error = "Key đã hết hạn ngày \(fmt(d))"
+                                default:
+                                    error = "Không thể kích hoạt"
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                if license.isChecking { ProgressView().tint(.white) }
+                                Text(license.isChecking ? "ĐANG KIỂM TRA..." : "KÍCH HOẠT").bold()
+                            }.frame(maxWidth: .infinity).padding()
+                        }
+                        .background(input.trimmingCharacters(in: .whitespaces).isEmpty ? Color.gray : Color.indigo)
+                        .foregroundStyle(.white)
+                        .cornerRadius(10)
+                        .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || license.isChecking)
+                    }
+                    .padding(.horizontal, 30)
+
+                    if case .expired(let d) = license.status {
+                        Text("⚠️ Key trước đó đã hết hạn ngày \(fmt(d))")
+                            .font(.caption).foregroundStyle(.orange)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+
+                    Spacer(minLength: 20)
+
+                    Text("v1.0").font(.caption2).foregroundStyle(.gray.opacity(0.4))
+                }
+                .padding(.vertical, 20)
+            }
+        }
+        .sheet(isPresented: $showAdminInfo) {
+            LicenseAdminInfoView().environmentObject(license)
+        }
+    }
+
+    private func fmt(_ d: Date) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "dd/MM/yyyy"
+        return df.string(from: d)
+    }
+}
+
+// ==========================================
+// MARK: - ADMIN INFO VIEW
+// ==========================================
+struct LicenseAdminInfoView: View {
+    @EnvironmentObject var license: LicenseManager
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("THÔNG TIN ADMIN")
+                        .font(.headline)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("API Endpoint").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text(LicenseAPIClient.shared.baseURL)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(10)
+
+                    if let k = license.licenseKey {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("KEY HIỆN TẠI").font(.caption.bold()).foregroundStyle(.secondary)
+                            Text(k).font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text(license.statusText).font(.caption2).foregroundStyle(.green)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(UIColor.secondarySystemBackground))
+                        .cornerRadius(10)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("TẠO KEY MỚI (từ máy tính)").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text("""
+                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/create \\
+                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
+                          -H "Content-Type: application/json" \\
+                          -d '{"email":"user@example.com","duration_days":365}'
+                        """)
+                        .font(.system(size: 10, design: .monospaced))
+                        .padding(8)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(6)
+                        .textSelection(.enabled)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(10)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("LỆNH QUẢN LÝ (curl)").font(.caption.bold()).foregroundStyle(.secondary)
+                        Text("""
+                        # Thu hồi key
+                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/disable \\
+                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
+                          -d '{"license_key":"QT-XXXXX-XXXXX"}'
+                        """)
+                        .font(.system(size: 10, design: .monospaced))
+                        .padding(8)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(6)
+                        .textSelection(.enabled)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(10)
+
+                    Button(role: .destructive) {
+                        license.deactivate()
+                        dismiss()
+                    } label: {
+                        Label("Xoá key hiện tại", systemImage: "trash")
+                            .frame(maxWidth: .infinity).padding(10)
+                    }
+                    .background(Color.red.opacity(0.15)).foregroundStyle(.red)
+                    .cornerRadius(8)
+                }
+                .padding()
+            }
+            .navigationTitle("Admin Info")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Đóng") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
 // MARK: - APP ENTRY
 // ==========================================
 @main
@@ -1344,12 +1699,29 @@ struct SpamDiscordApp: App {
     @StateObject private var app = AppState()
     @StateObject private var bot = BotManager()
     @StateObject private var userNuke = UserNukeManager()
+    @StateObject private var license = LicenseManager.shared
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
         WindowGroup {
-            MainTabView()
-                .environmentObject(app)
-                .environmentObject(bot)
-                .environmentObject(userNuke)
+            Group {
+                if license.isUnlocked {
+                    MainTabView()
+                        .environmentObject(app)
+                        .environmentObject(bot)
+                        .environmentObject(userNuke)
+                } else {
+                    LockView()
+                        .environmentObject(license)
+                }
+            }
+            .onChange(of: scenePhase) { phase in
+                if phase == .active {
+                    Task { @MainActor in
+                        await license.refreshStatus()
+                    }
+                }
+            }
         }
     }
 }
@@ -1773,7 +2145,7 @@ struct BotGuildListView: View {
 }
 
 // ==========================================
-// MARK: - NUKE OPTIONS (shared, permission-aware)
+// MARK: - NUKE OPTIONS
 // ==========================================
 enum NukeMode { case bot, user }
 
@@ -1783,14 +2155,13 @@ struct NukeOptionsView: View {
     let guild: Guild
     @Binding var selectedGuild: Guild?
     let mode: NukeMode
-    let permissions: GuildPermissions?   // nil = no gating (bot mode)
+    let permissions: GuildPermissions?
     @State private var options = NukeConfig()
 
     var canRun: Bool { !options.enabledSteps.isEmpty }
 
-    // ✅ NEW: Is a step enabled by permissions?
     func stepPermitted(_ step: NukeStepType) -> Bool {
-        guard let p = permissions else { return true }   // bot mode: all enabled
+        guard let p = permissions else { return true }
         switch step {
         case .massBan: return p.massBan
         case .deleteChannels: return p.deleteChannels
@@ -1824,7 +2195,6 @@ struct NukeOptionsView: View {
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
 
-                // Show permission summary for user mode
                 if let p = permissions {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("QUYỀN KHẢ DỤNG").font(.caption).bold().foregroundStyle(.secondary)
@@ -1847,7 +2217,6 @@ struct NukeOptionsView: View {
                 }
 
                 Button {
-                    // Auto-remove steps user has no perm for
                     if let p = permissions {
                         options.enabledSteps = options.enabledSteps.filter { s in
                             switch s {
@@ -1880,12 +2249,10 @@ struct NukeOptionsView: View {
     func permBadge(_ text: String, _ ok: Bool) -> some View {
         HStack(spacing: 3) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.caption2)
-                .foregroundStyle(ok ? .green : .red)
+                .font(.caption2).foregroundStyle(ok ? .green : .red)
             Text(text).font(.caption2).foregroundStyle(ok ? .primary : .secondary)
         }.padding(.horizontal, 6).padding(.vertical, 3)
-        .background((ok ? Color.green : Color.red).opacity(0.12))
-        .cornerRadius(5)
+        .background((ok ? Color.green : Color.red).opacity(0.12)).cornerRadius(5)
     }
 
     @ViewBuilder
@@ -1905,14 +2272,10 @@ struct NukeOptionsView: View {
                 }.foregroundStyle(.secondary)
 
                 Text("\(index + 1)").font(.caption.bold()).foregroundStyle(.secondary).frame(width: 18)
-                Image(systemName: step.icon)
-                    .foregroundStyle(permitted ? .indigo : .gray)
-                    .frame(width: 20)
+                Image(systemName: step.icon).foregroundStyle(permitted ? .indigo : .gray).frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(step.rawValue).font(.headline)
-                    if !permitted {
-                        Text("Không có quyền").font(.caption2).foregroundStyle(.red)
-                    }
+                    if !permitted { Text("Không có quyền").font(.caption2).foregroundStyle(.red) }
                 }
                 Spacer()
                 Toggle("", isOn: Binding(
@@ -1922,8 +2285,7 @@ struct NukeOptionsView: View {
                     }
                 )).labelsHidden().tint(.indigo)
                 .disabled(!permitted)
-            }.padding()
-            .opacity(permitted ? 1 : 0.6)
+            }.padding().opacity(permitted ? 1 : 0.6)
 
             if isOn && permitted {
                 Divider()
@@ -2118,7 +2480,6 @@ struct UserNukeView: View {
     }
 }
 
-// ✅ MODIFIED: Add "Thêm tay" button + sheet
 struct UserNukeTokenPickerView: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Binding var selectedGuild: Guild?
@@ -2153,7 +2514,7 @@ struct UserNukeTokenPickerView: View {
 
             if userNuke.tokens.isEmpty {
                 EmptyStateView(title: "Chưa có token user", systemImage: "person.badge.key",
-                               description: "Thêm token bằng tay hoặc import file .txt.\nToken nuke lưu riêng, KHÔNG chung với token spam.")
+                               description: "Import file .txt hoặc thêm tay.\nToken nuke lưu riêng.")
             } else {
                 List {
                     Section(header: Text("Chọn token (\(userNuke.selectedTokenIds.count) đã chọn)")) {
@@ -2203,16 +2564,13 @@ struct UserNukeTokenPickerView: View {
         .sheet(isPresented: $showImport) {
             DocumentPicker(contentTypes: [.item]) { u in Task { await userNuke.importFromFile(url: u) } }
         }
-        .sheet(isPresented: $showManual) {
-            UserNukeManualAddSheet()
-        }
+        .sheet(isPresented: $showManual) { UserNukeManualAddSheet() }
         .alert("Lỗi", isPresented: $showErr) { Button("OK", role: .cancel) {} }
         message: { Text(userNuke.importError ?? "") }
         .onChange(of: userNuke.importError) { v in if v != nil { showErr = true } }
     }
 }
 
-// ✅ NEW: Manual add token sheet for user nuke
 struct UserNukeManualAddSheet: View {
     @EnvironmentObject var userNuke: UserNukeManager
     @Environment(\.dismiss) var dismiss
@@ -2231,24 +2589,16 @@ struct UserNukeManualAddSheet: View {
                         .textInputAutocapitalization(.never)
                         .focused($focused)
                 }
-
                 if let e = errorMsg {
-                    Section {
-                        Text(e).font(.caption).foregroundStyle(.red)
-                    }
+                    Section { Text(e).font(.caption).foregroundStyle(.red) }
                 }
-
-                Section(footer: Text("Token sẽ được kiểm tra tính hợp lệ trước khi thêm. Có thể nhập nhiều dòng (mỗi dòng 1 token).")) {
-                    Button("Thêm token") {
-                        Task { await addTokens() }
-                    }
-                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || userNuke.isImporting)
+                Section(footer: Text("Mỗi dòng 1 token.")) {
+                    Button("Thêm token") { Task { await addTokens() } }
+                        .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || userNuke.isImporting)
                 }
             }
             .navigationTitle("Thêm token tay").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
-            }
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } } }
             .onAppear { focused = true }
         }
     }
@@ -2259,16 +2609,10 @@ struct UserNukeManualAddSheet: View {
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { errorMsg = "Không có token"; return }
         errorMsg = nil
-        var okCount = 0
-        for line in lines {
-            let added = await userNuke.addTokenManually(line)
-            if added { okCount += 1 }
-        }
-        if okCount > 0 {
-            dismiss()
-        } else {
-            errorMsg = "Không thêm được token nào (có thể đã tồn tại hoặc token chết)."
-        }
+        var ok = 0
+        for line in lines { if await userNuke.addTokenManually(line) { ok += 1 } }
+        if ok > 0 { dismiss() }
+        else { errorMsg = "Không thêm được (trùng hoặc token chết)." }
     }
 }
 
