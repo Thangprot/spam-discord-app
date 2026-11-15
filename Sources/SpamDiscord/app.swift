@@ -33,6 +33,61 @@ struct DocumentPicker: UIViewControllerRepresentable {
 }
 
 // ==========================================
+// MARK: - KEYCHAIN HELPER (LƯU TRỮ VĨNH VIỄN)
+// ==========================================
+class KeychainHelper {
+    static let standard = KeychainHelper()
+    private init() {}
+
+    func save(_ data: Data, service: String, account: String) {
+        let query = [
+            kSecValueData: data,
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account
+        ] as CFDictionary
+
+        SecItemDelete(query)
+        SecItemAdd(query, nil)
+    }
+
+    func read(service: String, account: String) -> Data? {
+        let query = [
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecClass: kSecClassGenericPassword,
+            kSecReturnData: true
+        ] as CFDictionary
+
+        var result: AnyObject?
+        SecItemCopyMatching(query, &result)
+        return (result as? Data)
+    }
+
+    func delete(service: String, account: String) {
+        let query = [
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecClass: kSecClassGenericPassword
+        ] as CFDictionary
+        SecItemDelete(query)
+    }
+    
+    func saveString(_ value: String, forKey key: String) {
+        if let data = value.data(using: .utf8) {
+            save(data, service: Bundle.main.bundleIdentifier ?? "app", account: key)
+        }
+    }
+    
+    func readString(forKey key: String) -> String? {
+        if let data = read(service: Bundle.main.bundleIdentifier ?? "app", account: key) {
+            return String(data: data, encoding: .utf8)
+        }
+        return nil
+    }
+}
+
+// ==========================================
 // MARK: - MODELS
 // ==========================================
 struct DiscordUser: Codable { let id, username: String; let globalName: String?; let avatar: String? }
@@ -1334,13 +1389,24 @@ enum LicenseStatus: Equatable {
 final class LicenseAPIClient {
     static let shared = LicenseAPIClient()
 
-    // ⚠️ ĐÃ THÊM https:// VÀO ĐẦU LINK
+    // ⚠️ ĐỔI URL NÀY thành URL Worker của bạn
     let baseURL = "https://key.nqtaff01.workers.dev"
 
     private func machineID() -> String {
-        let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? "unknown")-\(Bundle.main.bundleIdentifier ?? "app")"
+        let keychainKey = "QT_MachineID"
+        
+        // Thử đọc từ Keychain trước để đảm bảo ID không đổi khi xóa app
+        if let savedID = KeychainHelper.standard.readString(forKey: keychainKey) {
+            return savedID
+        }
+        
+        // Nếu chưa có, tạo mới và lưu vào Keychain
+        let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)-\(Bundle.main.bundleIdentifier ?? "app")"
         let hash = SHA256.hash(data: Data(raw.utf8))
-        return hash.compactMap { String(format: "%02x", $0) }.joined()
+        let newID = hash.compactMap { String(format: "%02x", $0) }.joined()
+        
+        KeychainHelper.standard.saveString(newID, forKey: keychainKey)
+        return newID
     }
 
     func activate(key: String) async throws -> LicenseActivationResponse {
@@ -1361,7 +1427,10 @@ final class LicenseAPIClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 15
-        req.httpBody = try JSONSerialization.data(withJSONObject: ["license_key": key])
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "license_key": key,
+            "machine_id": machineID() // Check chính chủ
+        ])
         let (data, _) = try await URLSession.shared.data(for: req)
         return try JSONDecoder().decode(LicenseValidationResponse.self, from: data)
     }
@@ -1373,7 +1442,7 @@ final class LicenseManager: ObservableObject {
 
     @Published var status: LicenseStatus = .notActivated
     @Published var licenseKey: String? = nil
-    @Published var activatedAt: Date? = UserDefaults.standard.object(forKey: "QT_LicenseActivatedAt") as? Date
+    @Published var activatedAt: Date? = nil
     @Published var isChecking = false
 
     private let keyStoreKey = "QT_LicenseKey_Server"
@@ -1382,12 +1451,22 @@ final class LicenseManager: ObservableObject {
     private let activatedStoreKey = "QT_LicenseActivatedAt"
 
     init() {
-        self.licenseKey = UserDefaults.standard.string(forKey: keyStoreKey)
+        // Đọc dữ liệu từ Keychain
+        self.licenseKey = KeychainHelper.standard.readString(forKey: keyStoreKey)
+        
+        if let actString = KeychainHelper.standard.readString(forKey: activatedStoreKey),
+           let actDouble = Double(actString) {
+            self.activatedAt = Date(timeIntervalSince1970: actDouble)
+        }
+
         if licenseKey == nil {
             status = .notActivated
-        } else if let cachedExp = UserDefaults.standard.object(forKey: expiryStoreKey) as? Date {
+        } else if let expString = KeychainHelper.standard.readString(forKey: expiryStoreKey),
+                  let expDouble = Double(expString) {
+            let cachedExp = Date(timeIntervalSince1970: expDouble)
             status = Date() > cachedExp ? .expired(expiresOn: cachedExp) : .valid(expiresOn: cachedExp)
         }
+        
         Task { @MainActor [weak self] in
             await self?.refreshStatus()
         }
@@ -1407,10 +1486,11 @@ final class LicenseManager: ObservableObject {
                 let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
                 let now = Date()
                 
-                UserDefaults.standard.set(clean, forKey: keyStoreKey)
-                UserDefaults.standard.set(exp, forKey: expiryStoreKey)
-                UserDefaults.standard.set(now, forKey: lastCheckKey)
-                UserDefaults.standard.set(now, forKey: activatedStoreKey)
+                // Lưu vào Keychain
+                KeychainHelper.standard.saveString(clean, forKey: keyStoreKey)
+                KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
+                KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: lastCheckKey)
+                KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
                 
                 licenseKey = clean
                 activatedAt = now
@@ -1438,8 +1518,10 @@ final class LicenseManager: ObservableObject {
             let res = try await LicenseAPIClient.shared.validate(key: key)
             if res.valid == true, let expMs = res.expiresAt {
                 let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
-                UserDefaults.standard.set(exp, forKey: expiryStoreKey)
-                UserDefaults.standard.set(Date(), forKey: lastCheckKey)
+                
+                KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
+                KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
+                
                 status = .valid(expiresOn: exp)
                 return
             } else {
@@ -1447,7 +1529,9 @@ final class LicenseManager: ObservableObject {
                 return
             }
         } catch {
-            if let cachedExp = UserDefaults.standard.object(forKey: expiryStoreKey) as? Date {
+            if let expString = KeychainHelper.standard.readString(forKey: expiryStoreKey),
+               let expDouble = Double(expString) {
+                let cachedExp = Date(timeIntervalSince1970: expDouble)
                 if Date() > cachedExp {
                     status = .expired(expiresOn: cachedExp)
                 } else {
@@ -1460,10 +1544,11 @@ final class LicenseManager: ObservableObject {
     }
 
     func deactivate() {
-        UserDefaults.standard.removeObject(forKey: keyStoreKey)
-        UserDefaults.standard.removeObject(forKey: expiryStoreKey)
-        UserDefaults.standard.removeObject(forKey: lastCheckKey)
-        UserDefaults.standard.removeObject(forKey: activatedStoreKey)
+        KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: keyStoreKey)
+        KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: expiryStoreKey)
+        KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: lastCheckKey)
+        KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: activatedStoreKey)
+        
         licenseKey = nil
         activatedAt = nil
         status = .notActivated
@@ -1847,7 +1932,6 @@ struct AboutView: View {
         guard let key = license.licenseKey else { return "No Key" }
         if showFullKey { return key }
         
-        // Che phần giữa của key, ví dụ: QT-ABCDE-12345 -> QT-***-12345
         let parts = key.split(separator: "-")
         if parts.count == 3 {
             return "\(parts[0])-***-\(parts[2])"
