@@ -878,6 +878,11 @@ class VoiceRoomClient {
             }
         }
 
+        guard ssrc != 0 else {
+            log?("⚠️ Voice Ready nhưng ssrc = 0")
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice ssrc = 0"])
+        }
+
         voiceHB = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 13_750_000_000)
@@ -896,7 +901,11 @@ class VoiceRoomClient {
         }
 
         isMicOn = true
-        try await setSpeaking(1)
+        do {
+            try await setSpeaking(1)
+        } catch {
+            log?("Không thể bật speaking ban đầu: \(error.localizedDescription)")
+        }
         startSpeakingRefresh()
 
         isJoined = true
@@ -910,33 +919,60 @@ class VoiceRoomClient {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
                 guard let self = self else { break }
-                if self.isMicOn { try? await self.setSpeaking(1) }
+                if self.isMicOn && self.voiceWS?.state == .running && self.ssrc != 0 {
+                    try? await self.setSpeaking(1)
+                }
             }
         }
     }
 
     func setSpeaking(_ flag: Int) async throws {
-        guard let vws = voiceWS else { return }
-        try await sendJSON(vws, ["op": 5, "d": ["speaking": flag, "delay": 0, "ssrc": ssrc]])
+        guard let vws = voiceWS, vws.state == .running, ssrc != 0 else {
+            throw NSError(domain: "Room", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Voice WS chưa sẵn sàng hoặc ssrc = 0"])
+        }
+        try await sendJSON(vws, [
+            "op": 5,
+            "d": [
+                "speaking": flag,
+                "delay": 0,
+                "ssrc": ssrc
+            ]
+        ])
     }
 
     func setMic(_ on: Bool) async {
         isMicOn = on
-        try? await setSpeaking(on ? 1 : 0)
-        log?(on ? "🎤 Mic ON" : "🔇 Mic OFF")
+        do {
+            try await setSpeaking(on ? 1 : 0)
+            log?(on ? "🎤 Mic ON" : "🔇 Mic OFF")
+        } catch {
+            log?("Mic Error: \(error.localizedDescription)")
+        }
     }
 
     func setSpeaker(_ on: Bool) async {
         isSpeakerOn = on
-        guard let gw = gatewayWS, let gid = guildId, let cid = channelId else { return }
-        try? await sendJSON(gw, ["op": 4, "d": [
-            "guild_id": gid, "channel_id": cid, "self_mute": !isMicOn, "self_deaf": !on
-        ]])
-        log?(on ? "🔊 Loa ON" : "🔈 Loa OFF")
+        guard let gw = gatewayWS, gw.state == .running,
+              let gid = guildId, let cid = channelId else {
+            log?("Gateway WS chưa kết nối, không thể đổi loa")
+            return
+        }
+        do {
+            try await sendJSON(gw, ["op": 4, "d": [
+                "guild_id": gid, "channel_id": cid, "self_mute": !isMicOn, "self_deaf": !on
+            ]])
+            log?(on ? "🔊 Loa ON" : "🔈 Loa OFF")
+        } catch {
+            log?("Loa Error: \(error.localizedDescription)")
+        }
     }
 
     func setCam(_ on: Bool) async {
-        guard let vws = voiceWS else { return }
+        guard let vws = voiceWS, vws.state == .running, ssrc != 0 else {
+            log?("Voice WS chưa sẵn sàng, không thể đổi Cam")
+            return
+        }
         let videoSSRC = ssrc + 1
         let payload: [String: Any] = [
             "op": 12, "d": [
@@ -954,7 +990,10 @@ class VoiceRoomClient {
     }
 
     func setStream(_ on: Bool) async {
-        guard let vws = voiceWS else { return }
+        guard let vws = voiceWS, vws.state == .running else {
+            log?("Voice WS chưa sẵn sàng, không thể đổi Stream")
+            return
+        }
         do {
             if on {
                 try await sendJSON(vws, ["op": 18, "d": ["type": "go-live", "paused": false]])
@@ -969,7 +1008,9 @@ class VoiceRoomClient {
     func leave() async {
         gatewayHB?.cancel(); voiceHB?.cancel(); speakingRefresh?.cancel(); voiceReceiveTask?.cancel()
         gatewayHB = nil; voiceHB = nil; speakingRefresh = nil; voiceReceiveTask = nil
-        try? await setSpeaking(0)
+        if voiceWS?.state == .running && ssrc != 0 {
+            try? await setSpeaking(0)
+        }
         gatewayWS?.cancel(with: .normalClosure, reason: nil)
         voiceWS?.cancel(with: .normalClosure, reason: nil)
         gatewayWS = nil; voiceWS = nil
@@ -987,6 +1028,9 @@ class VoiceRoomClient {
     }
 
     private func sendJSON(_ ws: URLSessionWebSocketTask, _ obj: [String: Any]) async throws {
+        guard ws.state == .running else {
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Socket is not connected"])
+        }
         let data = try JSONSerialization.data(withJSONObject: obj)
         try await ws.send(.string(String(data: data, encoding: .utf8)!))
     }
@@ -1871,7 +1915,7 @@ class VoiceRoomManager: ObservableObject {
             let tid = t.id
             c.log = { msg in
                 Task { @MainActor in
-                    if msg.contains("✓") || msg.contains("✗") || msg.contains("error") || msg.contains("ON") || msg.contains("OFF") {
+                    if msg.contains("✓") || msg.contains("✗") || msg.contains("error") || msg.contains("Error") || msg.contains("ON") || msg.contains("OFF") || msg.contains("Lỗi") {
                         self.log("[\(t.username.prefix(12))] \(msg)")
                     }
                 }
@@ -1886,7 +1930,6 @@ class VoiceRoomManager: ObservableObject {
                 try await c.joinVoice(guildId: guild.id, channelId: channel.id)
                 perTokenStatus[t.id] = "Đã join ✓"
                 
-                // Áp dụng trạng thái ban đầu
                 await c.setMic(micEnabled)
                 await c.setSpeaker(speakerEnabled)
                 if camEnabled { await c.setCam(true) }
