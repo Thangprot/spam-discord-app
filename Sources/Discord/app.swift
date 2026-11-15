@@ -202,15 +202,33 @@ final class NowPlayingHelper {
     private init() {}
     private var isActive = false
     private var onStopCB: (() -> Void)?
+    
+    // Cache ảnh
+    private lazy var defaultArtwork: MPMediaItemArtwork? = {
+        let size = CGSize(width: 512, height: 512)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { ctx in
+            // Nền màu tối giống app
+            UIColor(red: 0.08, green: 0.08, blue: 0.16, alpha: 1.0).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            
+            // Vẽ logo (Ngọn lửa màu đỏ)
+            let config = UIImage.SymbolConfiguration(pointSize: 300, weight: .bold)
+            if let symbol = UIImage(systemName: "flame.fill", withConfiguration: config)?.withTintColor(.red, renderingMode: .alwaysOriginal) {
+                let symbolSize = symbol.size
+                let origin = CGPoint(x: (size.width - symbolSize.width) / 2, y: (size.height - symbolSize.height) / 2)
+                symbol.draw(at: origin)
+            }
+        }
+        return MPMediaItemArtwork(boundsSize: size) { _ in image }
+    }()
 
     func start(onStop: (() -> Void)? = nil) {
         isActive = true
         onStopCB = onStop
 
-        // 1) Nhận sự kiện từ tai nghe / lock screen
         UIApplication.shared.beginReceivingRemoteControlEvents()
 
-        // 2) Cấu hình remote command center
         let cc = MPRemoteCommandCenter.shared()
         cc.playCommand.isEnabled = false
         cc.nextTrackCommand.isEnabled = false
@@ -233,7 +251,6 @@ final class NowPlayingHelper {
             cc.stopCommand.isEnabled = false
         }
 
-        // 3) Đợi audio thực sự play rồi mới set Now Playing
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.update(title: "Quoc Thang Tools", detail: "Đang chuẩn bị...")
         }
@@ -246,10 +263,15 @@ final class NowPlayingHelper {
         info[MPMediaItemPropertyArtist] = detail
         info[MPMediaItemPropertyAlbumTitle] = "Quoc Thang Tools"
         info[MPMediaItemPropertyPlaybackDuration] = 0
+        
+        // Thêm ảnh
+        info[MPMediaItemPropertyArtwork] = defaultArtwork
+        
         info[MPNowPlayingInfoPropertyIsLiveStream] = true
         info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
         info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
         info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+        
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         if #available(iOS 16.0, *) {
             MPNowPlayingInfoCenter.default().playbackState = .playing
@@ -270,11 +292,12 @@ final class NowPlayingHelper {
 }
 
 // ==========================================
-// MARK: - BACKGROUND (Audio câm, mẫu khác 0)
+// MARK: - BACKGROUND (AVAudioEngine)
 // ==========================================
 class BackgroundManager {
     static let shared = BackgroundManager()
-    private var audioPlayer: AVAudioPlayer?
+    private var engine: AVAudioEngine?
+    private var sourceNode: AVAudioSourceNode?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
 
     func start() {
@@ -286,57 +309,47 @@ class BackgroundManager {
 
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default,
-                                    options: [.mixWithOthers, .duckOthers])
+            // KHÔNG dùng .mixWithOthers để iOS cho phép hiện Now Playing
+            try session.setCategory(.playback, mode: .default, options: [])
             try session.setActive(true, options: [])
             print("[BG] Audio session OK")
         } catch {
             print("[BG] AVAudioSession FAIL: \(error)")
         }
 
-        if audioPlayer?.isPlaying == true { return }
+        if engine?.isRunning == true { return }
 
-        do {
-            let sr: UInt32 = 8000
-            let numSamples = Int(sr)
-            let ds = numSamples * 2
-
-            var h = Data()
-            h.append(contentsOf: [0x52,0x49,0x46,0x46])                       // "RIFF"
-            var cs = UInt32(36 + ds).littleEndian; h.append(Data(bytes: &cs, count: 4))
-            h.append(contentsOf: [0x57,0x41,0x56,0x45,0x66,0x6d,0x74,0x20])   // "WAVEfmt "
-            var s1 = UInt32(16).littleEndian; h.append(Data(bytes: &s1, count: 4))
-            var af = UInt16(1).littleEndian;  h.append(Data(bytes: &af, count: 2))  // PCM
-            var nc = UInt16(1).littleEndian;  h.append(Data(bytes: &nc, count: 2))  // mono
-            var sl = sr.littleEndian;         h.append(Data(bytes: &sl, count: 4))  // sample rate
-            var br = UInt32(sr * 2).littleEndian; h.append(Data(bytes: &br, count: 4))
-            var ba = UInt16(2).littleEndian;  h.append(Data(bytes: &ba, count: 2))
-            var bp = UInt16(16).littleEndian; h.append(Data(bytes: &bp, count: 2))
-            h.append(contentsOf: [0x64,0x61,0x74,0x61])                       // "data"
-            var dc = UInt32(ds).littleEndian; h.append(Data(bytes: &dc, count: 4))
-
-            // Mẫu = 1 (gần như im lặng -90dB) → iOS coi là audio THẬT
-            var audioData = Data(count: ds)
-            for i in stride(from: 0, to: ds, by: 2) {
-                audioData[i] = 1
-                audioData[i + 1] = 0
+        let eng = AVAudioEngine()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+        
+        // Phát ra âm thanh cực nhỏ để đánh thức phần cứng
+        let node = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
+            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            for buf in abl {
+                let ptr = buf.mData?.assumingMemoryBound(to: Float.self)
+                for i in 0..<Int(frameCount) { ptr?[i] = 0.00001 }
             }
-
-            let player = try AVAudioPlayer(data: h + audioData)
-            player.numberOfLoops = -1
-            player.volume = 0.01
-            player.prepareToPlay()
-            let ok = player.play()
-            audioPlayer = player
-            print("[BG] AVAudioPlayer playing: \(ok)")
+            return noErr
+        }
+        
+        eng.attach(node)
+        eng.connect(node, to: eng.mainMixerNode, format: format)
+        eng.mainMixerNode.outputVolume = 0.01
+        
+        do {
+            try eng.start()
+            engine = eng
+            sourceNode = node
+            print("[BG] AVAudioEngine started: \(eng.isRunning)")
         } catch {
-            print("[BG] AVAudioPlayer FAIL: \(error)")
+            print("[BG] AVAudioEngine FAIL: \(error)")
         }
     }
 
     func stop() {
-        audioPlayer?.stop()
-        audioPlayer = nil
+        engine?.stop()
+        engine = nil
+        sourceNode = nil
         if bgTask != .invalid {
             UIApplication.shared.endBackgroundTask(bgTask)
             bgTask = .invalid
@@ -663,13 +676,14 @@ class AppState: ObservableObject {
             } catch {
                 consecutiveErrors += 1
                 if consecutiveErrors >= 2 {
+                    // Silent re-login
                     do {
                         _ = try await DiscordClient(token: token.token).validateToken()
                         client = DiscordClient(token: token.token)
                         consecutiveErrors = 0
                         try? await Task.sleep(nanoseconds: 800_000_000)
                     } catch {
-                        return // token chết, dừng riêng token này
+                        return // Token chết, dừng riêng token này
                     }
                 } else {
                     try? await Task.sleep(nanoseconds: 1_200_000_000)
