@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15   # 🔥 ĐÃ SỬA THÀNH macos-15 (Có sẵn Xcode 16)
+    runs-on: macos-15
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,7 +22,7 @@ jobs:
         run: |
           xcodebuild build \
           -project Discord.xcodeproj \
-          -scheme discord \
+          -scheme Discord \
           -configuration Release \
           -sdk iphoneos \
           -destination generic/platform=iOS \

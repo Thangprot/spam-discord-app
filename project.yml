@@ -10,7 +10,7 @@ settings:
     SWIFT_VERSION: "5.0"
 
 targets:
-  discord:
+  Discord:
     type: application
     platform: iOS
     sources:
