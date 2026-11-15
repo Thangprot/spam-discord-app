@@ -1335,7 +1335,7 @@ final class LicenseAPIClient {
     static let shared = LicenseAPIClient()
 
     // ⚠️ ĐỔI URL NÀY thành URL Worker của bạn
-    let baseURL = "https://key.nqtaf01.workers.dev"
+    let baseURL = "key.nqtaff01.workers.dev"
 
     private func machineID() -> String {
         let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? "unknown")-\(Bundle.main.bundleIdentifier ?? "app")"
