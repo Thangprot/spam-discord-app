@@ -696,6 +696,7 @@ class VoiceRoomClient {
     private var gatewayHB: Task<Void, Never>?
     private var voiceHB: Task<Void, Never>?
     private var speakingRefresh: Task<Void, Never>?
+    private var voiceReceiveTask: Task<Void, Never>?
 
     private(set) var sessionId: String?
     private(set) var userId: String?
@@ -704,6 +705,9 @@ class VoiceRoomClient {
     private(set) var channelId: String?
     private(set) var ssrc: Int = 0
     private(set) var isJoined = false
+
+    private var isMicOn = true
+    private var isSpeakerOn = true
 
     var log: ((String) -> Void)?
     var onStateChange: ((Bool) -> Void)?
@@ -730,8 +734,7 @@ class VoiceRoomClient {
     func validate() async throws -> DiscordUser {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me")!)
         guard let h = r as? HTTPURLResponse, h.statusCode == 200 else {
-            throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Token không hợp lệ"])
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Token không hợp lệ"])
         }
         return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
@@ -739,26 +742,20 @@ class VoiceRoomClient {
     func getGuilds() async throws -> [Guild] {
         let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/users/@me/guilds")!)
         guard let h = r as? HTTPURLResponse, h.statusCode == 200 else {
-            throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Không lấy được guilds"])
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không lấy được guilds"])
         }
         return try JSONDecoder().decode([Guild].self, from: d)
     }
 
     func getVoiceChannels(guildId: String) async throws -> [VoiceChannelInfo] {
-        let (d, r) = try await session.data(
-            from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
+        let (d, r) = try await session.data(from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
         let status = (r as? HTTPURLResponse)?.statusCode ?? -1
         guard status == 200 else {
-            throw NSError(domain: "Room", code: status,
-                          userInfo: [NSLocalizedDescriptionKey: "HTTP \(status) khi lấy channels"])
+            throw NSError(domain: "Room", code: status, userInfo: [NSLocalizedDescriptionKey: "HTTP \(status) khi lấy channels"])
         }
         let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]] ?? []
         return arr.compactMap { ch in
-            guard let id = ch["id"] as? String,
-                  let name = ch["name"] as? String,
-                  let type = ch["type"] as? Int,
-                  (type == 2 || type == 13) else { return nil }
+            guard let id = ch["id"] as? String, let name = ch["name"] as? String, let type = ch["type"] as? Int, (type == 2 || type == 13) else { return nil }
             return VoiceChannelInfo(id: id, name: name, guildId: guildId, type: type)
         }
     }
@@ -767,17 +764,12 @@ class VoiceRoomClient {
         self.guildId = guildId
         self.channelId = channelId
 
-        // --- BƯỚC 1: KẾT NỐI GATEWAY CHÍNH ---
         log?("Mở gateway WS...")
-        guard let gatewayURL = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else {
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Gateway URL invalid"])
-        }
-        let gw = session.webSocketTask(with: gatewayURL)
+        let gw = session.webSocketTask(with: URL(string: "wss://gateway.discord.gg/?v=10&encoding=json")!)
         gw.maximumMessageSize = 16 * 1024 * 1024
         gw.resume()
         gatewayWS = gw
 
-        // Chờ Hello (op 10)
         guard let hello = try await recvJSON(gw) as? [String: Any],
               let hbInt = ((hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int) else {
             throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Gateway Hello missing"])
@@ -791,19 +783,13 @@ class VoiceRoomClient {
             }
         }
 
-        log?("Identify...")
-        try await sendJSON(gw, [
-            "op": 2,
-            "d": [
-                "token": token,
-                "capabilities": 125,
-                "properties": ["os": "iOS", "browser": "Safari", "device": "iPhone"],
-                "compress": false,
-                "presence": ["status": "online", "since": 0, "activities": [], "afk": false]
-            ]
-        ])
+        try await sendJSON(gw, ["op": 2, "d": [
+            "token": token, "capabilities": 125,
+            "properties": ["os": "iOS", "browser": "Safari", "device": "iPhone"],
+            "compress": false,
+            "presence": ["status": "online", "since": 0, "activities": [], "afk": false]
+        ]])
 
-        // Chờ READY
         while true {
             let msg = try await recvJSON(gw) as? [String: Any]
             if (msg?["t"] as? String) == "READY" {
@@ -811,7 +797,6 @@ class VoiceRoomClient {
                 sessionId = d?["session_id"] as? String
                 let u = d?["user"] as? [String: Any]
                 userId = u?["id"] as? String
-                username = u?["username"] as? String
                 break
             }
             if let op = msg?["op"] as? Int, op == 9 {
@@ -819,23 +804,14 @@ class VoiceRoomClient {
             }
         }
 
-        log?("Voice state update...")
-        try await sendJSON(gw, [
-            "op": 4,
-            "d": [
-                "guild_id": guildId,
-                "channel_id": channelId,
-                "self_mute": false,
-                "self_deaf": false
-            ]
-        ])
+        try await sendJSON(gw, ["op": 4, "d": [
+            "guild_id": guildId, "channel_id": channelId, "self_mute": false, "self_deaf": false
+        ]])
 
-        // --- BƯỚC 2: CHỜ VOICE SERVER UPDATE ---
         var vsEndpoint: String?
         var vsToken: String?
         while vsEndpoint == nil {
-            if let msg = try await recvJSON(gw) as? [String: Any],
-               (msg["t"] as? String) == "VOICE_SERVER_UPDATE" {
+            if let msg = try await recvJSON(gw) as? [String: Any], (msg["t"] as? String) == "VOICE_SERVER_UPDATE" {
                 let d = msg["d"] as? [String: Any]
                 vsEndpoint = d?["endpoint"] as? String
                 vsToken = d?["token"] as? String
@@ -845,12 +821,7 @@ class VoiceRoomClient {
             throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice server missing"])
         }
 
-        // ✅ FIX: Chuẩn hóa endpoint và thêm header Origin / User-Agent
-        var cleanEp = ep
-            .replacingOccurrences(of: "wss://", with: "")
-            .replacingOccurrences(of: "https://", with: "")
-
-        // Loại bỏ port :2048 hoặc :443 nếu có
+        var cleanEp = ep.replacingOccurrences(of: "wss://", with: "").replacingOccurrences(of: "https://", with: "")
         var portSuffix = ""
         if let colonIdx = cleanEp.lastIndex(of: ":") {
             let afterColon = cleanEp.suffix(from: cleanEp.index(after: colonIdx))
@@ -859,95 +830,50 @@ class VoiceRoomClient {
                 cleanEp = String(cleanEp.prefix(upTo: colonIdx))
             }
         }
-        cleanEp = cleanEp.replacingOccurrences(of: "/?v=4", with: "")
-            .replacingOccurrences(of: "/", with: "")
+        cleanEp = cleanEp.replacingOccurrences(of: "/?v=4", with: "").replacingOccurrences(of: "/", with: "")
 
-        log?("Endpoint gốc: \(ep)")
-        log?("Endpoint sạch: \(cleanEp) (port: \(portSuffix.isEmpty ? "mặc định" : portSuffix))")
-
-        // Thử cả Voice version 8 (ưu tiên) và 4
         var candidateURLs: [String] = []
-        
-        // Các biến thể của v8
         candidateURLs.append("wss://\(cleanEp)/?v=8")
-        if !portSuffix.isEmpty {
-            candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=8")
-        }
-        
-        // Các biến thể của v4 (fallback)
+        if !portSuffix.isEmpty { candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=8") }
         candidateURLs.append("wss://\(cleanEp)/?v=4")
-        if !portSuffix.isEmpty {
-            candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=4")
-        }
-        
-        // Không có version (ít khi dùng)
-        candidateURLs.append("wss://\(cleanEp)")
+        if !portSuffix.isEmpty { candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=4") }
 
         var vws: URLSessionWebSocketTask? = nil
-        var lastError: Error? = nil
-
         for candidateURL in candidateURLs {
-            log?("Thử kết nối: \(candidateURL)")
-            guard let url = URL(string: candidateURL) else {
-                log?("URL không hợp lệ: \(candidateURL)")
-                continue
-            }
-
-            // ✅ FIX: Thêm Origin và User-Agent vào URLRequest để tránh bị chặn
+            guard let url = URL(string: candidateURL) else { continue }
             var req = URLRequest(url: url)
             req.setValue("https://discord.com", forHTTPHeaderField: "Origin")
-            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
-
             let task = session.webSocketTask(with: req)
             task.maximumMessageSize = 16 * 1024 * 1024
             task.resume()
-
             do {
-                // Đợi 1 giây để socket kết nối xong
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                
-                // Đọc Hello (op 8)
+                try await Task.sleep(nanoseconds: 500_000_000)
                 let helloMsg = try await recvJSON(task)
                 if let h = helloMsg as? [String: Any], (h["op"] as? Int) == 8 {
                     vws = task
-                    log?("Kết nối thành công: \(candidateURL)")
                     break
                 } else {
-                    log?("Phản hồi không phải Hello op 8: \(helloMsg)")
                     task.cancel(with: .goingAway, reason: nil)
                 }
             } catch {
-                log?("Kết nối thất bại: \(error.localizedDescription)")
-                lastError = error
                 task.cancel(with: .goingAway, reason: nil)
             }
         }
 
         guard let voiceSocket = vws else {
-            throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS. Lỗi cuối: \(lastError?.localizedDescription ?? "unknown")"])
+            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS"])
         }
         voiceWS = voiceSocket
 
-        // --- BƯỚC 3: GỬI IDENTIFY (OP 0) ---
-        log?("Gửi Voice Identify (op 0)...")
-        try await sendJSON(voiceSocket, [
-            "op": 0,
-            "d": [
-                "server_id": guildId,
-                "user_id": userId ?? "",
-                "session_id": sessionId ?? "",
-                "token": vt
-            ]
-        ])
+        try await sendJSON(voiceSocket, ["op": 0, "d": [
+            "server_id": guildId, "user_id": userId ?? "", "session_id": sessionId ?? "", "token": vt
+        ]])
 
         var readyAttempts = 0
         while readyAttempts < 20 {
             readyAttempts += 1
-            if let msg = try await recvJSON(voiceSocket) as? [String: Any],
-               (msg["op"] as? Int) == 2 {
+            if let msg = try await recvJSON(voiceSocket) as? [String: Any], (msg["op"] as? Int) == 2 {
                 ssrc = ((msg["d"] as? [String: Any])?["ssrc"] as? Int) ?? 0
-                log?("Voice Ready ✓ (ssrc: \(ssrc))")
                 break
             }
         }
@@ -959,102 +885,90 @@ class VoiceRoomClient {
             }
         }
 
-        try await setSpeaking(1)
-
-        speakingRefresh = Task { [weak self] in
+        voiceReceiveTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
-                try? await self?.setSpeaking(1)
+                do {
+                    _ = try await self?.recvJSON(voiceSocket)
+                } catch {
+                    break
+                }
             }
         }
+
+        isMicOn = true
+        try await setSpeaking(1)
+        startSpeakingRefresh()
 
         isJoined = true
         onStateChange?(true)
         log?("Đã vào voice ✓")
     }
 
+    private func startSpeakingRefresh() {
+        speakingRefresh?.cancel()
+        speakingRefresh = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard let self = self else { break }
+                if self.isMicOn { try? await self.setSpeaking(1) }
+            }
+        }
+    }
+
     func setSpeaking(_ flag: Int) async throws {
         guard let vws = voiceWS else { return }
-        try await sendJSON(vws, ["op": 5, "d": [
-            "speaking": flag, "delay": 0, "ssrc": ssrc
-        ]])
+        try await sendJSON(vws, ["op": 5, "d": ["speaking": flag, "delay": 0, "ssrc": ssrc]])
     }
 
     func setMic(_ on: Bool) async {
-        speakingRefresh?.cancel()
-        speakingRefresh = nil
+        isMicOn = on
         try? await setSpeaking(on ? 1 : 0)
-        if on {
-            speakingRefresh = Task { [weak self] in
-                while !Task.isCancelled {
-                    try? await Task.sleep(nanoseconds: 10_000_000_000)
-                    try? await self?.setSpeaking(1)
-                }
-            }
-        }
-        log?(on ? "Mic ON" : "Mic OFF")
+        log?(on ? "🎤 Mic ON" : "🔇 Mic OFF")
     }
 
     func setSpeaker(_ on: Bool) async {
+        isSpeakerOn = on
         guard let gw = gatewayWS, let gid = guildId, let cid = channelId else { return }
-        try? await sendJSON(gw, [
-            "op": 4,
-            "d": [
-                "guild_id": gid,
-                "channel_id": cid,
-                "self_mute": false,
-                "self_deaf": !on
-            ]
-        ])
-        log?(on ? "Loa ON" : "Loa OFF")
+        try? await sendJSON(gw, ["op": 4, "d": [
+            "guild_id": gid, "channel_id": cid, "self_mute": !isMicOn, "self_deaf": !on
+        ]])
+        log?(on ? "🔊 Loa ON" : "🔈 Loa OFF")
     }
 
     func setCam(_ on: Bool) async {
         guard let vws = voiceWS else { return }
         let videoSSRC = ssrc + 1
         let payload: [String: Any] = [
-            "op": 12,
-            "d": [
-                "audio_ssrc": ssrc,
-                "video_ssrc": on ? videoSSRC : 0,
-                "rtx_ssrc": 0,
+            "op": 12, "d": [
+                "audio_ssrc": ssrc, "video_ssrc": on ? videoSSRC : 0, "rtx_ssrc": 0,
                 "streams": on ? [[
-                    "type": "video",
-                    "rid": "100",
-                    "ssrc": videoSSRC,
-                    "active": true,
-                    "quality": 100,
-                    "rtx_ssrc": 0,
-                    "max_bitrate": 2500000,
-                    "max_framerate": 30,
-                    "max_resolution": ["type": "fixed", "width": 1280, "height": 720]
+                    "type": "video", "rid": "100", "ssrc": videoSSRC, "active": true, "quality": 100, "rtx_ssrc": 0,
+                    "max_bitrate": 2500000, "max_framerate": 30, "max_resolution": ["type": "fixed", "width": 1280, "height": 720]
                 ]] : []
             ]
         ]
-        try? await sendJSON(vws, payload)
-        log?(on ? "Cam ON" : "Cam OFF")
+        do {
+            try await sendJSON(vws, payload)
+            log?(on ? "📷 Cam ON" : "📷 Cam OFF")
+        } catch { log?("Cam Error: \(error.localizedDescription)") }
     }
 
     func setStream(_ on: Bool) async {
         guard let vws = voiceWS else { return }
-        if on {
-            try? await sendJSON(vws, [
-                "op": 18,
-                "d": ["type": "go-live", "paused": false]
-            ])
-            log?("Stream ON")
-        } else {
-            try? await sendJSON(vws, [
-                "op": 20,
-                "d": ["stream_key": "go-live"]
-            ])
-            log?("Stream OFF")
-        }
+        do {
+            if on {
+                try await sendJSON(vws, ["op": 18, "d": ["type": "go-live", "paused": false]])
+                log?("📡 Stream ON")
+            } else {
+                try await sendJSON(vws, ["op": 20, "d": ["stream_key": "go-live"]])
+                log?("📡 Stream OFF")
+            }
+        } catch { log?("Stream Error: \(error.localizedDescription)") }
     }
 
     func leave() async {
-        gatewayHB?.cancel(); voiceHB?.cancel(); speakingRefresh?.cancel()
-        gatewayHB = nil; voiceHB = nil; speakingRefresh = nil
+        gatewayHB?.cancel(); voiceHB?.cancel(); speakingRefresh?.cancel(); voiceReceiveTask?.cancel()
+        gatewayHB = nil; voiceHB = nil; speakingRefresh = nil; voiceReceiveTask = nil
         try? await setSpeaking(0)
         gatewayWS?.cancel(with: .normalClosure, reason: nil)
         voiceWS?.cancel(with: .normalClosure, reason: nil)
@@ -1066,12 +980,9 @@ class VoiceRoomClient {
     private func recvJSON(_ ws: URLSessionWebSocketTask) async throws -> Any {
         let msg = try await ws.receive()
         switch msg {
-        case .string(let s):
-            return try JSONSerialization.jsonObject(with: Data(s.utf8))
-        case .data(let d):
-            return try JSONSerialization.jsonObject(with: d)
-        @unknown default:
-            throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "WS msg invalid"])
+        case .string(let s): return try JSONSerialization.jsonObject(with: Data(s.utf8))
+        case .data(let d): return try JSONSerialization.jsonObject(with: d)
+        @unknown default: throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "WS msg invalid"])
         }
     }
 
@@ -1960,7 +1871,7 @@ class VoiceRoomManager: ObservableObject {
             let tid = t.id
             c.log = { msg in
                 Task { @MainActor in
-                    if msg.contains("✓") || msg.contains("✗") {
+                    if msg.contains("✓") || msg.contains("✗") || msg.contains("error") || msg.contains("ON") || msg.contains("OFF") {
                         self.log("[\(t.username.prefix(12))] \(msg)")
                     }
                 }
@@ -1974,6 +1885,13 @@ class VoiceRoomManager: ObservableObject {
             do {
                 try await c.joinVoice(guildId: guild.id, channelId: channel.id)
                 perTokenStatus[t.id] = "Đã join ✓"
+                
+                // Áp dụng trạng thái ban đầu
+                await c.setMic(micEnabled)
+                await c.setSpeaker(speakerEnabled)
+                if camEnabled { await c.setCam(true) }
+                if streamEnabled { await c.setStream(true) }
+                
             } catch {
                 perTokenStatus[t.id] = "Lỗi: \(error.localizedDescription.prefix(50))"
                 log("[\(t.username.prefix(12))] Lỗi: \(error.localizedDescription)")
