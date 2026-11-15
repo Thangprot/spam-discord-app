@@ -741,12 +741,14 @@ class VoiceRoomClient {
         return try JSONDecoder().decode([Guild].self, from: d)
     }
 
+    // ✅ FIX: bind status code trước khi dùng
     func getVoiceChannels(guildId: String) async throws -> [VoiceChannelInfo] {
         let (d, r) = try await session.data(
             from: URL(string: "https://discord.com/api/v10/guilds/\(guildId)/channels")!)
-        guard let h = r as? HTTPURLResponse, h.statusCode == 200 else {
-            throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "HTTP \(h.statusCode) khi lấy channels"])
+        let status = (r as? HTTPURLResponse)?.statusCode ?? -1
+        guard status == 200 else {
+            throw NSError(domain: "Room", code: status,
+                          userInfo: [NSLocalizedDescriptionKey: "HTTP \(status) khi lấy channels"])
         }
         let arr = try JSONSerialization.jsonObject(with: d) as? [[String: Any]] ?? []
         return arr.compactMap { ch in
@@ -1622,13 +1624,11 @@ class VoiceRoomManager: ObservableObject {
     @Published var selectedGuild: Guild?
     @Published var selectedChannel: VoiceChannelInfo?
 
-    // Toggle states
     @Published var camEnabled = false
     @Published var streamEnabled = false
     @Published var micEnabled = true
     @Published var speakerEnabled = true
 
-    // Running
     @Published var isRunning = false
     @Published var perTokenStatus: [UUID: String] = [:]
     @Published var roomLog: [String] = []
@@ -1737,15 +1737,12 @@ class VoiceRoomManager: ObservableObject {
         isLoading = false
         log("Quét xong: \(eligibleGuilds.count) server, \(eligibleChannels.values.reduce(0) { $0 + $1.count }) kênh")
     }
-
-    // ✅ FIX: log lỗi + delay giữa các guild
     private func loadForToken(_ t: TokenInfo) async {
         let client = VoiceRoomClient(token: t.token)
         do {
             let guilds = try await client.getGuilds()
             tokenGuilds[t.id] = guilds
             log("[\(t.username.prefix(12))] \(guilds.count) server")
-
             var channelMap: [String: [VoiceChannelInfo]] = [:]
             for g in guilds {
                 do {
@@ -1758,7 +1755,6 @@ class VoiceRoomManager: ObservableObject {
                     log("  [\(g.name.prefix(20))] LỖI: \(error.localizedDescription.prefix(60))")
                     channelMap[g.id] = []
                 }
-                // Delay tránh rate limit
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
             tokenChannels[t.id] = channelMap
@@ -1769,16 +1765,12 @@ class VoiceRoomManager: ObservableObject {
         }
         recomputeEligibility()
     }
-
-    // ✅ FIX: Guilds = INTERSECTION, Channels = UNION
     func recomputeEligibility() {
         guard !selectedTokenIds.isEmpty else {
             eligibleGuilds = []; eligibleChannels = [:]
             selectedGuild = nil; selectedChannel = nil
             return
         }
-
-        // ---- GUILDS: intersection (tất cả token phải ở cùng server) ----
         var guildSet: Set<String>? = nil
         var guildMap: [String: Guild] = [:]
         for id in selectedTokenIds {
@@ -1792,20 +1784,15 @@ class VoiceRoomManager: ObservableObject {
         eligibleGuilds = (guildSet ?? []).compactMap { guildMap[$0] }
             .sorted { $0.name < $1.name }
 
-        // ---- CHANNELS: UNION (kênh nào ít nhất 1 token thấy được) ----
         var chMap: [String: [VoiceChannelInfo]] = [:]
         for guild in eligibleGuilds {
             var chInfo: [String: VoiceChannelInfo] = [:]
             for id in selectedTokenIds {
                 let chs = tokenChannels[id]?[guild.id] ?? []
-                for c in chs where chInfo[c.id] == nil {
-                    chInfo[c.id] = c
-                }
+                for c in chs where chInfo[c.id] == nil { chInfo[c.id] = c }
             }
             let result = Array(chInfo.values).sorted { $0.name < $1.name }
-            if !result.isEmpty {
-                chMap[guild.id] = result
-            }
+            if !result.isEmpty { chMap[guild.id] = result }
         }
         eligibleChannels = chMap
 
@@ -1818,7 +1805,6 @@ class VoiceRoomManager: ObservableObject {
         }
     }
 
-    // ✅ NEW: đếm token có quyền vào kênh
     func tokensWithAccess(guildId: String, channelId: String) -> [TokenInfo] {
         tokens.filter { t in
             selectedTokenIds.contains(t.id) &&
@@ -1846,7 +1832,6 @@ class VoiceRoomManager: ObservableObject {
         for (_, c) in clients { await c.setSpeaker(speakerEnabled) }
     }
 
-    // ✅ FIX: chỉ join token có quyền vào kênh
     func startRoom() async {
         guard let guild = selectedGuild, let channel = selectedChannel else { return }
         guard !selectedTokenIds.isEmpty else { return }
@@ -1876,7 +1861,7 @@ class VoiceRoomManager: ObservableObject {
         }
 
         if eligibleTokens.isEmpty {
-            log("⚠️ Không có token nào có quyền vào kênh này")
+            log("Không có token nào có quyền vào kênh này")
             isRunning = false
             BackgroundManager.shared.stop()
             return
@@ -3002,7 +2987,6 @@ struct RoomTokenPickerView: View {
                 }
             }
 
-            // ✅ NEW: log panel để xem debug khi scan
             if !room.roomLog.isEmpty {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -3137,7 +3121,6 @@ struct RoomGuildListView: View {
                             } else { Circle().fill(.gray.opacity(0.3)).frame(width: 42, height: 42) }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(g.name).font(.headline)
-                                // ✅ FIX: chỉ đếm kênh voice
                                 if let chs = room.eligibleChannels[g.id] {
                                     let voiceOnly = chs.filter { $0.isVoice }.count
                                     Text("\(voiceOnly) kênh thoại")
@@ -3168,7 +3151,6 @@ struct RoomConfigView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
-                // Guild card
                 HStack(spacing: 12) {
                     if let icon = guild.icon,
                        let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
@@ -3178,7 +3160,6 @@ struct RoomConfigView: View {
                     } else { Circle().fill(.gray.opacity(0.3)).frame(width: 48, height: 48) }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(guild.name).font(.headline)
-                        // ✅ FIX: chỉ đếm kênh voice
                         Text("\(channels.filter { $0.isVoice }.count) kênh thoại")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
@@ -3188,14 +3169,12 @@ struct RoomConfigView: View {
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(12)
 
-                // Voice channels
                 VStack(alignment: .leading, spacing: 8) {
                     Text("CHỌN KÊNH THOẠI").font(.caption).bold().foregroundStyle(.secondary)
                     if channels.isEmpty {
                         Text("Không có kênh thoại chung").font(.caption).foregroundStyle(.red)
                     } else {
                         ForEach(channels) { ch in
-                            // ✅ FIX: hiện badge X/Y token per kênh
                             let accessCount = room.accessCount(guildId: guild.id, channelId: ch.id)
                             let totalTokens = room.selectedTokenIds.count
                             let hasAccess = accessCount > 0
@@ -3230,14 +3209,12 @@ struct RoomConfigView: View {
                     }
                 }.padding().background(Color(UIColor.tertiarySystemBackground)).cornerRadius(12)
 
-                // Note
                 VStack(alignment: .leading, spacing: 6) {
                     Text("CHỨC NĂNG KHI ĐANG Ở TRONG VOICE").font(.caption).bold().foregroundStyle(.secondary)
                     Text("Sau khi join, bật/tắt Cam / Stream / Mic / Loa bằng thanh toggle. Chỉ đổi trạng thái Discord (icon, ring xanh) — không có media packet thật.")
                         .font(.caption2).foregroundStyle(.secondary)
                 }.padding().background(Color(UIColor.tertiarySystemBackground)).cornerRadius(12)
 
-                // Start
                 Button {
                     Task { await room.startRoom() }
                 } label: {
@@ -3264,7 +3241,6 @@ struct RoomRunningView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             VStack(spacing: 8) {
                 HStack {
                     Image(systemName: "waveform").foregroundStyle(.green).font(.title3)
@@ -3283,35 +3259,25 @@ struct RoomRunningView: View {
                 }
             }.padding().background(Color.green.opacity(0.08))
 
-            // Toggle bar
             HStack(spacing: 8) {
-                toggleButton(icon: "video.fill",
-                             label: "Cam",
-                             isOn: room.camEnabled,
-                             color: .purple) {
+                toggleButton(icon: "video.fill", label: "Cam",
+                             isOn: room.camEnabled, color: .purple) {
                     Task { await room.toggleCam() }
                 }
-                toggleButton(icon: "dot.radiowaves.left.and.right",
-                             label: "Stream",
-                             isOn: room.streamEnabled,
-                             color: .blue) {
+                toggleButton(icon: "dot.radiowaves.left.and.right", label: "Stream",
+                             isOn: room.streamEnabled, color: .blue) {
                     Task { await room.toggleStream() }
                 }
-                toggleButton(icon: room.micEnabled ? "mic.fill" : "mic.slash.fill",
-                             label: "Mic",
-                             isOn: room.micEnabled,
-                             color: .green) {
+                toggleButton(icon: room.micEnabled ? "mic.fill" : "mic.slash.fill", label: "Mic",
+                             isOn: room.micEnabled, color: .green) {
                     Task { await room.toggleMic() }
                 }
-                toggleButton(icon: room.speakerEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill",
-                             label: "Loa",
-                             isOn: room.speakerEnabled,
-                             color: .orange) {
+                toggleButton(icon: room.speakerEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill", label: "Loa",
+                             isOn: room.speakerEnabled, color: .orange) {
                     Task { await room.toggleSpeaker() }
                 }
             }.padding(.horizontal).padding(.vertical, 10)
 
-            // Per-token list
             ScrollView {
                 VStack(spacing: 6) {
                     ForEach(room.tokens.filter { room.selectedTokenIds.contains($0.id) }) { t in
@@ -3329,7 +3295,6 @@ struct RoomRunningView: View {
                 }.padding()
             }
 
-            // Log
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
@@ -3351,7 +3316,6 @@ struct RoomRunningView: View {
                 }
             }
 
-            // Stop
             Button {
                 Task { await room.stopRoom() }
             } label: {
