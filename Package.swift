@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "SpamDiscord",
+    name: "Discord",
     platforms: [
         .iOS(.v16)
     ],
     products: [
-        .executable(name: "SpamDiscord", targets: ["SpamDiscord"])
+        .executable(name: "Discord", targets: ["Discord"])
     ],
     targets: [
         .executableTarget(
-            name: "SpamDiscord",
-            path: "Sources/SpamDiscord"
+            name: "Discord",
+            path: "Sources/Discord"
         )
     ]
 )
