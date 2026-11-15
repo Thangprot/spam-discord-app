@@ -845,11 +845,12 @@ class VoiceRoomClient {
             throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice server missing"])
         }
 
-        // ✅ FIX TRIỆT ĐỂ: Chuẩn hóa endpoint và thử nhiều biến thể URL
+        // ✅ FIX: Chuẩn hóa endpoint và thêm header Origin / User-Agent
         var cleanEp = ep
             .replacingOccurrences(of: "wss://", with: "")
             .replacingOccurrences(of: "https://", with: "")
 
+        // Loại bỏ port :2048 hoặc :443 nếu có
         var portSuffix = ""
         if let colonIdx = cleanEp.lastIndex(of: ":") {
             let afterColon = cleanEp.suffix(from: cleanEp.index(after: colonIdx))
@@ -864,13 +865,22 @@ class VoiceRoomClient {
         log?("Endpoint gốc: \(ep)")
         log?("Endpoint sạch: \(cleanEp) (port: \(portSuffix.isEmpty ? "mặc định" : portSuffix))")
 
+        // Thử cả Voice version 8 (ưu tiên) và 4
         var candidateURLs: [String] = []
-        candidateURLs.append("wss://\(cleanEp)/?v=4")
+        
+        // Các biến thể của v8
         candidateURLs.append("wss://\(cleanEp)/?v=8")
         if !portSuffix.isEmpty {
-            candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=4")
             candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=8")
         }
+        
+        // Các biến thể của v4 (fallback)
+        candidateURLs.append("wss://\(cleanEp)/?v=4")
+        if !portSuffix.isEmpty {
+            candidateURLs.append("wss://\(cleanEp):\(portSuffix)/?v=4")
+        }
+        
+        // Không có version (ít khi dùng)
         candidateURLs.append("wss://\(cleanEp)")
 
         var vws: URLSessionWebSocketTask? = nil
@@ -883,12 +893,20 @@ class VoiceRoomClient {
                 continue
             }
 
-            let task = session.webSocketTask(with: url)
+            // ✅ FIX: Thêm Origin và User-Agent vào URLRequest để tránh bị chặn
+            var req = URLRequest(url: url)
+            req.setValue("https://discord.com", forHTTPHeaderField: "Origin")
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+
+            let task = session.webSocketTask(with: req)
             task.maximumMessageSize = 16 * 1024 * 1024
             task.resume()
 
             do {
-                try await Task.sleep(nanoseconds: 800_000_000)
+                // Đợi 1 giây để socket kết nối xong
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                
+                // Đọc Hello (op 8)
                 let helloMsg = try await recvJSON(task)
                 if let h = helloMsg as? [String: Any], (h["op"] as? Int) == 8 {
                     vws = task
@@ -896,16 +914,18 @@ class VoiceRoomClient {
                     break
                 } else {
                     log?("Phản hồi không phải Hello op 8: \(helloMsg)")
+                    task.cancel(with: .goingAway, reason: nil)
                 }
             } catch {
                 log?("Kết nối thất bại: \(error.localizedDescription)")
                 lastError = error
+                task.cancel(with: .goingAway, reason: nil)
             }
         }
 
         guard let voiceSocket = vws else {
             throw NSError(domain: "Room", code: -1,
-                          userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS. Thử lại sau. Lỗi cuối: \(lastError?.localizedDescription ?? "unknown")"])
+                          userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS. Lỗi cuối: \(lastError?.localizedDescription ?? "unknown")"])
         }
         voiceWS = voiceSocket
 
