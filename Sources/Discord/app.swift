@@ -1635,12 +1635,59 @@ final class IndexBox: @unchecked Sendable {
 }
 
 // ==========================================
-// MARK: - USERNAME CHECKER
+// MARK: - USERNAME CHECKER (AUTO-GEN)
 // ==========================================
 struct UsernameResult: Identifiable {
     let id = UUID()
     let username: String
     let exists: Bool      // true = đã tồn tại (đỏ), false = trống (xanh)
+}
+
+/// Sinh username tự động — an toàn concurrent (actor).
+actor UsernameGenerator {
+    let lengthMode: Int              // 0 = 3&4, 3 = chỉ 3, 4 = chỉ 4
+    private var seen: Set<String>
+    private let letters: [Character] = Array("abcdefghijklmnopqrstuvwxyz")
+    private let allChars: [Character] = Array("abcdefghijklmnopqrstuvwxyz0123456789_.")
+
+    init(lengthMode: Int, preexisting: Set<String>) {
+        self.lengthMode = lengthMode
+        self.seen = preexisting
+    }
+
+    /// Trả nil nếu đã thử quá nhiều lần (không gian gần cạn — cực hiếm).
+    func next() -> String? {
+        for _ in 0..<5000 {
+            let n: Int
+            if lengthMode == 3 { n = 3 }
+            else if lengthMode == 4 { n = 4 }
+            else { n = Int.random(in: 3...4) }
+
+            var chars: [Character] = []
+            chars.reserveCapacity(n)
+            var hasLetter = false
+            for i in 0..<n {
+                if i == n - 1 && !hasLetter {
+                    chars.append(letters.randomElement()!)
+                    hasLetter = true
+                } else {
+                    let c = allChars.randomElement()!
+                    chars.append(c)
+                    if c.isLetter { hasLetter = true }
+                }
+            }
+            let u = String(chars)
+            if !seen.contains(u) {
+                seen.insert(u)
+                return u
+            }
+        }
+        return nil
+    }
+
+    func release(_ u: String) { seen.remove(u) }
+    func markSeen(_ u: String) { seen.insert(u) }
+    func seenCount() -> Int { seen.count }
 }
 
 struct ProxyInfo {
@@ -1654,14 +1701,12 @@ struct ProxyInfo {
     /// ✅ iOS CHỈ hỗ trợ HTTP proxy — từ chối scheme socks.
     static func parse(_ raw: String) -> ProxyInfo? {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // CHỈ 1 proxy: từ chối nếu có xuống dòng
         guard !s.isEmpty, !s.contains("\n") else { return nil }
         var scheme = "http"
         if let r = s.range(of: "://") {
             scheme = String(s[..<r.lowerBound]).lowercased()
             s = String(s[r.upperBound...])
         }
-        // ✅ iOS chỉ hỗ trợ HTTP/HTTPS proxy qua connectionProxyDictionary
         guard scheme == "http" || scheme == "https" else { return nil }
         var user: String? = nil
         var pass: String? = nil
@@ -1689,7 +1734,6 @@ final class ProxyAuthDelegate: NSObject, URLSessionTaskDelegate {
                     didReceive challenge: URLAuthenticationChallenge) async
         -> (URLSession.AuthChallengeDisposition, URLCredential?) {
         let m = challenge.protectionSpace.authenticationMethod
-        // ✅ iOS: chỉ Basic/Digest (bỏ NSURLAuthenticationMethodProxy vì macOS-only)
         if m == NSURLAuthenticationMethodHTTPBasic ||
            m == NSURLAuthenticationMethodHTTPDigest {
             if let u = username, let p = password {
@@ -1700,44 +1744,48 @@ final class ProxyAuthDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
-actor RateLimiter {
-    private let interval: TimeInterval
-    private var nextAllowed: Date = .distantPast
-    init(rqPerSecond: Double) { interval = rqPerSecond > 0 ? 1.0 / rqPerSecond : 0 }
-    func acquire() async {
-        let now = Date()
-        if nextAllowed > now {
-            let wait = nextAllowed.timeIntervalSince(now)
-            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
-        }
-        nextAllowed = Date().addingTimeInterval(interval)
-    }
-}
-
 @MainActor
 final class UsernameCheckerManager: ObservableObject {
-    @Published var inputText = ""
+    // MARK: - Config (user nhập)
     @Published var proxyRaw = ""
-    @Published var threadCount = 4
-    @Published var rqPerSecond: Double = 5
-    @Published var exactLength = 0            // 0 = không lọc
-    @Published var results: [UsernameResult] = []
+    @Published var threadCount = 100
+    @Published var lengthMode = 0        // 0 = 3&4, 3 = chỉ 3, 4 = chỉ 4
+
+    // MARK: - Runtime
     @Published var isRunning = false
-    @Published var showOnlyAvailable = false
     @Published var checkedCount = 0
     @Published var availableCount = 0
+    @Published var requestCount = 0
+    @Published var rateLimitCount = 0
     @Published var currentUsername = ""
-    @Published var lastError: String?
+    @Published var availableUsernames: [String] = []
+    @Published var recentChecked: [UsernameResult] = []
     @Published var proxyValid = false
     @Published var notifGranted = false
+    @Published var lastError: String?
+    @Published var startTime: Date?
 
     private var task: Task<Void, Never>?
     private var lastNPUpdate = Date.distantPast
 
-    var displayedResults: [UsernameResult] {
-        showOnlyAvailable ? results.filter { !$0.exists } : results
+    // Delay cố định y hệt Python (POST_DELAY_MS = 10, JITTER_MS = 50)
+    private let postDelayMs = 10
+    private let jitterMs = 50
+
+    // MARK: - Files
+    private var checkedFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("checked_usernames.txt")
     }
-    var existsCount: Int { results.filter { $0.exists }.count }
+    private var availableFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("available_usernames.txt")
+    }
+
+    // MARK: - Computed
+    var existsCount: Int { max(0, checkedCount - availableCount) }
+    var elapsed: TimeInterval { startTime.map { Date().timeIntervalSince($0) } ?? 0 }
+    var rps: Double { elapsed > 0 ? Double(requestCount) / elapsed : 0 }
 
     func validateProxy() { proxyValid = ProxyInfo.parse(proxyRaw) != nil }
 
@@ -1747,79 +1795,58 @@ final class UsernameCheckerManager: ObservableObject {
         }
     }
 
-    /// Sinh 50 username random đúng độ dài đã nhập
-    func generateRandomUsernames() {
-        guard (2...32).contains(exactLength) else {
-            lastError = "Độ dài phải từ 2 đến 32"; return
-        }
-        let chars = Array("abcdefghijklmnopqrstuvwxyz0123456789")
-        var lines: [String] = []
-        for _ in 0..<50 {
-            var s = ""
-            for _ in 0..<exactLength { s.append(chars.randomElement()!) }
-            lines.append(s)
-        }
-        inputText = lines.joined(separator: "\n")
-        lastError = nil
-    }
-
+    // MARK: - Start / Stop
     func start() {
         guard !isRunning else { return }
         guard let proxy = ProxyInfo.parse(proxyRaw) else {
-            lastError = "Proxy không hợp lệ. iOS chỉ hỗ trợ HTTP proxy (host:port:user:pass). Không hỗ trợ SOCKS."
+            lastError = "Proxy không hợp lệ. iOS chỉ hỗ trợ HTTP proxy (host:port:user:pass)"
             return
         }
-        var names = inputText
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        if exactLength > 0 { names = names.filter { $0.count == exactLength } }
-        guard !names.isEmpty else { lastError = "Không có username để check"; return }
 
-        results = []; checkedCount = 0; availableCount = 0
-        currentUsername = ""; lastError = nil; isRunning = true
+        // Nạp dữ liệu cũ để tránh check lại
+        let preexisting = loadSeenFromFiles()
+        availableUsernames = loadAvailableFromFile()
 
+        let gen = UsernameGenerator(lengthMode: lengthMode, preexisting: preexisting)
+        let threads = max(1, min(threadCount, 500))
         let session = makeProxySession(proxy: proxy)
-        let limiter = RateLimiter(rqPerSecond: rqPerSecond)
+
+        checkedCount = 0
+        availableCount = 0
+        requestCount = 0
+        rateLimitCount = 0
+        currentUsername = ""
+        recentChecked = []
+        lastError = nil
+        startTime = Date()
+        isRunning = true
+
+        ensureFilesExist()
 
         BackgroundManager.shared.start()
         NowPlayingHelper.shared.start(onStop: { [weak self] in
             Task { @MainActor in self?.stop() }
         })
-        NowPlayingHelper.shared.update(title: "Username Checker", detail: "Đang chuẩn bị...")
+        NowPlayingHelper.shared.update(title: "Username Checker", detail: "Đang khởi động...")
 
-        let threads = max(1, min(threadCount, 32))
-        let box = IndexBox()
-        let manager = self
+        let delayMs = self.postDelayMs
+        let jitterMs = self.jitterMs
 
-        task = Task {
+        task = Task { [weak self] in
+            guard let self = self else { return }
             await withTaskGroup(of: Void.self) { group in
                 for _ in 0..<threads {
-                    group.addTask {
-                        while !Task.isCancelled {
-                            let i = box.next()
-                            if i >= names.count { break }
-                            let name = names[i]
-                            await limiter.acquire()
-                            let res = await manager.checkOne(username: name, session: session)
-                            await MainActor.run {
-                                manager.checkedCount += 1
-                                manager.currentUsername = name
-                                if let exists = res {
-                                    manager.results.append(UsernameResult(username: name, exists: exists))
-                                    if !exists {
-                                        manager.availableCount += 1
-                                        manager.notifyAvailable(name)
-                                    }
-                                }
-                                manager.updateNP()
-                            }
-                        }
+                    group.addTask { [weak self] in
+                        guard let self = self else { return }
+                        await self.workerLoop(
+                            gen: gen, session: session,
+                            delayMs: delayMs, jitterMs: jitterMs
+                        )
                     }
                 }
             }
             await MainActor.run {
-                manager.isRunning = false
+                self.isRunning = false
                 BackgroundManager.shared.stop()
                 NowPlayingHelper.shared.stop()
             }
@@ -1827,58 +1854,103 @@ final class UsernameCheckerManager: ObservableObject {
     }
 
     func stop() {
-        task?.cancel(); task = nil
+        task?.cancel()
+        task = nil
         isRunning = false
         BackgroundManager.shared.stop()
         NowPlayingHelper.shared.stop()
     }
 
-    private func checkOne(username: String, session: URLSession) async -> Bool? {
-        guard let url = URL(string: "https://discord.com/api/v9/auth/register") else { return nil }
+    // MARK: - Worker loop (chạy mãi đến khi user dừng)
+    private nonisolated func workerLoop(
+        gen: UsernameGenerator,
+        session: URLSession,
+        delayMs: Int,
+        jitterMs: Int
+    ) async {
+        while !Task.isCancelled {
+            guard let username = await gen.next() else {
+                // Không gian tên gần cạn — chờ một nhịp
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                continue
+            }
+
+            let result = await checkOne(username: username, session: session)
+
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                self.requestCount += 1
+                self.currentUsername = username
+
+                if let exists = result {
+                    self.checkedCount += 1
+                    if !exists {
+                        self.availableCount += 1
+                        self.availableUsernames.append(username)
+                        self.appendToFile(self.availableFileURL, username)
+                        self.notifyAvailable(username)
+                    }
+                    self.appendToFile(self.checkedFileURL, username)
+
+                    let r = UsernameResult(username: username, exists: exists)
+                    self.recentChecked.insert(r, at: 0)
+                    if self.recentChecked.count > 500 {
+                        self.recentChecked.removeLast(self.recentChecked.count - 500)
+                    }
+                } else {
+                    // Check thất bại → nhả username để lần sau thử lại
+                    Task { await gen.release(username) }
+                }
+                self.updateNP()
+            }
+
+            let d = Double(delayMs + Int.random(in: 0...jitterMs)) / 1000.0
+            try? await Task.sleep(nanoseconds: UInt64(d * 1_000_000_000))
+        }
+    }
+
+    // MARK: - Check 1 username
+    private nonisolated func checkOne(username: String, session: URLSession) async -> Bool? {
+        guard let url = URL(string: "https://discord.com/api/v9/unique-username/username-attempt-unauthed") else {
+            return nil
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.timeoutInterval = 20
-        let body: [String: Any] = [
-            "consent": true,
-            "fingerprint": randomFingerprint(),
-            "username": username,
-            "gift_code_sku_id": NSNull(),
-            "captcha_key": NSNull()
-        ]
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        req.timeoutInterval = 10
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["username": username])
+
         do {
             let (data, resp) = try await session.data(for: req)
             guard let http = resp as? HTTPURLResponse else { return nil }
-            if http.statusCode == 429 { return nil }
-            if http.statusCode == 200 { return true }
+
+            if http.statusCode == 429 {
+                await MainActor.run { [weak self] in self?.rateLimitCount += 1 }
+                // Proxy tĩnh: nghỉ 1s cho gateway xoay IP (giống Python)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                return nil
+            }
+            guard http.statusCode == 200 else { return nil }
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return nil
             }
-            if let errs = json["username"] as? [String], !errs.isEmpty {
-                let j = errs.joined(separator: " ").lowercased()
-                if j.contains("taken") || j.contains("already") { return true }
-                return nil
-            }
-            // Không có lỗi username → chỉ bị captcha → username TRỐNG
-            return false
-        } catch { return nil }
+            if let taken = json["taken"] as? Bool { return taken }
+            return nil
+        } catch {
+            return nil
+        }
     }
 
+    // MARK: - Proxy session
     private func makeProxySession(proxy: ProxyInfo) -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 20
-        cfg.timeoutIntervalForResource = 30
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = 15
+        cfg.httpMaximumConnectionsPerHost = 200
         cfg.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Content-Type": "application/json",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Origin": "https://discord.com",
-            "Referer": "https://discord.com/register"
+            "Accept": "*/*"
         ]
-        // ✅ iOS chỉ hỗ trợ HTTP proxy (kCFNetworkProxiesHTTPxxx).
-        // Không có kCFNetworkProxiesHTTPSxxx / SOCKSxxx trên iOS —
-        // HTTPS requests vẫn đi qua HTTP proxy bằng CONNECT tunnel.
         var d: [AnyHashable: Any] = [:]
         d[kCFNetworkProxiesHTTPEnable as String] = 1
         d[kCFNetworkProxiesHTTPProxy as String] = proxy.host
@@ -1889,19 +1961,14 @@ final class UsernameCheckerManager: ObservableObject {
         return URLSession(configuration: cfg, delegate: del, delegateQueue: nil)
     }
 
-    private func randomFingerprint() -> String {
-        var b = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, b.count, &b)
-        return b.map { String(format: "%02x", $0) }.joined()
-    }
-
+    // MARK: - Now Playing / Notifications
     private func notifyAvailable(_ name: String) {
         NowPlayingHelper.shared.update(
             title: "🎯 Trống: \(name)",
-            detail: "\(availableCount) trống / \(checkedCount) đã check"
+            detail: "\(availableCount) available / \(checkedCount) checked"
         )
         let c = UNMutableNotificationContent()
-        c.title = "✅ Username trống"
+        c.title = "✅ Username available"
         c.body = name
         c.sound = .default
         let r = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
@@ -1913,9 +1980,47 @@ final class UsernameCheckerManager: ObservableObject {
         guard now.timeIntervalSince(lastNPUpdate) >= 0.5 else { return }
         lastNPUpdate = now
         NowPlayingHelper.shared.update(
-            title: "Check \(checkedCount) · Trống \(availableCount)",
-            detail: "Đang: \(currentUsername)"
+            title: "Check \(checkedCount) · Available \(availableCount)",
+            detail: String(format: "RPS %.1f · Đang: %@", rps, currentUsername)
         )
+    }
+
+    // MARK: - Persistence
+    private func ensureFilesExist() {
+        for url in [checkedFileURL, availableFileURL] {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+        }
+    }
+
+    private func loadSeenFromFiles() -> Set<String> {
+        var s = Set<String>()
+        for url in [checkedFileURL, availableFileURL] {
+            if let content = try? String(contentsOf: url, encoding: .utf8) {
+                for line in content.split(separator: "\n") {
+                    let u = String(line).trimmingCharacters(in: .whitespaces)
+                    if !u.isEmpty { s.insert(u) }
+                }
+            }
+        }
+        return s
+    }
+
+    private func loadAvailableFromFile() -> [String] {
+        guard let content = try? String(contentsOf: availableFileURL, encoding: .utf8) else { return [] }
+        return content.split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func appendToFile(_ url: URL, _ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        }
     }
 }
 
@@ -2364,43 +2469,35 @@ struct UsernameCheckerView: View {
             ScrollView {
                 VStack(spacing: 14) {
 
+                    // Stats hàng 1
                     HStack(spacing: 10) {
-                        StatCard(title: "Đã check", value: "\(checker.checkedCount)", color: .indigo)
-                        StatCard(title: "Trống", value: "\(checker.availableCount)", color: .green)
-                        StatCard(title: "Tồn tại", value: "\(checker.existsCount)", color: .red)
+                        StatCard(title: "Checked", value: "\(checker.checkedCount)", color: .indigo)
+                        StatCard(title: "Available", value: "\(checker.availableCount)", color: .green)
+                        StatCard(title: "Taken", value: "\(checker.existsCount)", color: .red)
+                    }
+                    // Stats hàng 2
+                    HStack(spacing: 10) {
+                        StatCard(title: "RPS", value: String(format: "%.1f", checker.rps), color: .purple)
+                        StatCard(title: "429", value: "\(checker.rateLimitCount)", color: .orange)
+                        StatCard(title: "Thời gian", value: "\(Int(checker.elapsed))s", color: .gray)
                     }
 
+                    // Độ dài username
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("USERNAME (mỗi dòng 1 cái)")
-                            .font(.caption.bold()).foregroundStyle(.secondary)
-                        TextEditor(text: $checker.inputText)
-                            .frame(height: 110).padding(8)
-                            .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
-                        HStack {
-                            Button("Tạo random") { checker.generateRandomUsernames() }
-                                .font(.caption.bold()).foregroundStyle(.indigo)
-                            Spacer()
-                            Button("Xoá") { checker.inputText = "" }
-                                .font(.caption.bold()).foregroundStyle(.red)
+                        Text("ĐỘ DÀI USERNAME").font(.caption.bold()).foregroundStyle(.secondary)
+                        Picker("", selection: $checker.lengthMode) {
+                            Text("3 ký tự").tag(3)
+                            Text("4 ký tự").tag(4)
+                            Text("Cả 3 & 4").tag(0)
                         }
-                    }
-                    .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Độ dài username").font(.subheadline)
-                            Spacer()
-                            TextField("0", value: $checker.exactLength, format: .number)
-                                .keyboardType(.numberPad)
-                                .multilineTextAlignment(.trailing)
-                                .frame(width: 70).padding(8)
-                                .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
-                        }
-                        Text("0 = không lọc. Nút Random sẽ tạo username đúng độ dài này.")
+                        .pickerStyle(.segmented)
+                        .disabled(checker.isRunning)
+                        Text("Chỉ a-z, 0-9, _ và . (phải có ít nhất 1 chữ cái)")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                     .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
 
+                    // Proxy
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
                             Text("PROXY (chỉ 1 proxy)").font(.caption.bold()).foregroundStyle(.secondary)
@@ -2410,8 +2507,7 @@ struct UsernameCheckerView: View {
                                     UIApplication.shared.open(url)
                                 }
                             } label: {
-                                Label("Mua proxy", systemImage: "cart.fill")
-                                    .font(.caption.bold())
+                                Label("Mua proxy", systemImage: "cart.fill").font(.caption.bold())
                             }
                         }
                         TextField("host:port:user:pass  (HTTP proxy)", text: $checker.proxyRaw)
@@ -2420,6 +2516,7 @@ struct UsernameCheckerView: View {
                             .padding(10)
                             .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(10)
                             .onChange(of: checker.proxyRaw) { _ in checker.validateProxy() }
+                            .disabled(checker.isRunning)
                         if !checker.proxyRaw.isEmpty {
                             Text(checker.proxyValid ? "✅ Proxy hợp lệ" : "❌ Proxy sai định dạng (chỉ hỗ trợ HTTP)")
                                 .font(.caption2)
@@ -2428,25 +2525,21 @@ struct UsernameCheckerView: View {
                     }
                     .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
 
+                    // Số luồng
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Text("Số luồng").font(.subheadline)
                             Spacer()
-                            Stepper("\(checker.threadCount)", value: $checker.threadCount, in: 1...32)
+                            Stepper("\(checker.threadCount)", value: $checker.threadCount, in: 1...500)
                                 .fixedSize()
+                                .disabled(checker.isRunning)
                         }
-                        HStack {
-                            Text("Requests/giây").font(.subheadline)
-                            Spacer()
-                            TextField("5", value: $checker.rqPerSecond, format: .number)
-                                .keyboardType(.decimalPad)
-                                .multilineTextAlignment(.trailing)
-                                .frame(width: 70).padding(8)
-                                .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
-                        }
+                        Text("Khuyến nghị 100-300 với proxy tĩnh. Delay 10-60ms mỗi request.")
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                     .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
 
+                    // Start/Stop
                     Button {
                         checker.isRunning ? checker.stop() : checker.start()
                     } label: {
@@ -2462,36 +2555,64 @@ struct UsernameCheckerView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
+                    // Copy available
                     HStack {
-                        Toggle("Chỉ username chưa tồn tại", isOn: $checker.showOnlyAvailable)
+                        Text("Available (\(checker.availableUsernames.count))")
                             .font(.caption.bold())
                         Spacer()
                         Button {
-                            let names = checker.displayedResults.filter { !$0.exists }.map { $0.username }
-                            UIPasteboard.general.string = names.joined(separator: "\n")
+                            UIPasteboard.general.string = checker.availableUsernames.joined(separator: "\n")
                         } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                                .font(.caption.bold())
+                            Label("Copy all", systemImage: "doc.on.doc").font(.caption.bold())
                         }
-                        .disabled(checker.results.isEmpty)
+                        .disabled(checker.availableUsernames.isEmpty)
                     }
                     .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
 
-                    LazyVStack(spacing: 6) {
-                        ForEach(checker.displayedResults) { r in
-                            HStack {
-                                Image(systemName: r.exists ? "xmark.circle.fill" : "checkmark.circle.fill")
-                                    .foregroundStyle(r.exists ? .red : .green)
-                                Text(r.username)
-                                    .font(.system(.subheadline, design: .monospaced))
-                                Spacer()
-                                Text(r.exists ? "Tồn tại" : "Trống")
-                                    .font(.caption2).bold()
-                                    .foregroundStyle(r.exists ? .red : .green)
+                    // Danh sách username trống (mới nhất ở trên)
+                    if !checker.availableUsernames.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("USERNAME TRỐNG").font(.caption.bold()).foregroundStyle(.secondary)
+                            LazyVStack(spacing: 6) {
+                                ForEach(Array(checker.availableUsernames.reversed().prefix(200)), id: \.self) { u in
+                                    HStack {
+                                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                                        Text(u).font(.system(.subheadline, design: .monospaced))
+                                        Spacer()
+                                        Button {
+                                            UIPasteboard.general.string = u
+                                        } label: {
+                                            Image(systemName: "doc.on.doc").font(.caption)
+                                        }
+                                    }
+                                    .padding(8)
+                                    .background(Color.green.opacity(0.08)).cornerRadius(8)
+                                }
                             }
-                            .padding(10)
-                            .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
                         }
+                        .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
+                    }
+
+                    // Recent checked (đỏ/xanh)
+                    if !checker.recentChecked.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("GẦN ĐÂY").font(.caption.bold()).foregroundStyle(.secondary)
+                            LazyVStack(spacing: 4) {
+                                ForEach(checker.recentChecked.prefix(50)) { r in
+                                    HStack {
+                                        Image(systemName: r.exists ? "xmark.circle.fill" : "checkmark.circle.fill")
+                                            .foregroundStyle(r.exists ? .red : .green)
+                                        Text(r.username).font(.system(.caption, design: .monospaced))
+                                        Spacer()
+                                        Text(r.exists ? "tồn tại" : "trống")
+                                            .font(.caption2)
+                                            .foregroundStyle(r.exists ? .red : .green)
+                                    }
+                                    .padding(.horizontal, 8).padding(.vertical, 4)
+                                }
+                            }
+                        }
+                        .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(14)
                     }
                 }
                 .padding()
