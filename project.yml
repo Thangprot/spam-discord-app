@@ -14,10 +14,8 @@ targets:
     type: application
     platform: iOS
     sources:
-      # Đường dẫn chứa code Swift (đảm bảo đúng chữ hoa/thường)
       - path: Sources/discord
-      # Đường dẫn chứa Logo
-      - path: Assets.xcassets
+      - path: Assets.xcassets 
     settings:
       base:
         INFOPLIST_FILE: info.plist
