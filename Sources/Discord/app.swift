@@ -206,6 +206,11 @@ final class NowPlayingHelper {
     func start(onStop: (() -> Void)? = nil) {
         isActive = true
         onStopCB = onStop
+
+        // 1) Nhận sự kiện từ tai nghe / lock screen
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+
+        // 2) Cấu hình remote command center
         let cc = MPRemoteCommandCenter.shared()
         cc.playCommand.isEnabled = false
         cc.nextTrackCommand.isEnabled = false
@@ -213,17 +218,25 @@ final class NowPlayingHelper {
         cc.togglePlayPauseCommand.isEnabled = false
         cc.pauseCommand.removeTarget(nil)
         cc.stopCommand.removeTarget(nil)
-        cc.pauseCommand.isEnabled = (onStop != nil)
-        cc.stopCommand.isEnabled = (onStop != nil)
+
         if onStop != nil {
+            cc.pauseCommand.isEnabled = true
+            cc.stopCommand.isEnabled = true
             let handler: (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus = { [weak self] _ in
-                self?.onStopCB?()
+                DispatchQueue.main.async { self?.onStopCB?() }
                 return .success
             }
             cc.pauseCommand.addTarget(handler: handler)
             cc.stopCommand.addTarget(handler: handler)
+        } else {
+            cc.pauseCommand.isEnabled = false
+            cc.stopCommand.isEnabled = false
         }
-        update(title: "Quoc Thang Tools", detail: "Đang chuẩn bị...")
+
+        // 3) Đợi audio thực sự play rồi mới set Now Playing
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.update(title: "Quoc Thang Tools", detail: "Đang chuẩn bị...")
+        }
     }
 
     func update(title: String, detail: String) {
@@ -232,51 +245,102 @@ final class NowPlayingHelper {
         info[MPMediaItemPropertyTitle] = title
         info[MPMediaItemPropertyArtist] = detail
         info[MPMediaItemPropertyAlbumTitle] = "Quoc Thang Tools"
+        info[MPMediaItemPropertyPlaybackDuration] = 0
         info[MPNowPlayingInfoPropertyIsLiveStream] = true
         info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
-        info[MPMediaItemPropertyPlaybackDuration] = 0
+        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        if #available(iOS 16.0, *) {
+            MPNowPlayingInfoCenter.default().playbackState = .playing
+        }
+        print("[NP] Updated: \(title) — \(detail)")
     }
 
     func stop() {
         isActive = false
         onStopCB = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        if #available(iOS 16.0, *) {
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+        }
+        UIApplication.shared.endReceivingRemoteControlEvents()
+        print("[NP] Stopped")
     }
 }
 
 // ==========================================
-// MARK: - BACKGROUND
+// MARK: - BACKGROUND (Audio câm, mẫu khác 0)
 // ==========================================
 class BackgroundManager {
     static let shared = BackgroundManager()
     private var audioPlayer: AVAudioPlayer?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
+
     func start() {
-        bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in self?.stop() }
+        if bgTask == .invalid {
+            bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in
+                self?.stop()
+            }
+        }
+
         do {
-            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try AVAudioSession.sharedInstance().setActive(true)
-            let sr = 8000, ds = sr * 2
-            var h = Data(); h.append(contentsOf: [0x52,0x49,0x46,0x46])
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default,
+                                    options: [.mixWithOthers, .duckOthers])
+            try session.setActive(true, options: [])
+            print("[BG] Audio session OK")
+        } catch {
+            print("[BG] AVAudioSession FAIL: \(error)")
+        }
+
+        if audioPlayer?.isPlaying == true { return }
+
+        do {
+            let sr: UInt32 = 8000
+            let numSamples = Int(sr)
+            let ds = numSamples * 2
+
+            var h = Data()
+            h.append(contentsOf: [0x52,0x49,0x46,0x46])                       // "RIFF"
             var cs = UInt32(36 + ds).littleEndian; h.append(Data(bytes: &cs, count: 4))
-            h.append(contentsOf: [0x57,0x41,0x56,0x45,0x66,0x6d,0x74,0x20])
+            h.append(contentsOf: [0x57,0x41,0x56,0x45,0x66,0x6d,0x74,0x20])   // "WAVEfmt "
             var s1 = UInt32(16).littleEndian; h.append(Data(bytes: &s1, count: 4))
-            var af = UInt16(1).littleEndian; h.append(Data(bytes: &af, count: 2))
-            var nc = UInt16(1).littleEndian; h.append(Data(bytes: &nc, count: 2))
-            var sl = UInt32(sr).littleEndian; h.append(Data(bytes: &sl, count: 4))
-            var br = UInt32(sr*2).littleEndian; h.append(Data(bytes: &br, count: 4))
-            var ba = UInt16(2).littleEndian; h.append(Data(bytes: &ba, count: 2))
+            var af = UInt16(1).littleEndian;  h.append(Data(bytes: &af, count: 2))  // PCM
+            var nc = UInt16(1).littleEndian;  h.append(Data(bytes: &nc, count: 2))  // mono
+            var sl = sr.littleEndian;         h.append(Data(bytes: &sl, count: 4))  // sample rate
+            var br = UInt32(sr * 2).littleEndian; h.append(Data(bytes: &br, count: 4))
+            var ba = UInt16(2).littleEndian;  h.append(Data(bytes: &ba, count: 2))
             var bp = UInt16(16).littleEndian; h.append(Data(bytes: &bp, count: 2))
-            h.append(contentsOf: [0x64,0x61,0x74,0x61])
+            h.append(contentsOf: [0x64,0x61,0x74,0x61])                       // "data"
             var dc = UInt32(ds).littleEndian; h.append(Data(bytes: &dc, count: 4))
-            audioPlayer = try AVAudioPlayer(data: h + Data(repeating: 0, count: ds))
-            audioPlayer?.numberOfLoops = -1; audioPlayer?.play()
-        } catch {}
+
+            // Mẫu = 1 (gần như im lặng -90dB) → iOS coi là audio THẬT
+            var audioData = Data(count: ds)
+            for i in stride(from: 0, to: ds, by: 2) {
+                audioData[i] = 1
+                audioData[i + 1] = 0
+            }
+
+            let player = try AVAudioPlayer(data: h + audioData)
+            player.numberOfLoops = -1
+            player.volume = 0.01
+            player.prepareToPlay()
+            let ok = player.play()
+            audioPlayer = player
+            print("[BG] AVAudioPlayer playing: \(ok)")
+        } catch {
+            print("[BG] AVAudioPlayer FAIL: \(error)")
+        }
     }
+
     func stop() {
-        audioPlayer?.stop(); audioPlayer = nil
-        if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask); bgTask = .invalid }
+        audioPlayer?.stop()
+        audioPlayer = nil
+        if bgTask != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
     }
 }
 
@@ -2564,7 +2628,6 @@ struct NukeOptionsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                // Header
                 HStack(spacing: 12) {
                     if let icon = guild.icon, let url = URL(string: "https://cdn.discordapp.com/icons/\(guild.id)/\(icon).png?size=64") {
                         AsyncImage(url: url) { img in img.resizable().scaledToFill() }
@@ -2581,7 +2644,6 @@ struct NukeOptionsView: View {
                     } label: { Image(systemName: "xmark.circle.fill").font(.title3).foregroundStyle(.gray) }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
-                // Steps
                 VStack(alignment: .leading, spacing: 10) {
                     Text("CHỌN HÀNH ĐỘNG").font(.caption).bold().foregroundStyle(.secondary)
                     ForEach(NukeStepType.allCases) { step in
@@ -2606,7 +2668,6 @@ struct NukeOptionsView: View {
                     }
                 }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
 
-                // Step-specific config
                 if options.enabledSteps.contains(.massBan) {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("MASS BAN").font(.caption).bold().foregroundStyle(.secondary)
@@ -2849,7 +2910,6 @@ struct UserNukeView: View {
 
     private var userGuildListView: some View {
         VStack(spacing: 0) {
-            // Token list
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("TOKEN (\(userNuke.selectedTokenIds.count)/\(userNuke.tokens.count))")
