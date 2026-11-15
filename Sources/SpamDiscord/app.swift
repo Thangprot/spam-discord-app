@@ -1301,16 +1301,26 @@ final class IndexBox: @unchecked Sendable {
 // MARK: - LICENSE API
 // ==========================================
 struct LicenseActivationResponse: Codable {
-    let valid: Bool
+    let valid: Bool?
     let expiresAt: Int64?
     let message: String?
     let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case valid, message, error
+        case expiresAt = "expires_at"
+    }
 }
 
 struct LicenseValidationResponse: Codable {
-    let valid: Bool
+    let valid: Bool?
     let expiresAt: Int64?
     let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case valid, error
+        case expiresAt = "expires_at"
+    }
 }
 
 enum LicenseStatus: Equatable {
@@ -1325,7 +1335,7 @@ final class LicenseAPIClient {
     static let shared = LicenseAPIClient()
 
     // ⚠️ ĐỔI URL NÀY thành URL Worker của bạn
-    let baseURL = "https://key.nqtaff01.workers.dev/"
+    let baseURL = "https://key.nqtaf01.workers.dev"
 
     private func machineID() -> String {
         let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? "unknown")-\(Bundle.main.bundleIdentifier ?? "app")"
@@ -1363,11 +1373,13 @@ final class LicenseManager: ObservableObject {
 
     @Published var status: LicenseStatus = .notActivated
     @Published var licenseKey: String? = nil
+    @Published var activatedAt: Date? = UserDefaults.standard.object(forKey: "QT_LicenseActivatedAt") as? Date
     @Published var isChecking = false
 
     private let keyStoreKey = "QT_LicenseKey_Server"
     private let expiryStoreKey = "QT_LicenseExpiry"
     private let lastCheckKey = "QT_LicenseLastCheck"
+    private let activatedStoreKey = "QT_LicenseActivatedAt"
 
     init() {
         self.licenseKey = UserDefaults.standard.string(forKey: keyStoreKey)
@@ -1391,12 +1403,17 @@ final class LicenseManager: ObservableObject {
         defer { isChecking = false }
         do {
             let res = try await LicenseAPIClient.shared.activate(key: clean)
-            if res.valid, let expMs = res.expiresAt {
+            if res.valid == true, let expMs = res.expiresAt {
                 let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
+                let now = Date()
+                
                 UserDefaults.standard.set(clean, forKey: keyStoreKey)
                 UserDefaults.standard.set(exp, forKey: expiryStoreKey)
-                UserDefaults.standard.set(Date(), forKey: lastCheckKey)
+                UserDefaults.standard.set(now, forKey: lastCheckKey)
+                UserDefaults.standard.set(now, forKey: activatedStoreKey)
+                
                 licenseKey = clean
+                activatedAt = now
                 status = .valid(expiresOn: exp)
                 return status
             } else {
@@ -1419,7 +1436,7 @@ final class LicenseManager: ObservableObject {
 
         do {
             let res = try await LicenseAPIClient.shared.validate(key: key)
-            if res.valid, let expMs = res.expiresAt {
+            if res.valid == true, let expMs = res.expiresAt {
                 let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
                 UserDefaults.standard.set(exp, forKey: expiryStoreKey)
                 UserDefaults.standard.set(Date(), forKey: lastCheckKey)
@@ -1446,7 +1463,9 @@ final class LicenseManager: ObservableObject {
         UserDefaults.standard.removeObject(forKey: keyStoreKey)
         UserDefaults.standard.removeObject(forKey: expiryStoreKey)
         UserDefaults.standard.removeObject(forKey: lastCheckKey)
+        UserDefaults.standard.removeObject(forKey: activatedStoreKey)
         licenseKey = nil
+        activatedAt = nil
         status = .notActivated
     }
 
@@ -1465,7 +1484,7 @@ final class LicenseManager: ObservableObject {
         }
     }
 
-    private func formatDate(_ d: Date) -> String {
+    func formatDate(_ d: Date) -> String {
         let df = DateFormatter()
         df.dateFormat = "dd/MM/yyyy"
         return df.string(from: d)
@@ -1692,6 +1711,152 @@ struct LicenseAdminInfoView: View {
 }
 
 // ==========================================
+// MARK: - ABOUT / INFO VIEW
+// ==========================================
+struct AboutView: View {
+    @EnvironmentObject var license: LicenseManager
+    @State private var showFullKey = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 20) {
+                    
+                    // MARK: License Card
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("LICENSE INFORMATION")
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                        
+                        HStack {
+                            Text("License Key")
+                                .font(.subheadline)
+                            Spacer()
+                            Text(maskedKey)
+                                .font(.system(.subheadline, design: .monospaced))
+                                .foregroundStyle(.indigo)
+                            
+                            Toggle("", isOn: $showFullKey)
+                                .labelsHidden()
+                                .tint(.indigo)
+                                .scaleEffect(0.8)
+                        }
+                        Divider()
+                        
+                        HStack {
+                            Text("Activated On")
+                                .font(.subheadline)
+                            Spacer()
+                            Text(license.activatedAt != nil ? license.formatDate(license.activatedAt!) : "N/A")
+                                .font(.subheadline.bold())
+                                .foregroundStyle(.secondary)
+                        }
+                        Divider()
+                        
+                        HStack {
+                            Text("Expires On")
+                                .font(.subheadline)
+                            Spacer()
+                            if case .valid(let exp) = license.status {
+                                Text(license.formatDate(exp))
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(.green)
+                            } else if case .expired(let exp) = license.status {
+                                Text(license.formatDate(exp))
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(.red)
+                            } else {
+                                Text("N/A")
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding()
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(15)
+                    
+                    // MARK: App Info Card
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundStyle(.blue)
+                            Text("About This App")
+                                .font(.headline)
+                        }
+                        
+                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning, and Voice Room integration. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(15)
+                    
+                    // MARK: Admin Info Card
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Image(systemName: "crown.fill")
+                                .foregroundStyle(.yellow)
+                            Text("Admin Services")
+                                .font(.headline)
+                        }
+                        
+                        Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile. Whether you need account registration tools, server nukers, mass DM tools, or any other automation, we can build it for you.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        
+                        Divider()
+                        
+                        HStack {
+                            Image(systemName: "message.fill")
+                                .foregroundStyle(.indigo)
+                            Text("Contact Admin (Discord):")
+                                .font(.subheadline.bold())
+                            Spacer()
+                            Text("@thaitu_thanhhoa")
+                                .font(.system(.subheadline, design: .monospaced))
+                                .foregroundStyle(.indigo)
+                                .textSelection(.enabled)
+                        }
+                        .padding()
+                        .background(Color.indigo.opacity(0.1))
+                        .cornerRadius(10)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.secondarySystemBackground))
+                    .cornerRadius(15)
+                    
+                    Text("Version 1.0.0")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.top)
+                }
+                .padding()
+            }
+            .background(Color(UIColor.systemGroupedBackground))
+            .navigationTitle("Information")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+    
+    // Hàm che Key
+    private var maskedKey: String {
+        guard let key = license.licenseKey else { return "No Key" }
+        if showFullKey { return key }
+        
+        // Che phần giữa của key, ví dụ: QT-ABCDE-12345 -> QT-***-12345
+        let parts = key.split(separator: "-")
+        if parts.count == 3 {
+            return "\(parts[0])-***-\(parts[2])"
+        }
+        return "\(key.prefix(4))***\(key.suffix(4))"
+    }
+}
+
+// ==========================================
 // MARK: - APP ENTRY
 // ==========================================
 @main
@@ -1710,6 +1875,7 @@ struct SpamDiscordApp: App {
                         .environmentObject(app)
                         .environmentObject(bot)
                         .environmentObject(userNuke)
+                        .environmentObject(license)
                 } else {
                     LockView()
                         .environmentObject(license)
@@ -1722,6 +1888,14 @@ struct SpamDiscordApp: App {
                     }
                 }
             }
+            .onChange(of: license.isUnlocked) { isUnlocked in
+                if !isUnlocked {
+                    app.stopSending()
+                    bot.stopNuke()
+                    userNuke.stop()
+                    BackgroundManager.shared.stop()
+                }
+            }
         }
     }
 }
@@ -1732,6 +1906,7 @@ struct MainTabView: View {
             SpamView().tabItem { Label("Spam", systemImage: "paperplane.fill") }
             TokenListView().tabItem { Label("Tokens", systemImage: "person.2.fill") }
             NukeTabView().tabItem { Label("Nuke", systemImage: "flame.fill") }
+            AboutView().tabItem { Label("Info", systemImage: "info.circle.fill") }
         }.tint(.indigo)
     }
 }
