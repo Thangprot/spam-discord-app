@@ -577,7 +577,7 @@ class UserNukeClient {
 
         guard let url = URL(string: "wss://gateway.discord.gg/?v=10&encoding=json") else { return }
         let ws = session.webSocketTask(with: url)
-        ws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX MESSAGE TOO LONG
+        ws.maximumMessageSize = 16 * 1024 * 1024
         ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
 
@@ -712,6 +712,8 @@ class VoiceRoomClient {
         self.token = token
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
+        cfg.timeoutIntervalForResource = 60
+        cfg.waitsForConnectivity = true
         let sp = """
         {"os":"iOS","browser":"Safari","device":"","system_locale":"en-US","browser_user_agent":"Mozilla/5.0 (iPhone)","browser_version":"17.0","os_version":"17.0","referrer":"","referring_domain":"","referrer_current":"","referring_domain_current":"","release_channel":"stable","client_build_number":305000,"client_event_source":null}
         """
@@ -767,7 +769,7 @@ class VoiceRoomClient {
 
         log?("Mở gateway WS...")
         let gw = session.webSocketTask(with: URL(string: "wss://gateway.discord.gg/?v=10&encoding=json")!)
-        gw.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX MESSAGE TOO LONG
+        gw.maximumMessageSize = 16 * 1024 * 1024
         gw.resume()
         gatewayWS = gw
 
@@ -837,15 +839,59 @@ class VoiceRoomClient {
             throw NSError(domain: "Room", code: -1, userInfo: [NSLocalizedDescriptionKey: "Voice server missing"])
         }
 
-        log?("Mở voice WS...")
-        let vws = session.webSocketTask(with: URL(string: "wss://\(ep)/?v=4")!)
-        vws.maximumMessageSize = 16 * 1024 * 1024 // ✅ FIX MESSAGE TOO LONG
-        vws.resume()
-        voiceWS = vws
+        var cleanEp = ep
+            .replacingOccurrences(of: "wss://", with: "")
+            .replacingOccurrences(of: "https://", with: "")
+        
+        if let colonIdx = cleanEp.lastIndex(of: ":") {
+            if cleanEp.suffix(from: colonIdx).contains(":443") {
+                cleanEp = String(cleanEp.prefix(upTo: colonIdx))
+            }
+        }
+        cleanEp = cleanEp.replacingOccurrences(of: "/?v=4", with: "")
+            .replacingOccurrences(of: "/", with: "")
 
-        _ = try await recvJSON(vws)
+        log?("Endpoint gốc: \(ep)")
+        log?("Endpoint sạch: \(cleanEp)")
 
-        try await sendJSON(vws, [
+        var vws: URLSessionWebSocketTask? = nil
+        var lastError: Error? = nil
+        let candidates = [
+            "wss://\(cleanEp)/?v=4",
+            "wss://\(cleanEp):443/?v=4"
+        ]
+
+        for candidateURL in candidates {
+            log?("Thử kết nối: \(candidateURL)")
+            guard let url = URL(string: candidateURL) else {
+                log?("URL không hợp lệ: \(candidateURL)")
+                continue
+            }
+            do {
+                let task = session.webSocketTask(with: url)
+                task.maximumMessageSize = 16 * 1024 * 1024
+                task.resume()
+                try await Task.sleep(nanoseconds: 500_000_000)
+                let helloMsg = try await recvJSON(task)
+                if let h = helloMsg as? [String: Any], (h["op"] as? Int) == 8 {
+                    vws = task
+                    log?("Kết nối thành công: \(candidateURL)")
+                    break
+                }
+            } catch {
+                log?("Kết nối thất bại: \(error.localizedDescription)")
+                lastError = error
+            }
+        }
+
+        guard let voiceSocket = vws else {
+            throw NSError(domain: "Room", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Không kết nối được Voice WS: \(lastError?.localizedDescription ?? "unknown")"])
+        }
+        voiceWS = voiceSocket
+
+        log?("Gửi Voice Identify (op 0)...")
+        try await sendJSON(voiceSocket, [
             "op": 0,
             "d": [
                 "server_id": guildId,
@@ -855,10 +901,13 @@ class VoiceRoomClient {
             ]
         ])
 
-        while true {
-            if let msg = try await recvJSON(vws) as? [String: Any],
+        var readyAttempts = 0
+        while readyAttempts < 20 {
+            readyAttempts += 1
+            if let msg = try await recvJSON(voiceSocket) as? [String: Any],
                (msg["op"] as? Int) == 2 {
                 ssrc = ((msg["d"] as? [String: Any])?["ssrc"] as? Int) ?? 0
+                log?("Voice Ready ✓ (ssrc: \(ssrc))")
                 break
             }
         }
@@ -866,7 +915,7 @@ class VoiceRoomClient {
         voiceHB = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 13_750_000_000)
-                try? await vws.send(.string("{\"op\":3,\"d\":\(Int(Date().timeIntervalSince1970 * 1000))}"))
+                try? await voiceSocket.send(.string("{\"op\":3,\"d\":\(Int(Date().timeIntervalSince1970 * 1000))}"))
             }
         }
 
@@ -1759,7 +1808,6 @@ class VoiceRoomManager: ObservableObject {
         isLoading = true
         log("Đang quét kênh của: \(guild.name)...")
         
-        // Xoá cache cũ của server này
         for id in selectedTokenIds {
             tokenChannels[id]?[guild.id] = nil
         }
@@ -3012,7 +3060,7 @@ struct RoomTokenPickerView: View {
 
             if !room.selectedTokenIds.isEmpty {
                 Button {
-                    Task { await room.loadGuildsForSelected() } // ✅ ĐÃ ĐỔI THÀNH loadGuildsForSelected
+                    Task { await room.loadGuildsForSelected() }
                 } label: {
                     HStack {
                         if room.isLoading { ProgressView().tint(.white) }
@@ -3111,7 +3159,7 @@ struct RoomGuildListView: View {
                     Button {
                         room.selectedGuild = g
                         room.selectedChannel = nil
-                        Task { await room.loadChannelsForSelected(guild: g) } // ✅ TẢI KÊNH KHI CHỌN SERVER
+                        Task { await room.loadChannelsForSelected(guild: g) }
                     } label: {
                         HStack(spacing: 12) {
                             if let icon = g.icon,
