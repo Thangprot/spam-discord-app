@@ -1894,13 +1894,10 @@ final class LicenseManager: ObservableObject {
             KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
             status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
         } catch {
-            // Network error → dùng cache expiry trong Keychain
             if let s = KeychainHelper.standard.readString(forKey: expiryStoreKey),
                let d = Double(s) {
                 let exp = Date(timeIntervalSince1970: d)
                 if Date() <= exp {
-                    // Offline grace: nhưng vẫn cần AppEndpoints → không có
-                    // => Buộc phải về trạng thái cracked vì thiếu API
                     AppEndpoints.clear()
                     status = .cracked(reason: "App has been cracked. Cannot verify license.")
                     return
@@ -2153,36 +2150,6 @@ struct LicenseAdminInfoView: View {
                         .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
                     }
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("TẠO KEY MỚI (từ máy tính)").font(.caption.bold()).foregroundStyle(.secondary)
-                        Text("""
-                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/create \\
-                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
-                          -H "Content-Type: application/json" \\
-                          -d '{"email":"user@example.com","duration_days":365}'
-                        """)
-                        .font(.system(size: 10, design: .monospaced)).padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
-                        .textSelection(.enabled)
-                    }
-                    .padding().frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("LỆNH QUẢN LÝ (curl)").font(.caption.bold()).foregroundStyle(.secondary)
-                        Text("""
-                        # Thu hồi key
-                        curl -X POST \(LicenseAPIClient.shared.baseURL)/admin/disable \\
-                          -H "Authorization: Bearer YOUR_ADMIN_SECRET" \\
-                          -d '{"license_key":"QT-XXXXX-XXXXX"}'
-                        """)
-                        .font(.system(size: 10, design: .monospaced)).padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(6)
-                        .textSelection(.enabled)
-                    }
-                    .padding().frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
-
                     Button(role: .destructive) {
                         license.deactivate(); dismiss()
                     } label: {
@@ -2408,7 +2375,7 @@ struct TokenListView: View {
                                    description: "Thêm token để bắt đầu.")
                 } else {
                     List {
-                        Section(header: Text("Danh sách (\(app.selectedTokenIds.count) đã chọn)")) {
+                        Section("Danh sách (\(app.selectedTokenIds.count) đã chọn)") {
                             ForEach(app.tokens) { t in
                                 HStack(spacing: 12) {
                                     if let url = t.avatarURL {
@@ -2471,7 +2438,7 @@ struct AddTokenSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section(header: Text("Nhập Token")) {
+                Section("Nhập Token") {
                     TextField("Dán token...", text: $input)
                         .autocorrectionDisabled().textInputAutocapitalization(.never)
                 }
@@ -2567,8 +2534,7 @@ struct ChannelListView: View {
             else {
                 List {
                     ForEach(sections, id: \.category?.id) { sec in
-                        Section(header: Text(sec.category?.displayName.uppercased() ?? "KHÁC")
-                            .font(.caption).bold()) {
+                        Section {
                             ForEach(sec.items) { c in
                                 NavigationLink(value: c) {
                                     HStack {
@@ -2578,6 +2544,9 @@ struct ChannelListView: View {
                                     }
                                 }
                             }
+                        } header: {
+                            Text(sec.category?.displayName.uppercased() ?? "KHÁC")
+                                .font(.caption).bold()
                         }
                     }
                 }
@@ -2787,7 +2756,7 @@ struct BotNukeView: View {
                 }
             } else {
                 List {
-                    Section(header: Text("Bot")) {
+                    Section("Bot") {
                         HStack {
                             if let url = bot.config?.avatarURL {
                                 AsyncImage(url: url) { img in img.resizable().scaledToFill() }
@@ -2803,7 +2772,7 @@ struct BotNukeView: View {
                             }
                         }
                     }
-                    Section(header: Text("Chọn server để nuke")) {
+                    Section("Chọn server để nuke") {
                         if bot.botGuilds.isEmpty {
                             Text("Không có server").foregroundStyle(.secondary)
                         } else {
@@ -2830,7 +2799,7 @@ struct BotNukeView: View {
         .sheet(isPresented: $showTokenSheet) {
             NavigationStack {
                 Form {
-                    Section(header: Text("Bot Token")) {
+                    Section("Bot Token") {
                         TextField("Dán bot token...", text: $tokenInput)
                             .autocorrectionDisabled().textInputAutocapitalization(.never)
                     }
@@ -2919,7 +2888,7 @@ struct UserNukeView: View {
                 }
             } else {
                 List {
-                    Section(header: Text("Tokens (\(userNuke.selectedTokenIds.count)/\(userNuke.tokens.count))")) {
+                    Section("Tokens (\(userNuke.selectedTokenIds.count)/\(userNuke.tokens.count))") {
                         if userNuke.tokens.isEmpty {
                             Text("Chưa có token").foregroundStyle(.secondary)
                         } else {
@@ -2958,7 +2927,7 @@ struct UserNukeView: View {
                         }
                     }
 
-                    Section(header: Text("Server có thể nuke")) {
+                    Section("Server có thể nuke") {
                         if userNuke.selectedTokenIds.isEmpty {
                             Text("Chọn token trước").foregroundStyle(.secondary)
                         } else if userNuke.isLoadingGuilds {
@@ -3021,7 +2990,7 @@ struct NukeConfigSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section(header: Text("Bước thực hiện")) {
+                Section("Bước thực hiện") {
                     ForEach(NukeStepType.allCases) { step in
                         Toggle(isOn: Binding(
                             get: { config.enabledSteps.contains(step) },
@@ -3034,13 +3003,13 @@ struct NukeConfigSheet: View {
                     }
                 }
 
-                Section(header: Text("Tuỳ chọn")) {
+                Section("Tuỳ chọn") {
                     if config.enabledSteps.contains(.massBan) {
                         TextField("Ban role ID (tuỳ chọn)", text: $config.banRoleId)
                             .keyboardType(.numberPad)
                         HStack {
                             Text("Delay ban")
-                            Slider(value: $config.banDelay, in: 0, ...1.0, step: 0.01)
+                            Slider(value: $config.banDelay, in: 0...1.0, step: 0.01)
                             Text("\(String(format: "%.2f", config.banDelay))s").font(.caption)
                         }
                     }
