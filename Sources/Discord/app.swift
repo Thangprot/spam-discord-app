@@ -1,5 +1,5 @@
 // ============================================================
-// QUOC THANG TOOLS — Full consolidated Swift file
+// QUOC THANG TOOLS — Full consolidated Swift file (Fixed & Updated)
 // ============================================================
 import SwiftUI
 import Foundation
@@ -138,6 +138,7 @@ enum MachineID {
 final class ConfigAPIClient {
     static let shared = ConfigAPIClient()
     private let baseURL = "https://key.nqtaff01.workers.dev"
+    // ⚠️ PHẢI TRÙNG VỚI WORKER
     private static let APP_SECRET = "QT_v1_SECRET_2f8a9c1e7b3d4f6a_CHANGE_ME_ON_BOTH_SIDES"
     func fetchConfig(key: String) async throws -> ConfigResponse {
         var req = URLRequest(url: URL(string: "\(baseURL)/config")!)
@@ -309,7 +310,6 @@ final class NowPlayingHelper {
         if #available(iOS 16.0, *) { MPNowPlayingInfoCenter.default().playbackState = .playing }
     }
 
-    // Hiển thị thời gian treo room trên lock screen
     func updateVoice(title: String, detail: String, elapsedSeconds: Int) {
         guard isActive else { return }
         var info: [String: Any] = [:]
@@ -476,7 +476,6 @@ class AppState: ObservableObject {
             tokens = s
             if let a = s.first(where: { $0.isValid }) {
                 activeToken = a; selectedTokenIds = [a.id]
-                // chỉ recompute nếu endpoints đã sẵn sàng
                 if AppEndpoints.isLoaded { Task { await recomputeMultiGuilds() } }
             }
         }
@@ -911,7 +910,14 @@ class UserNukeClient {
         let total = (detail["approximate_member_count"] as? Int)
             ?? (detail["member_count"] as? Int) ?? 1000
         guard let url = URL(string: AppEndpoints.gatewayURL) else { return }
-        let ws = session.webSocketTask(with: url); ws.resume()
+        
+        // Fix WebSocket Request Headers
+        var req = URLRequest(url: url)
+        req.setValue(token, forHTTPHeaderField: "Authorization")
+        req.setValue(AppEndpoints.userAgentDesktop, forHTTPHeaderField: "User-Agent")
+        
+        let ws = session.webSocketTask(with: req)
+        ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
         guard case .string(let hs) = try await ws.receive(),
               let hd = hs.data(using: .utf8),
@@ -1662,7 +1668,7 @@ final class IndexBox: @unchecked Sendable {
 }
 
 // ==========================================
-// MARK: - VOICE SESSION (treo room)
+// MARK: - VOICE SESSION (treo room) - FIXED WEBSOCKET
 // ==========================================
 @MainActor
 final class VoiceSession: ObservableObject, Identifiable {
@@ -1689,6 +1695,7 @@ final class VoiceSession: ObservableObject, Identifiable {
         self.token = token; self.guildId = guildId; self.channelId = channelId
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
+        // Header mặc định của URLSession
         cfg.httpAdditionalHeaders = [
             "Authorization": token.token,
             "User-Agent": AppEndpoints.userAgentMobile,
@@ -1704,15 +1711,27 @@ final class VoiceSession: ObservableObject, Identifiable {
         guard let url = URL(string: AppEndpoints.gatewayURL) else {
             error = "Gateway URL không hợp lệ"; return
         }
+        
         isCancelled = false
-        let ws = session.webSocketTask(with: url); ws.resume()
+        error = nil
+        
+        // FIX QUAN TRỌNG: Phải dùng URLRequest cho WebSocket để gửi Header
+        var req = URLRequest(url: url)
+        req.setValue(token.token, forHTTPHeaderField: "Authorization")
+        req.setValue(AppEndpoints.userAgentMobile, forHTTPHeaderField: "User-Agent")
+        req.setValue(AppEndpoints.superPropertiesMobile, forHTTPHeaderField: "X-Super-Properties")
+        
+        let ws = session.webSocketTask(with: req)
+        ws.resume()
         gatewayWS = ws
+        
         do {
             guard case .string(let hs) = try await ws.receive(),
                   let hd = hs.data(using: .utf8),
                   let hello = try? JSONSerialization.jsonObject(with: hd) as? [String: Any],
                   let hbi = (hello["d"] as? [String: Any])?["heartbeat_interval"] as? Int
-            else { error = "Không nhận HELLO"; await disconnect(); return }
+            else { throw NSError(domain: "Voice", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không nhận HELLO từ Discord"]) }
+            
             let hbInterval = Double(hbi) / 1000.0
             let identify: [String: Any] = [
                 "op": 2,
@@ -1726,6 +1745,7 @@ final class VoiceSession: ObservableObject, Identifiable {
             ]
             let idData = try JSONSerialization.data(withJSONObject: identify)
             try await ws.send(.string(String(data: idData, encoding: .utf8)!))
+            
             var ready = false; var attempts = 0
             while !ready && attempts < 30 {
                 attempts += 1
@@ -1733,14 +1753,16 @@ final class VoiceSession: ObservableObject, Identifiable {
                    let d = try? JSONSerialization.jsonObject(with: s.data(using: .utf8)!) as? [String: Any] {
                     if let t = d["t"] as? String, t == "READY" { ready = true }
                     if (d["op"] as? Int) == 9 {
-                        error = "Invalid Session"; await disconnect(); return
+                        throw NSError(domain: "Voice", code: 9, userInfo: [NSLocalizedDescriptionKey: "Invalid Session"])
                     }
                 }
             }
-            guard ready else { error = "Không nhận READY"; await disconnect(); return }
+            guard ready else { throw NSError(domain: "Voice", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không nhận READY từ Discord"]) }
+            
             startHeartbeat(interval: hbInterval)
             startListenLoop()
             await sendVoiceStateUpdate()
+            
             isConnected = true; connectedAt = Date()
             startElapsedTimer()
         } catch {
@@ -1776,7 +1798,10 @@ final class VoiceSession: ObservableObject, Identifiable {
                        let d = try? JSONSerialization.jsonObject(with: s.data(using: .utf8)!) as? [String: Any] {
                         self.handleGatewayMessage(d)
                     }
-                } catch { break }
+                } catch { 
+                    self.error = "Mất kết nối Gateway: \(error.localizedDescription)"
+                    break 
+                }
             }
         }
     }
@@ -2222,8 +2247,11 @@ final class LicenseManager: ObservableObject {
         case .cracked(let r): return r
         }
     }
+    // CẬP NHẬT: Hiển thị cả ngày và giờ
     func formatDate(_ d: Date) -> String {
-        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy"; return df.string(from: d)
+        let df = DateFormatter()
+        df.dateFormat = "dd/MM/yyyy HH:mm" // Sửa ở đây
+        return df.string(from: d)
     }
 }
 
@@ -2389,7 +2417,7 @@ struct LockView: View {
         }
     }
     private func fmt(_ d: Date) -> String {
-        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy"; return df.string(from: d)
+        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy HH:mm"; return df.string(from: d)
     }
 }
 
@@ -2472,12 +2500,13 @@ struct AboutView: View {
                         }
                     }
                     .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
+                    // KHÔI PHỤC INFO ĐẦY ĐỦ
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Image(systemName: "info.circle.fill").foregroundStyle(.blue)
                             Text("About This App").font(.headline)
                         }
-                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users...")
+                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning, and Voice Room integration. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     .padding().frame(maxWidth: .infinity, alignment: .leading)
@@ -2487,7 +2516,7 @@ struct AboutView: View {
                             Image(systemName: "crown.fill").foregroundStyle(.yellow)
                             Text("Admin Services").font(.headline)
                         }
-                        Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile...")
+                        Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile. Whether you need account registration tools, server nukers, mass DM tools, or any other automation, we can build it for you.")
                             .font(.subheadline).foregroundStyle(.secondary)
                         Divider()
                         HStack {
@@ -2634,7 +2663,7 @@ struct AddTokenSheet: View {
 }
 
 // ==========================================
-// MARK: - SPAM VIEWS (FIXED)
+// MARK: - SPAM VIEWS (FIXED RETRY)
 // ==========================================
 struct SpamView: View {
     @EnvironmentObject var app: AppState
@@ -2667,16 +2696,14 @@ struct SpamView: View {
                     } else if app.isLoading {
                         ProgressView("Đang tải...")
                     } else if filtered.isEmpty {
-                        // FIX: message khác nhau tùy số token
-                        if app.selectedTokenIds.count == 1 {
-                            EmptyStateView(title: "Không tải được server",
-                                           systemImage: "wifi.exclamationmark",
-                                           description: "Không thể tải danh sách server. Kiểm tra mạng và thử lại.")
-                        } else {
-                            EmptyStateView(title: "Không có server chung",
-                                           systemImage: "server.rack",
-                                           description: "Các token được chọn không cùng ở server nào.")
-                        }
+                        VStack(spacing: 15) {
+                            Image(systemName: "wifi.exclamationmark").font(.system(size: 50)).foregroundStyle(.secondary)
+                            Text("Không tải được server").font(.title2).bold()
+                            Text("Không thể tải danh sách server. Kiểm tra mạng và thử lại.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).padding(.horizontal)
+                            Button("Thử lại") {
+                                Task { await app.recomputeMultiGuilds() }
+                            }.buttonStyle(.borderedProminent).tint(.indigo).padding(.top, 10)
+                        }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(UIColor.systemGroupedBackground))
                     } else {
                         List(filtered) { g in
                             NavigationLink(value: g) {
@@ -2738,8 +2765,7 @@ struct ChannelListView: View {
                                     MessageInputView(guild: guild, channel: ch)
                                 } label: {
                                     HStack {
-                                        Image(systemName: "number")
-                                            .foregroundStyle(.indigo)
+                                        Image(systemName: "number").foregroundStyle(.indigo)
                                         Text(ch.displayName)
                                     }
                                 }
@@ -2769,21 +2795,17 @@ struct MessageInputView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // Message source
                 GroupBox("Nội dung tin nhắn") {
                     VStack(alignment: .leading, spacing: 8) {
                         TextEditor(text: $app.inputText)
                             .frame(minHeight: 140).font(.body)
                             .onChange(of: app.inputText) { _ in app.parseDirectInput() }
                         HStack {
-                            Button {
-                                showImport = true
-                            } label: {
+                            Button { showImport = true } label: {
                                 Label("Import file", systemImage: "doc.text")
                             }
                             Spacer()
-                            Text("\(app.messages.count) tin").font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text("\(app.messages.count) tin").font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -2809,14 +2831,11 @@ struct MessageInputView: View {
                 if app.isSending {
                     GroupBox("Đang gửi") {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Đã gửi: \(app.totalSent) tin")
-                                .font(.headline)
-                            Text(app.currentMessageStr)
-                                .font(.caption).lineLimit(2).foregroundStyle(.secondary)
+                            Text("Đã gửi: \(app.totalSent) tin").font(.headline)
+                            Text(app.currentMessageStr).font(.caption).lineLimit(2).foregroundStyle(.secondary)
                             ForEach(app.tokens.filter { app.tokenSendCount[$0.id] != nil }) { t in
                                 HStack {
-                                    Text(t.username).font(.caption)
-                                    Spacer()
+                                    Text(t.username).font(.caption); Spacer()
                                     Text("\(app.tokenSendCount[t.id] ?? 0)")
                                         .font(.system(.caption, design: .monospaced))
                                         .foregroundStyle(.indigo)
@@ -2835,8 +2854,7 @@ struct MessageInputView: View {
                 }
                 .background(app.isSending ? Color.red : Color.indigo)
                 .foregroundStyle(.white).cornerRadius(10)
-                .disabled(app.messages.isEmpty
-                          || (app.useTag && app.targetUserId.isEmpty))
+                .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty))
             }.padding()
         }
         .navigationTitle("#\(channel.displayName)")
@@ -2862,7 +2880,6 @@ struct BotNukeView: View {
     var body: some View {
         NavigationStack {
             List {
-                // Bot token
                 Section("Bot Token") {
                     if let c = bot.config {
                         HStack {
@@ -2872,8 +2889,7 @@ struct BotNukeView: View {
                                     .frame(width: 40, height: 40).clipShape(Circle())
                             } else {
                                 Image(systemName: "person.circle.fill")
-                                    .resizable().frame(width: 40, height: 40)
-                                    .foregroundStyle(.gray)
+                                    .resizable().frame(width: 40, height: 40).foregroundStyle(.gray)
                             }
                             VStack(alignment: .leading) {
                                 Text(c.displayName).font(.headline)
@@ -2921,11 +2937,9 @@ struct BotNukeView: View {
                                     selectedGuild = g
                                 } label: {
                                     HStack {
-                                        Text(g.name).foregroundStyle(.primary)
-                                        Spacer()
+                                        Text(g.name).foregroundStyle(.primary); Spacer()
                                         if selectedGuild?.id == g.id {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .foregroundStyle(.indigo)
+                                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo)
                                         }
                                     }
                                 }
@@ -2943,24 +2957,19 @@ struct BotNukeView: View {
                                     if v { config.enabledSteps.insert(step) }
                                     else { config.enabledSteps.remove(step) }
                                 }
-                            )) {
-                                Label(step.rawValue, systemImage: step.icon)
-                            }
+                            )) { Label(step.rawValue, systemImage: step.icon) }
                         }
                         if config.enabledSteps.contains(.renameGuild) {
                             TextField("Tên server mới", text: $config.newGuildName)
                         }
                         if config.enabledSteps.contains(.createRoles) {
                             TextField("Tên role", text: $config.roleName)
-                            Stepper("Số role: \(config.roleCount)",
-                                    value: $config.roleCount, in: 1...500)
+                            Stepper("Số role: \(config.roleCount)", value: $config.roleCount, in: 1...500)
                         }
                         if config.enabledSteps.contains(.createChannels) {
                             TextField("Tên kênh", text: $config.channelName)
-                            Stepper("Số kênh: \(config.channelCount)",
-                                    value: $config.channelCount, in: 1...500)
-                            TextField("Nội dung tin nhắn", text: $config.messageContent,
-                                      axis: .vertical).lineLimit(2...5)
+                            Stepper("Số kênh: \(config.channelCount)", value: $config.channelCount, in: 1...500)
+                            TextField("Nội dung tin nhắn", text: $config.messageContent, axis: .vertical).lineLimit(2...5)
                             Toggle("Tag @everyone", isOn: $config.tagEveryone)
                         }
                     }
@@ -2973,26 +2982,18 @@ struct BotNukeView: View {
                                     ProgressView(value: bot.phaseProgress)
                                 }
                             }
-                            HStack {
-                                Text("Ban: \(bot.banSuccess) OK / \(bot.banFailed) FAIL")
-                                    .font(.caption)
-                            }
-                            HStack {
-                                Text("Xoá: \(bot.channelsDeleted) | Tạo kênh: \(bot.channelsCreated) | Tin: \(bot.messagesSent) | Role: \(bot.rolesCreated)")
-                                    .font(.caption2)
-                            }
+                            Text("Ban: \(bot.banSuccess) OK / \(bot.banFailed) FAIL").font(.caption)
+                            Text("Xoá: \(bot.channelsDeleted) | Tạo kênh: \(bot.channelsCreated) | Tin: \(bot.messagesSent) | Role: \(bot.rolesCreated)").font(.caption2)
                             Button(role: .destructive) {
                                 bot.stopNuke()
                             } label: {
-                                Label("Dừng", systemImage: "stop.circle.fill")
-                                    .frame(maxWidth: .infinity).padding(8)
+                                Label("Dừng", systemImage: "stop.circle.fill").frame(maxWidth: .infinity).padding(8)
                             }
                         } else {
                             Button {
                                 Task { await bot.runNuke(guild: g, options: config) }
                             } label: {
-                                Label("BẮT ĐẦU NUKE", systemImage: "flame.fill")
-                                    .frame(maxWidth: .infinity).padding(10).bold()
+                                Label("BẮT ĐẦU NUKE", systemImage: "flame.fill").frame(maxWidth: .infinity).padding(10).bold()
                             }
                             .background(Color.red).foregroundStyle(.white).cornerRadius(10)
                             .disabled(config.enabledSteps.isEmpty)
@@ -3002,8 +3003,7 @@ struct BotNukeView: View {
                     if !bot.nukeLog.isEmpty {
                         Section("Log") {
                             ForEach(Array(bot.nukeLog.suffix(100).enumerated()), id: \.offset) { _, line in
-                                Text(line).font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                Text(line).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -3029,45 +3029,30 @@ struct AddUserTokenSheet: View {
                 Section("Nhập token tay") {
                     TextField("Dán token...", text: $input, axis: .vertical)
                         .autocorrectionDisabled().textInputAutocapitalization(.never)
-                        .font(.system(.body, design: .monospaced))
-                        .lineLimit(3...10)
+                        .font(.system(.body, design: .monospaced)).lineLimit(3...10)
                 }
                 Section {
-                    Button { showFile = true } label: {
-                        Label("Nhập từ file .txt", systemImage: "doc.text")
-                    }
+                    Button { showFile = true } label: { Label("Nhập từ file .txt", systemImage: "doc.text") }
                 } footer: {
                     Text("Mỗi dòng 1 token. Hỗ trợ UTF-8, UTF-16, ANSI.")
                 }
             }
-            .navigationTitle("Thêm Token User Nuke")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Thêm Token User Nuke").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Huỷ") { dismiss() }
-                }
+                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Lưu") {
-                        Task {
-                            _ = await userNuke.addTokenManually(input)
-                            dismiss()
-                        }
-                    }
-                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || userNuke.isImporting)
+                    Button("Lưu") { Task { _ = await userNuke.addTokenManually(input); dismiss() } }
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || userNuke.isImporting)
                 }
             }
             .sheet(isPresented: $showFile) {
                 DocumentPicker(contentTypes: [.plainText, .item]) { url in
-                    Task {
-                        await userNuke.importFromFile(url: url); showFile = false
-                    }
+                    Task { await userNuke.importFromFile(url: url); showFile = false }
                 } onCancel: { showFile = false }
             }
             .overlay {
                 if userNuke.isImporting {
-                    ProgressView("Đang kiểm tra...").padding()
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    ProgressView("Đang kiểm tra...").padding().background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
         }
@@ -3091,24 +3076,18 @@ struct UserNukeView: View {
                             HStack(spacing: 12) {
                                 if let u = t.avatarURL {
                                     AsyncImage(url: u) { i in i.resizable().scaledToFill() }
-                                    placeholder: { Circle().fill(.gray) }
-                                        .frame(width: 36, height: 36).clipShape(Circle())
+                                    placeholder: { Circle().fill(.gray) }.frame(width: 36, height: 36).clipShape(Circle())
                                 } else {
-                                    Image(systemName: "person.circle.fill")
-                                        .resizable().frame(width: 36, height: 36)
-                                        .foregroundStyle(.gray)
+                                    Image(systemName: "person.circle.fill").resizable().frame(width: 36, height: 36).foregroundStyle(.gray)
                                 }
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(t.username).font(.subheadline.bold())
-                                    Text(t.isValid ? "Live" : "Die")
-                                        .font(.caption2).bold()
-                                        .foregroundStyle(t.isValid ? .green : .red)
+                                    Text(t.isValid ? "Live" : "Die").font(.caption2).bold().foregroundStyle(t.isValid ? .green : .red)
                                 }
                                 Spacer()
                                 if t.isValid {
                                     Button { userNuke.toggleSelection(t) } label: {
-                                        Image(systemName: userNuke.selectedTokenIds.contains(t.id)
-                                              ? "checkmark.circle.fill" : "circle")
+                                        Image(systemName: userNuke.selectedTokenIds.contains(t.id) ? "checkmark.circle.fill" : "circle")
                                             .foregroundStyle(.indigo).font(.title3)
                                     }.buttonStyle(.plain)
                                 }
@@ -3120,16 +3099,12 @@ struct UserNukeView: View {
                     Menu {
                         Button("Thêm tay", systemImage: "keyboard") { showAddToken = true }
                         Button("Nhập file", systemImage: "doc.text") { showAddToken = true }
-                    } label: {
-                        Label("Thêm token", systemImage: "plus.circle.fill")
-                    }
+                    } label: { Label("Thêm token", systemImage: "plus.circle.fill") }
                 }
 
                 if !userNuke.selectedTokenIds.isEmpty {
                     Section {
-                        Button {
-                            Task { await userNuke.loadAllGuildsForSelected() }
-                        } label: {
+                        Button { Task { await userNuke.loadAllGuildsForSelected() } } label: {
                             if userNuke.isLoadingGuilds { ProgressView() }
                             else { Label("Tải danh sách server", systemImage: "arrow.clockwise") }
                         }
@@ -3139,16 +3114,10 @@ struct UserNukeView: View {
                 if !userNuke.eligibleGuilds.isEmpty {
                     Section("Server có thể nuke (\(userNuke.eligibleGuilds.count))") {
                         ForEach(userNuke.eligibleGuilds) { g in
-                            Button {
-                                selectedGuild = g
-                            } label: {
+                            Button { selectedGuild = g } label: {
                                 HStack {
-                                    Text(g.name).foregroundStyle(.primary)
-                                    Spacer()
-                                    if selectedGuild?.id == g.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.indigo)
-                                    }
+                                    Text(g.name).foregroundStyle(.primary); Spacer()
+                                    if selectedGuild?.id == g.id { Image(systemName: "checkmark.circle.fill").foregroundStyle(.indigo) }
                                 }
                             }
                         }
@@ -3166,25 +3135,19 @@ struct UserNukeView: View {
                                     if v { config.enabledSteps.insert(step) }
                                     else { config.enabledSteps.remove(step) }
                                 }
-                            )) {
-                                Label(step.rawValue, systemImage: step.icon)
-                            }
-                            .disabled(!can)
+                            )) { Label(step.rawValue, systemImage: step.icon) }.disabled(!can)
                         }
                         if config.enabledSteps.contains(.renameGuild) {
                             TextField("Tên server mới", text: $config.newGuildName)
                         }
                         if config.enabledSteps.contains(.createRoles) {
                             TextField("Tên role", text: $config.roleName)
-                            Stepper("Số role: \(config.roleCount)",
-                                    value: $config.roleCount, in: 1...500)
+                            Stepper("Số role: \(config.roleCount)", value: $config.roleCount, in: 1...500)
                         }
                         if config.enabledSteps.contains(.createChannels) {
                             TextField("Tên kênh", text: $config.channelName)
-                            Stepper("Số kênh: \(config.channelCount)",
-                                    value: $config.channelCount, in: 1...500)
-                            TextField("Nội dung tin", text: $config.messageContent,
-                                      axis: .vertical).lineLimit(2...5)
+                            Stepper("Số kênh: \(config.channelCount)", value: $config.channelCount, in: 1...500)
+                            TextField("Nội dung tin", text: $config.messageContent, axis: .vertical).lineLimit(2...5)
                             Toggle("Tag @everyone", isOn: $config.tagEveryone)
                         }
                     }
@@ -3198,22 +3161,16 @@ struct UserNukeView: View {
                                 }
                             }
                             Text("Đã quét: \(userNuke.membersScanned)").font(.caption)
-                            Text("Ban: \(userNuke.banSuccess) OK / \(userNuke.banFailed) FAIL")
-                                .font(.caption)
-                            Text("Xoá: \(userNuke.channelsDeleted) | Tạo: \(userNuke.channelsCreated) | Tin: \(userNuke.messagesSent)")
-                                .font(.caption2)
-                            Button(role: .destructive) {
-                                userNuke.stop()
-                            } label: {
-                                Label("Dừng", systemImage: "stop.circle.fill")
-                                    .frame(maxWidth: .infinity).padding(8)
+                            Text("Ban: \(userNuke.banSuccess) OK / \(userNuke.banFailed) FAIL").font(.caption)
+                            Text("Xoá: \(userNuke.channelsDeleted) | Tạo: \(userNuke.channelsCreated) | Tin: \(userNuke.messagesSent)").font(.caption2)
+                            Button(role: .destructive) { userNuke.stop() } label: {
+                                Label("Dừng", systemImage: "stop.circle.fill").frame(maxWidth: .infinity).padding(8)
                             }
                         } else {
                             Button {
                                 Task { await userNuke.runNuke(guild: g, options: config) }
                             } label: {
-                                Label("BẮT ĐẦU NUKE", systemImage: "flame.fill")
-                                    .frame(maxWidth: .infinity).padding(10).bold()
+                                Label("BẮT ĐẦU NUKE", systemImage: "flame.fill").frame(maxWidth: .infinity).padding(10).bold()
                             }
                             .background(Color.red).foregroundStyle(.white).cornerRadius(10)
                             .disabled(config.enabledSteps.isEmpty)
@@ -3223,8 +3180,7 @@ struct UserNukeView: View {
                     if !userNuke.nukeLog.isEmpty {
                         Section("Log") {
                             ForEach(Array(userNuke.nukeLog.suffix(80).enumerated()), id: \.offset) { _, line in
-                                Text(line).font(.system(.caption, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                                Text(line).font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -3257,31 +3213,24 @@ struct VoiceRoomView: View {
             List {
                 Section("Tokens (\(voice.selectedTokenIds.count) đã chọn)") {
                     if voice.tokens.isEmpty {
-                        Text("Chưa có token — thêm bên dưới")
-                            .foregroundStyle(.secondary)
+                        Text("Chưa có token — thêm bên dưới").foregroundStyle(.secondary)
                     } else {
                         ForEach(voice.tokens) { t in
                             HStack(spacing: 12) {
                                 if let u = t.avatarURL {
                                     AsyncImage(url: u) { i in i.resizable().scaledToFill() }
-                                    placeholder: { Circle().fill(.gray) }
-                                        .frame(width: 36, height: 36).clipShape(Circle())
+                                    placeholder: { Circle().fill(.gray) }.frame(width: 36, height: 36).clipShape(Circle())
                                 } else {
-                                    Image(systemName: "person.circle.fill")
-                                        .resizable().frame(width: 36, height: 36)
-                                        .foregroundStyle(.gray)
+                                    Image(systemName: "person.circle.fill").resizable().frame(width: 36, height: 36).foregroundStyle(.gray)
                                 }
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(t.username).font(.subheadline.bold())
-                                    Text(t.isValid ? "Live" : "Die")
-                                        .font(.caption2).bold()
-                                        .foregroundStyle(t.isValid ? .green : .red)
+                                    Text(t.isValid ? "Live" : "Die").font(.caption2).bold().foregroundStyle(t.isValid ? .green : .red)
                                 }
                                 Spacer()
                                 if t.isValid {
                                     Button { voice.toggleSelection(t) } label: {
-                                        Image(systemName: voice.selectedTokenIds.contains(t.id)
-                                              ? "checkmark.circle.fill" : "circle")
+                                        Image(systemName: voice.selectedTokenIds.contains(t.id) ? "checkmark.circle.fill" : "circle")
                                             .foregroundStyle(.indigo).font(.title3)
                                     }.buttonStyle(.plain)
                                 }
@@ -3297,8 +3246,7 @@ struct VoiceRoomView: View {
 
                 Section("Server / Kênh voice") {
                     if voice.guilds.isEmpty {
-                        Text(voice.isLoading ? "Đang tải..." : "Chưa có server")
-                            .foregroundStyle(.secondary)
+                        Text(voice.isLoading ? "Đang tải..." : "Chưa có server").foregroundStyle(.secondary)
                     } else {
                         Picker("Server", selection: Binding(
                             get: { voice.selectedGuild },
@@ -3308,9 +3256,7 @@ struct VoiceRoomView: View {
                             }
                         )) {
                             Text("Chọn...").tag(Guild?.none)
-                            ForEach(voice.guilds) { g in
-                                Text(g.name).tag(Guild?.some(g))
-                            }
+                            ForEach(voice.guilds) { g in Text(g.name).tag(Guild?.some(g)) }
                         }
                         let grouped = voice.groupedVoiceChannels()
                         if !grouped.isEmpty {
@@ -3320,16 +3266,12 @@ struct VoiceRoomView: View {
                                     if let cat = section.category {
                                         Section(cat.displayName) {
                                             ForEach(section.items) { ch in
-                                                Label(ch.displayName,
-                                                      systemImage: "speaker.wave.2.fill")
-                                                    .tag(Channel?.some(ch))
+                                                Label(ch.displayName, systemImage: "speaker.wave.2.fill").tag(Channel?.some(ch))
                                             }
                                         }
                                     } else {
                                         ForEach(section.items) { ch in
-                                            Label(ch.displayName,
-                                                  systemImage: "speaker.wave.2.fill")
-                                                .tag(Channel?.some(ch))
+                                            Label(ch.displayName, systemImage: "speaker.wave.2.fill").tag(Channel?.some(ch))
                                         }
                                     }
                                 }
@@ -3342,20 +3284,15 @@ struct VoiceRoomView: View {
                     Button {
                         Task { await voice.joinAll() }
                     } label: {
-                        Label("Vào tất cả token đã chọn",
-                              systemImage: "person.3.fill")
-                            .frame(maxWidth: .infinity).padding(8)
+                        Label("Vào tất cả token đã chọn", systemImage: "person.3.fill").frame(maxWidth: .infinity).padding(8)
                     }
                     .background(Color.indigo).foregroundStyle(.white).cornerRadius(8)
-                    .disabled(voice.selectedGuild == nil
-                              || voice.selectedChannel == nil
-                              || voice.selectedTokenIds.isEmpty)
+                    .disabled(voice.selectedGuild == nil || voice.selectedChannel == nil || voice.selectedTokenIds.isEmpty)
 
                     Button(role: .destructive) {
                         Task { await voice.leaveAll() }
                     } label: {
-                        Label("Rời tất cả", systemImage: "phone.down.fill")
-                            .frame(maxWidth: .infinity).padding(8)
+                        Label("Rời tất cả", systemImage: "phone.down.fill").frame(maxWidth: .infinity).padding(8)
                     }.disabled(voice.sessions.isEmpty)
                 }
 
@@ -3363,8 +3300,7 @@ struct VoiceRoomView: View {
                     Section("Đang treo (\(voice.connectedCount))") {
                         ForEach(voice.tokens.filter { voice.sessions[$0.id] != nil }) { t in
                             if let s = voice.sessions[t.id] {
-                                VoiceSessionRow(session: s)
-                                    .environmentObject(voice)
+                                VoiceSessionRow(session: s).environmentObject(voice)
                             }
                         }
                     }
@@ -3375,8 +3311,7 @@ struct VoiceRoomView: View {
                 VoiceAddTokenSheet().environmentObject(voice)
             }
             .task {
-                if AppEndpoints.isLoaded && voice.guilds.isEmpty
-                    && !voice.selectedTokenIds.isEmpty {
+                if AppEndpoints.isLoaded && voice.guilds.isEmpty && !voice.selectedTokenIds.isEmpty {
                     await voice.loadGuilds()
                 }
             }
@@ -3393,42 +3328,31 @@ struct VoiceSessionRow: View {
                 Text(session.token.username).font(.subheadline.bold())
                 Spacer()
                 if session.isConnected {
-                    Label(session.elapsedString, systemImage: "clock")
-                        .font(.caption.monospaced()).foregroundStyle(.green)
+                    Label(session.elapsedString, systemImage: "clock").font(.caption.monospaced()).foregroundStyle(.green)
                 } else if let e = session.error {
-                    Text(e).font(.caption2).foregroundStyle(.red).lineLimit(1)
+                    Text(e).font(.caption2).foregroundStyle(.red).lineLimit(2)
                 } else {
                     ProgressView().scaleEffect(0.7)
                 }
             }
             if session.isConnected {
                 HStack(spacing: 8) {
-                    toggleBtn("mic.slash.fill", on: session.isMuted) {
-                        Task { await voice.toggleMute(session.id) }
-                    }
-                    toggleBtn("speaker.slash.fill", on: session.isDeafened) {
-                        Task { await voice.toggleDeafen(session.id) }
-                    }
-                    toggleBtn("dot.radiowaves.left.and.right", on: session.isStreaming) {
-                        Task { await voice.toggleStream(session.id) }
-                    }
+                    toggleBtn("mic.slash.fill", on: session.isMuted) { Task { await voice.toggleMute(session.id) } }
+                    toggleBtn("speaker.slash.fill", on: session.isDeafened) { Task { await voice.toggleDeafen(session.id) } }
+                    toggleBtn("dot.radiowaves.left.and.right", on: session.isStreaming) { Task { await voice.toggleStream(session.id) } }
                     Spacer()
                     Button(role: .destructive) {
                         Task { await session.disconnect() }
-                    } label: {
-                        Image(systemName: "phone.down.fill")
-                    }.buttonStyle(.borderedProminent).tint(.red)
+                    } label: { Image(systemName: "phone.down.fill") }.buttonStyle(.borderedProminent).tint(.red)
                 }
             }
         }
     }
     private func toggleBtn(_ icon: String, on: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .frame(width: 36, height: 32)
+            Image(systemName: icon).frame(width: 36, height: 32)
                 .background(on ? Color.red.opacity(0.2) : Color.gray.opacity(0.15))
-                .foregroundStyle(on ? .red : .primary)
-                .cornerRadius(8)
+                .foregroundStyle(on ? .red : .primary).cornerRadius(8)
         }.buttonStyle(.plain)
     }
 }
@@ -3444,32 +3368,20 @@ struct VoiceAddTokenSheet: View {
                 Section("Nhập token tay") {
                     TextField("Dán token...", text: $input, axis: .vertical)
                         .autocorrectionDisabled().textInputAutocapitalization(.never)
-                        .font(.system(.body, design: .monospaced))
-                        .lineLimit(2...8)
+                        .font(.system(.body, design: .monospaced)).lineLimit(2...8)
                 }
                 Section {
-                    Button { showFile = true } label: {
-                        Label("Nhập từ file .txt", systemImage: "doc.text")
-                    }
+                    Button { showFile = true } label: { Label("Nhập từ file .txt", systemImage: "doc.text") }
                 } footer: {
                     Text("Mỗi dòng 1 token. Hỗ trợ UTF-8/UTF-16/ANSI.")
                 }
             }
-            .navigationTitle("Thêm Token Voice")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Thêm Token Voice").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Huỷ") { dismiss() }
-                }
+                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Lưu") {
-                        Task {
-                            _ = await voice.addTokenManually(input)
-                            dismiss()
-                        }
-                    }
-                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || voice.isImporting)
+                    Button("Lưu") { Task { _ = await voice.addTokenManually(input); dismiss() } }
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || voice.isImporting)
                 }
             }
             .sheet(isPresented: $showFile) {
@@ -3479,8 +3391,7 @@ struct VoiceAddTokenSheet: View {
             }
             .overlay {
                 if voice.isImporting {
-                    ProgressView("Đang kiểm tra...").padding()
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    ProgressView("Đang kiểm tra...").padding().background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
         }
