@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 import UIKit
 import CryptoKit
 import MediaPlayer
+import Darwin
+import MachO
 
 // ==========================================
 // MARK: - DOCUMENT PICKER
@@ -45,7 +47,8 @@ class KeychainHelper {
             kSecValueData: data,
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
-            kSecAttrAccount: account
+            kSecAttrAccount: account,
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ] as CFDictionary
         SecItemDelete(query)
         SecItemAdd(query, nil)
@@ -87,6 +90,326 @@ class KeychainHelper {
 }
 
 // ==========================================
+// MARK: - OBFUSCATION & STRING ENCRYPTION
+// ==========================================
+enum Obfuscator {
+    private static let salt: [UInt8] = [0x5A, 0x8C, 0x3F, 0x1E, 0x9B, 0x72, 0x4D, 0x61]
+
+    static func reveal(_ bytes: [UInt8]) -> String {
+        var out = [UInt8]()
+        out.reserveCapacity(bytes.count)
+        for (i, b) in bytes.enumerated() {
+            out.append(b ^ salt[i % salt.count])
+        }
+        return String(bytes: out, encoding: .utf8) ?? ""
+    }
+}
+
+enum AppSecrets {
+    // Encrypted baseURL
+    static let baseURL: [UInt8] = [0x32, 0xf8, 0x4b, 0x6e, 0xe8, 0x48, 0x62, 0x4e, 0x31, 0xe9, 0x46, 0x30, 0xf5, 0x03, 0x39, 0x00, 0x3c, 0xea, 0x0f, 0x2f, 0xb5, 0x05, 0x22, 0x13, 0x31, 0xe9, 0x4d, 0x6d, 0xb5, 0x16, 0x28, 0x17]
+    // Encrypted Master Secret
+    static let masterSecret: [UInt8] = [0x0b, 0xd8, 0x60, 0x68, 0xa9, 0x2d, 0x1e, 0x24, 0x19, 0xd3, 0x06, 0x7c, 0xa3, 0x14, 0x7f, 0x00, 0x6e, 0xef, 0x08, 0x7b, 0xaa, 0x16, 0x78, 0x00, 0x62, 0xee, 0x0c, 0x7d, 0xad, 0x17, 0x74, 0x07, 0x68, 0xed, 0x0b, 0x7a, 0xac, 0x10, 0x7c, 0x04, 0x62, 0xea]
+}
+
+// ==========================================
+// MARK: - SECURITY GUARD & ANTI-CRACK ENGINE
+// ==========================================
+final class SecurityGuard: @unchecked Sendable {
+    static let shared = SecurityGuard()
+
+    private(set) var isCompromised = false
+    private var sessionToken: String? = nil
+    private var watchdogTimer: Timer? = nil
+    private let lock = NSLock()
+
+    private init() {
+        applyAntiDebug()
+    }
+
+    /// Ngăn chặn debugger (LLDB / GDB / Frida) gắn vào tiến trình
+    func applyAntiDebug() {
+        #if !DEBUG
+        typealias PtraceType = @convention(c) (CInt, pid_t, CInt, CInt) -> CInt
+        if let handle = dlopen(nil, RTLD_NOW) {
+            defer { dlclose(handle) }
+            let ptraceBytes: [UInt8] = [0x2a, 0xf8, 0x4d, 0x7f, 0xf8, 0x17] // "ptrace"
+            let symName = Obfuscator.reveal(ptraceBytes)
+            if let sym = dlsym(handle, symName) {
+                let ptraceFunc = unsafeBitCast(sym, to: PtraceType.self)
+                _ = ptraceFunc(31, 0, 0, 0) // PT_DENY_ATTACH = 31
+            }
+        }
+        #endif
+    }
+
+    /// Kiểm tra P_TRACED flag qua sysctl
+    static func isDebuggerAttached() -> Bool {
+        var info = kinfo_proc()
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
+        var size = MemoryLayout<kinfo_proc>.stride
+        let junk = sysctl(&mib, u_int(mib.count), &info, &size, nil, 0)
+        if junk == 0 {
+            return (info.kp_proc.p_flag & 0x0800) != 0
+        }
+        return false
+    }
+
+    /// Quét các dynamic library can thiệp / hooking / dylib injection
+    static func checkInjectedDylibs() -> Bool {
+        let count = _dyld_image_count()
+        let blacklisted = [
+            "fridagadget", "frida", "cydiasubstrate", "substrate",
+            "ellekit", "shadow", "libhooker", "substitute",
+            "sslunpinning", "flex", "cycript", "dumpdecrypted",
+            "bfdecrypt", "clutch", "dylib1.dylib", "tweak"
+        ]
+        for i in 0..<count {
+            if let namePtr = _dyld_get_image_name(i) {
+                let name = String(cString: namePtr).lowercased()
+                for target in blacklisted {
+                    if name.contains(target) {
+                        return true
+                    }
+                }
+            }
+        }
+
+        let dyldBytes: [UInt8] = [0x1e, 0xd5, 0x73, 0x5a, 0xc4, 0x3b, 0x03, 0x32, 0x1f, 0xde, 0x6b, 0x41, 0xd7, 0x3b, 0x0f, 0x33, 0x1b, 0xde, 0x76, 0x5b, 0xc8] // "DYLD_INSERT_LIBRARIES"
+        let dyldEnv = Obfuscator.reveal(dyldBytes)
+        if let insert = getenv(dyldEnv), String(cString: insert).count > 0 {
+            return true
+        }
+        return false
+    }
+
+    /// Phát hiện proxy hệ thống (Reqable, Charles, Shadowrocket HTTP proxy)
+    static func isProxyEnabled() -> Bool {
+        guard let dict = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+            return false
+        }
+        if let httpProxy = dict["HTTPProxy"] as? String, !httpProxy.isEmpty { return true }
+        if let httpsProxy = dict["HTTPSProxy"] as? String, !httpsProxy.isEmpty { return true }
+        if let enable = dict["HTTPEnable"] as? Int, enable == 1 { return true }
+        if let enable = dict["HTTPSEnable"] as? Int, enable == 1 { return true }
+        return false
+    }
+
+    /// Đánh dấu ứng dụng đã bị crack/can thiệp và hủy hoại bộ nhớ
+    func markCompromised(reason: String) {
+        lock.lock()
+        isCompromised = true
+        sessionToken = nil
+        lock.unlock()
+
+        AppEndpoints.clear()
+
+        let delay = Double.random(in: 2.0...5.0)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
+            exit(0)
+        }
+    }
+
+    /// Xác thực và lưu Session Token từ server
+    func updateSessionToken(_ token: String) -> Bool {
+        let parts = token.components(separatedBy: ".")
+        guard parts.count == 2,
+              let payloadData = Data(base64Encoded: parts[0]),
+              let payloadObj = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+              let mid = payloadObj["mid"] as? String,
+              let exp = payloadObj["exp"] as? Double else {
+            markCompromised(reason: "Invalid session envelope")
+            return false
+        }
+
+        let secret = Obfuscator.reveal(AppSecrets.masterSecret)
+        let expectedSig = SecureAPIClient.hmacHex(parts[0], secret: secret)
+        guard parts[1].lowercased() == expectedSig.lowercased() else {
+            markCompromised(reason: "Session signature mismatch")
+            return false
+        }
+
+        guard mid == MachineID.get() else {
+            markCompromised(reason: "Machine ID mismatch")
+            return false
+        }
+
+        guard exp > Date().timeIntervalSince1970 else {
+            return false
+        }
+
+        lock.lock()
+        sessionToken = token
+        lock.unlock()
+        return true
+    }
+
+    /// Kiểm tra quyền thực thi lõi (gắn sâu vào spam/nuke)
+    func verifyExecutionPermit() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if isCompromised { return false }
+        guard let token = sessionToken else { return false }
+
+        let parts = token.components(separatedBy: ".")
+        guard parts.count == 2 else { return false }
+
+        if SecurityGuard.isDebuggerAttached() || SecurityGuard.isProxyEnabled() || SecurityGuard.checkInjectedDylibs() {
+            markCompromised(reason: "Environment integrity compromised")
+            return false
+        }
+
+        return true
+    }
+
+    /// Bắt đầu Watchdog định kỳ kiểm tra ngầm
+    func startWatchdog() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.watchdogTimer?.invalidate()
+            self.watchdogTimer = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                if SecurityGuard.isDebuggerAttached() || SecurityGuard.checkInjectedDylibs() || SecurityGuard.isProxyEnabled() {
+                    self.markCompromised(reason: "Watchdog detected tampering")
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
+// MARK: - SECURE TRANSPORT & ENCRYPTED CLIENT
+// ==========================================
+final class SecureSessionDelegate: NSObject, URLSessionDelegate {
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let serverTrust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        var error: CFError?
+        let isTrusted = SecTrustEvaluateWithError(serverTrust, &error)
+        guard isTrusted else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+
+        if #available(iOS 15.0, *) {
+            if let certChain = SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate] {
+                for cert in certChain {
+                    let summary = (SecCertificateCopySubjectSummary(cert) as String? ?? "").lowercased()
+                    if summary.contains("charles") || summary.contains("reqable") ||
+                       summary.contains("fiddler") || summary.contains("burp") ||
+                       summary.contains("portswigger") || summary.contains("mitmproxy") ||
+                       summary.contains("shadowrocket") || summary.contains("surge") {
+                        SecurityGuard.shared.markCompromised(reason: "MITM root certificate detected")
+                        completionHandler(.cancelAuthenticationChallenge, nil)
+                        return
+                    }
+                }
+            }
+        }
+
+        completionHandler(.useCredential, URLCredential(trust: serverTrust))
+    }
+}
+
+final class SecureAPIClient {
+    static let shared = SecureAPIClient()
+    private let session: URLSession
+
+    var baseURL: String {
+        Obfuscator.reveal(AppSecrets.baseURL)
+    }
+
+    private var secret: String {
+        Obfuscator.reveal(AppSecrets.masterSecret)
+    }
+
+    private init() {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 20
+        session = URLSession(configuration: cfg, delegate: SecureSessionDelegate(), delegateQueue: nil)
+    }
+
+    static func hmacHex(_ str: String, secret: String) -> String {
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let code = HMAC<SHA256>.authenticationCode(for: Data(str.utf8), using: key)
+        return code.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func deriveKey(seed: String) -> SymmetricKey {
+        let hash = SHA256.hash(data: Data(seed.utf8))
+        return SymmetricKey(data: hash)
+    }
+
+    func sendEncryptedRequest<T: Decodable>(endpoint: String, bodyDict: [String: Any]) async throws -> T {
+        if SecurityGuard.isDebuggerAttached() || SecurityGuard.isProxyEnabled() || SecurityGuard.checkInjectedDylibs() {
+            SecurityGuard.shared.markCompromised(reason: "Tampering check failed")
+            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security check failed"])
+        }
+
+        let ts = String(Int(Date().timeIntervalSince1970))
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+
+        let clientKey = deriveKey(seed: "\(secret):\(nonce):\(ts)")
+        let jsonData = try JSONSerialization.data(withJSONObject: bodyDict)
+        let sealedBox = try AES.GCM.seal(jsonData, using: clientKey)
+        guard let combined = sealedBox.combined else {
+            throw NSError(domain: "Security", code: 500, userInfo: [NSLocalizedDescriptionKey: "Encryption error"])
+        }
+        let payloadBase64 = combined.base64EncodedString()
+        let sig = SecureAPIClient.hmacHex("\(payloadBase64):\(nonce):\(ts)", secret: secret)
+
+        let envelope: [String: Any] = [
+            "payload": payloadBase64,
+            "nonce": nonce,
+            "ts": ts,
+            "sig": sig
+        ]
+
+        guard let url = URL(string: "\(baseURL)\(endpoint)") else {
+            throw NSError(domain: "Network", code: 400, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: envelope)
+
+        let (data, res) = try await session.data(for: req)
+        guard let httpRes = res as? HTTPURLResponse, (200...299).contains(httpRes.statusCode) else {
+            let msg = String(data: data, encoding: .utf8) ?? "HTTP Error"
+            throw NSError(domain: "Network", code: (res as? HTTPURLResponse)?.statusCode ?? 500, userInfo: [NSLocalizedDescriptionKey: msg])
+        }
+
+        guard let serverEnvelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let respPayload = serverEnvelope["payload"] as? String,
+              let respSig = serverEnvelope["sig"] as? String else {
+            SecurityGuard.shared.markCompromised(reason: "Invalid server response structure")
+            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "App has been cracked. Invalid response."])
+        }
+
+        let expectedRespSig = SecureAPIClient.hmacHex("\(respPayload):\(nonce)", secret: secret)
+        guard respSig.lowercased() == expectedRespSig.lowercased() else {
+            SecurityGuard.shared.markCompromised(reason: "Server response signature verification failed")
+            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "App has been cracked. Response signature mismatch."])
+        }
+
+        let respKey = deriveKey(seed: "\(secret):resp:\(nonce):\(ts)")
+        guard let combinedRespData = Data(base64Encoded: respPayload) else {
+            throw NSError(domain: "Security", code: 500, userInfo: [NSLocalizedDescriptionKey: "Base64 decode failed"])
+        }
+        let respBox = try AES.GCM.SealedBox(combined: combinedRespData)
+        let decryptedData = try AES.GCM.open(respBox, using: respKey)
+
+        return try JSONDecoder().decode(T.self, from: decryptedData)
+    }
+}
+
+// ==========================================
 // MARK: - REMOTE CONFIG (từ Cloudflare Worker)
 // ==========================================
 struct RemoteConfigDTO: Codable {
@@ -108,12 +431,14 @@ struct ConfigResponse: Codable {
     let valid: Bool?
     let expiresAt: Int64?
     let config: RemoteConfigDTO?
+    let sessionToken: String?
     let error: String?
     let cracked: Bool?
 
     enum CodingKeys: String, CodingKey {
         case valid, config, error, cracked
         case expiresAt = "expires_at"
+        case sessionToken = "session_token"
     }
 }
 
@@ -164,7 +489,16 @@ enum MachineID {
     static func get() -> String {
         let k = "QT_MachineID"
         if let saved = KeychainHelper.standard.readString(forKey: k) { return saved }
-        let raw = "\(UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString)-\(Bundle.main.bundleIdentifier ?? "app")"
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let machineMirror = Mirror(reflecting: systemInfo.machine)
+        let model = machineMirror.children.reduce("") { identifier, element in
+            guard let value = element.value as? Int8, value != 0 else { return identifier }
+            return identifier + String(UnicodeScalar(UInt8(value)))
+        }
+        let vendor = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+        let bundle = Bundle.main.bundleIdentifier ?? "app"
+        let raw = "\(vendor)-\(model)-\(bundle)-v2"
         let hash = SHA256.hash(data: Data(raw.utf8))
         let newID = hash.compactMap { String(format: "%02x", $0) }.joined()
         KeychainHelper.standard.saveString(newID, forKey: k)
@@ -177,22 +511,16 @@ enum MachineID {
 // ==========================================
 final class ConfigAPIClient {
     static let shared = ConfigAPIClient()
-    private let baseURL = "https://key.nqtaff01.workers.dev"
-    // ⚠️ PHẢI TRÙNG VỚI DISCORD_CONFIG.app_secret BÊN SERVER
-    private static let APP_SECRET = "QT_v1_SECRET_2f8a9c1e7b3d4f6a_CHANGE_ME_ON_BOTH_SIDES"
+    var baseURL: String { SecureAPIClient.shared.baseURL }
 
     func fetchConfig(key: String) async throws -> ConfigResponse {
-        var req = URLRequest(url: URL(string: "\(baseURL)/config")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 15
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "license_key": key,
-            "machine_id": MachineID.get(),
-            "app_secret": ConfigAPIClient.APP_SECRET,
-        ])
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return try JSONDecoder().decode(ConfigResponse.self, from: data)
+        return try await SecureAPIClient.shared.sendEncryptedRequest(
+            endpoint: "/config",
+            bodyDict: [
+                "license_key": key,
+                "machine_id": MachineID.get()
+            ]
+        )
     }
 }
 
@@ -480,18 +808,26 @@ class DiscordClient {
         }
     }
     func validateToken() async throws -> DiscordUser {
+        guard SecurityGuard.shared.verifyExecutionPermit() else {
+            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+        }
         let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me")!)
         try check(r, d); return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
     func getAllGuilds() async throws -> [Guild] {
+        guard SecurityGuard.shared.verifyExecutionPermit() else { return [] }
         let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me/guilds")!)
         try check(r, d); return try JSONDecoder().decode([Guild].self, from: d)
     }
     func getAllChannels(guildId: String) async throws -> [Channel] {
+        guard SecurityGuard.shared.verifyExecutionPermit() else { return [] }
         let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(guildId)/channels")!)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
     func sendMessage(channelId: String, content: String) async throws {
+        guard SecurityGuard.shared.verifyExecutionPermit() else {
+            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+        }
         var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(channelId)/messages")!)
         req.httpMethod = "POST"
         req.timeoutInterval = 20
@@ -841,6 +1177,9 @@ class BotClient {
         }
     }
     func validate() async throws -> BotInfo {
+        guard SecurityGuard.shared.verifyExecutionPermit() else {
+            throw NSError(domain: "B", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+        }
         let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me")!)
         try check(r, d); return try JSONDecoder().decode(BotInfo.self, from: d)
     }
@@ -869,11 +1208,13 @@ class BotClient {
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
     func deleteChannel(_ c: String) async throws {
+        guard SecurityGuard.shared.verifyExecutionPermit() else { return }
         var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(c)")!)
         req.httpMethod = "DELETE"
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func createChannel(_ g: String, name: String, openEveryone: Bool) async throws -> String? {
+        guard SecurityGuard.shared.verifyExecutionPermit() else { return nil }
         var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/channels")!)
         req.httpMethod = "POST"
         var p: [String: Any] = ["name": name, "type": 0]
@@ -934,10 +1275,14 @@ class UserNukeClient {
         }
     }
     func validate() async throws -> DiscordUser {
+        guard SecurityGuard.shared.verifyExecutionPermit() else {
+            throw NSError(domain: "UN", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+        }
         let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me")!)
         try check(r, d); return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
     func getGuildsWithPerms() async throws -> [NukeGuild] {
+        guard SecurityGuard.shared.verifyExecutionPermit() else { return [] }
         let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me/guilds")!)
         try check(r, d); return try JSONDecoder().decode([NukeGuild].self, from: d)
     }
@@ -1751,23 +2096,28 @@ final class IndexBox: @unchecked Sendable {
 struct LicenseActivationResponse: Codable {
     let valid: Bool?
     let expiresAt: Int64?
+    let sessionToken: String?
+    let config: RemoteConfigDTO?
     let message: String?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
-        case valid, message, error
+        case valid, message, error, config
         case expiresAt = "expires_at"
+        case sessionToken = "session_token"
     }
 }
 
 struct LicenseValidationResponse: Codable {
     let valid: Bool?
     let expiresAt: Int64?
+    let sessionToken: String?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
         case valid, error
         case expiresAt = "expires_at"
+        case sessionToken = "session_token"
     }
 }
 
@@ -1782,32 +2132,28 @@ enum LicenseStatus: Equatable {
 
 final class LicenseAPIClient {
     static let shared = LicenseAPIClient()
-    let baseURL = "https://key.nqtaff01.workers.dev"
+    var baseURL: String { SecureAPIClient.shared.baseURL }
 
     private func machineID() -> String { MachineID.get() }
 
     func activate(key: String) async throws -> LicenseActivationResponse {
-        var req = URLRequest(url: URL(string: "\(baseURL)/activate")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 15
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "license_key": key, "machine_id": machineID()
-        ])
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return try JSONDecoder().decode(LicenseActivationResponse.self, from: data)
+        return try await SecureAPIClient.shared.sendEncryptedRequest(
+            endpoint: "/activate",
+            bodyDict: [
+                "license_key": key,
+                "machine_id": machineID()
+            ]
+        )
     }
 
     func validate(key: String) async throws -> LicenseValidationResponse {
-        var req = URLRequest(url: URL(string: "\(baseURL)/validate")!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 15
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
-            "license_key": key, "machine_id": machineID()
-        ])
-        let (data, _) = try await URLSession.shared.data(for: req)
-        return try JSONDecoder().decode(LicenseValidationResponse.self, from: data)
+        return try await SecureAPIClient.shared.sendEncryptedRequest(
+            endpoint: "/validate",
+            bodyDict: [
+                "license_key": key,
+                "machine_id": machineID()
+            ]
+        )
     }
 }
 
@@ -1849,6 +2195,15 @@ final class LicenseManager: ObservableObject {
                 status = .invalid(reason: res.error ?? "Key không hợp lệ")
                 return status
             }
+            if let token = res.sessionToken {
+                guard SecurityGuard.shared.updateSessionToken(token) else {
+                    status = .cracked(reason: "Session permit corrupted")
+                    return status
+                }
+            }
+            if let cfg = res.config {
+                AppEndpoints.apply(cfg)
+            }
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
             let now = Date()
             KeychainHelper.standard.saveString(clean, forKey: keyStoreKey)
@@ -1856,7 +2211,10 @@ final class LicenseManager: ObservableObject {
             KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: lastCheckKey)
             KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
             licenseKey = clean; activatedAt = now
-            await fetchAndApplyConfig(key: clean)
+            status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
+            if !AppEndpoints.isLoaded {
+                await fetchAndApplyConfig(key: clean)
+            }
             return status
         } catch {
             status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
@@ -1879,6 +2237,7 @@ final class LicenseManager: ObservableObject {
         do {
             let res = try await ConfigAPIClient.shared.fetchConfig(key: key)
             if res.cracked == true {
+                SecurityGuard.shared.markCompromised(reason: res.error ?? "App has been cracked")
                 AppEndpoints.clear()
                 status = .cracked(reason: res.error ?? "App has been cracked.")
                 return
@@ -1888,26 +2247,21 @@ final class LicenseManager: ObservableObject {
                 status = .cracked(reason: res.error ?? "App has been cracked.")
                 return
             }
+            if let token = res.sessionToken {
+                guard SecurityGuard.shared.updateSessionToken(token) else {
+                    AppEndpoints.clear()
+                    status = .cracked(reason: "Invalid session permit")
+                    return
+                }
+            }
             AppEndpoints.apply(cfg)
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
             KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
             KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
             status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
         } catch {
-            if let s = KeychainHelper.standard.readString(forKey: expiryStoreKey),
-               let d = Double(s) {
-                let exp = Date(timeIntervalSince1970: d)
-                if Date() <= exp {
-                    AppEndpoints.clear()
-                    status = .cracked(reason: "App has been cracked. Cannot verify license.")
-                    return
-                } else {
-                    AppEndpoints.clear()
-                    status = .expired(expiresOn: exp)
-                    return
-                }
-            }
             AppEndpoints.clear()
+            SecurityGuard.shared.markCompromised(reason: "Verification failed")
             status = .cracked(reason: "App has been cracked. Cannot verify license.")
         }
     }
@@ -1922,7 +2276,7 @@ final class LicenseManager: ObservableObject {
     }
 
     var isUnlocked: Bool {
-        if case .valid = status, AppEndpoints.isLoaded { return true }
+        if case .valid = status, AppEndpoints.isLoaded, SecurityGuard.shared.verifyExecutionPermit() { return true }
         return false
     }
 
@@ -2267,12 +2621,17 @@ struct SpamDiscordApp: App {
     @StateObject private var license = LicenseManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        SecurityGuard.shared.applyAntiDebug()
+        SecurityGuard.shared.startWatchdog()
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {
                 switch license.status {
                 case .valid:
-                    if AppEndpoints.isLoaded {
+                    if AppEndpoints.isLoaded && SecurityGuard.shared.verifyExecutionPermit() {
                         MainTabView()
                             .environmentObject(app)
                             .environmentObject(bot)
