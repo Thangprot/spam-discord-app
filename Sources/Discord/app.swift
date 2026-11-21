@@ -48,7 +48,7 @@ class KeychainHelper {
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
-            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock
         ] as CFDictionary
         SecItemDelete(query)
         SecItemAdd(query, nil)
@@ -120,94 +120,16 @@ final class SecurityGuard: @unchecked Sendable {
 
     private(set) var isCompromised = false
     private var sessionToken: String? = nil
-    private var watchdogTimer: Timer? = nil
     private let lock = NSLock()
 
-    private init() {
-        applyAntiDebug()
-    }
+    private init() {}
 
-    /// Ngăn chặn debugger (LLDB / GDB / Frida) gắn vào tiến trình
-    func applyAntiDebug() {
-        #if !DEBUG
-        typealias PtraceType = @convention(c) (CInt, pid_t, CInt, CInt) -> CInt
-        if let handle = dlopen(nil, RTLD_NOW) {
-            defer { dlclose(handle) }
-            let ptraceBytes: [UInt8] = [0x2a, 0xf8, 0x4d, 0x7f, 0xf8, 0x17] // "ptrace"
-            let symName = Obfuscator.reveal(ptraceBytes)
-            if let sym = dlsym(handle, symName) {
-                let ptraceFunc = unsafeBitCast(sym, to: PtraceType.self)
-                _ = ptraceFunc(31, 0, 0, 0) // PT_DENY_ATTACH = 31
-            }
-        }
-        #endif
-    }
-
-    /// Kiểm tra P_TRACED flag qua sysctl
-    static func isDebuggerAttached() -> Bool {
-        var info = kinfo_proc()
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]
-        var size = MemoryLayout<kinfo_proc>.stride
-        let junk = sysctl(&mib, u_int(mib.count), &info, &size, nil, 0)
-        if junk == 0 {
-            return (info.kp_proc.p_flag & 0x0800) != 0
-        }
-        return false
-    }
-
-    /// Quét các dynamic library can thiệp / hooking / dylib injection
-    static func checkInjectedDylibs() -> Bool {
-        let count = _dyld_image_count()
-        let blacklisted = [
-            "fridagadget", "frida", "cydiasubstrate", "substrate",
-            "ellekit", "shadow", "libhooker", "substitute",
-            "sslunpinning", "flex", "cycript", "dumpdecrypted",
-            "bfdecrypt", "clutch", "dylib1.dylib", "tweak"
-        ]
-        for i in 0..<count {
-            if let namePtr = _dyld_get_image_name(i) {
-                let name = String(cString: namePtr).lowercased()
-                for target in blacklisted {
-                    if name.contains(target) {
-                        return true
-                    }
-                }
-            }
-        }
-
-        let dyldBytes: [UInt8] = [0x1e, 0xd5, 0x73, 0x5a, 0xc4, 0x3b, 0x03, 0x32, 0x1f, 0xde, 0x6b, 0x41, 0xd7, 0x3b, 0x0f, 0x33, 0x1b, 0xde, 0x76, 0x5b, 0xc8] // "DYLD_INSERT_LIBRARIES"
-        let dyldEnv = Obfuscator.reveal(dyldBytes)
-        if let insert = getenv(dyldEnv), String(cString: insert).count > 0 {
-            return true
-        }
-        return false
-    }
-
-    /// Phát hiện proxy hệ thống (Reqable, Charles, Shadowrocket HTTP proxy)
-    static func isProxyEnabled() -> Bool {
-        guard let dict = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
-            return false
-        }
-        if let httpProxy = dict["HTTPProxy"] as? String, !httpProxy.isEmpty { return true }
-        if let httpsProxy = dict["HTTPSProxy"] as? String, !httpsProxy.isEmpty { return true }
-        if let enable = dict["HTTPEnable"] as? Int, enable == 1 { return true }
-        if let enable = dict["HTTPSEnable"] as? Int, enable == 1 { return true }
-        return false
-    }
-
-    /// Đánh dấu ứng dụng đã bị crack/can thiệp và hủy hoại bộ nhớ
     func markCompromised(reason: String) {
         lock.lock()
         isCompromised = true
         sessionToken = nil
         lock.unlock()
-
         AppEndpoints.clear()
-
-        let delay = Double.random(in: 2.0...5.0)
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
-            exit(0)
-        }
     }
 
     /// Xác thực và lưu Session Token từ server
@@ -240,6 +162,7 @@ final class SecurityGuard: @unchecked Sendable {
 
         lock.lock()
         sessionToken = token
+        isCompromised = false
         lock.unlock()
         return true
     }
@@ -255,67 +178,13 @@ final class SecurityGuard: @unchecked Sendable {
         let parts = token.components(separatedBy: ".")
         guard parts.count == 2 else { return false }
 
-        if SecurityGuard.isDebuggerAttached() || SecurityGuard.isProxyEnabled() || SecurityGuard.checkInjectedDylibs() {
-            markCompromised(reason: "Environment integrity compromised")
-            return false
-        }
-
         return true
-    }
-
-    /// Bắt đầu Watchdog định kỳ kiểm tra ngầm
-    func startWatchdog() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.watchdogTimer?.invalidate()
-            self.watchdogTimer = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
-                if SecurityGuard.isDebuggerAttached() || SecurityGuard.checkInjectedDylibs() || SecurityGuard.isProxyEnabled() {
-                    self.markCompromised(reason: "Watchdog detected tampering")
-                }
-            }
-        }
     }
 }
 
 // ==========================================
 // MARK: - SECURE TRANSPORT & ENCRYPTED CLIENT
 // ==========================================
-final class SecureSessionDelegate: NSObject, URLSessionDelegate {
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              let serverTrust = challenge.protectionSpace.serverTrust else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-
-        var error: CFError?
-        let isTrusted = SecTrustEvaluateWithError(serverTrust, &error)
-        guard isTrusted else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-
-        if #available(iOS 15.0, *) {
-            if let certChain = SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate] {
-                for cert in certChain {
-                    let summary = (SecCertificateCopySubjectSummary(cert) as String? ?? "").lowercased()
-                    if summary.contains("charles") || summary.contains("reqable") ||
-                       summary.contains("fiddler") || summary.contains("burp") ||
-                       summary.contains("portswigger") || summary.contains("mitmproxy") ||
-                       summary.contains("shadowrocket") || summary.contains("surge") {
-                        SecurityGuard.shared.markCompromised(reason: "MITM root certificate detected")
-                        completionHandler(.cancelAuthenticationChallenge, nil)
-                        return
-                    }
-                }
-            }
-        }
-
-        completionHandler(.useCredential, URLCredential(trust: serverTrust))
-    }
-}
-
 final class SecureAPIClient {
     static let shared = SecureAPIClient()
     private let session: URLSession
@@ -330,9 +199,9 @@ final class SecureAPIClient {
 
     private init() {
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 15
-        cfg.timeoutIntervalForResource = 20
-        session = URLSession(configuration: cfg, delegate: SecureSessionDelegate(), delegateQueue: nil)
+        cfg.timeoutIntervalForRequest = 20
+        cfg.timeoutIntervalForResource = 30
+        session = URLSession(configuration: cfg)
     }
 
     static func hmacHex(_ str: String, secret: String) -> String {
@@ -347,11 +216,6 @@ final class SecureAPIClient {
     }
 
     func sendEncryptedRequest<T: Decodable>(endpoint: String, bodyDict: [String: Any]) async throws -> T {
-        if SecurityGuard.isDebuggerAttached() || SecurityGuard.isProxyEnabled() || SecurityGuard.checkInjectedDylibs() {
-            SecurityGuard.shared.markCompromised(reason: "Tampering check failed")
-            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security check failed"])
-        }
-
         let ts = String(Int(Date().timeIntervalSince1970))
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
 
@@ -385,27 +249,35 @@ final class SecureAPIClient {
             throw NSError(domain: "Network", code: (res as? HTTPURLResponse)?.statusCode ?? 500, userInfo: [NSLocalizedDescriptionKey: msg])
         }
 
-        guard let serverEnvelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let respPayload = serverEnvelope["payload"] as? String,
-              let respSig = serverEnvelope["sig"] as? String else {
-            SecurityGuard.shared.markCompromised(reason: "Invalid server response structure")
-            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "App has been cracked. Invalid response."])
+        // Kiểm tra xem phản hồi có phải là gói tin mã hóa AES-GCM không
+        if let serverEnvelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let respPayload = serverEnvelope["payload"] as? String,
+           let respSig = serverEnvelope["sig"] as? String {
+
+            let expectedRespSig = SecureAPIClient.hmacHex("\(respPayload):\(nonce)", secret: secret)
+            guard respSig.lowercased() == expectedRespSig.lowercased() else {
+                throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Chữ ký bảo mật không khớp. Gói tin bị can thiệp."])
+            }
+
+            let respKey = deriveKey(seed: "\(secret):resp:\(nonce):\(ts)")
+            guard let combinedRespData = Data(base64Encoded: respPayload) else {
+                throw NSError(domain: "Security", code: 500, userInfo: [NSLocalizedDescriptionKey: "Base64 decode failed"])
+            }
+            let respBox = try AES.GCM.SealedBox(combined: combinedRespData)
+            let decryptedData = try AES.GCM.open(respBox, using: respKey)
+            return try JSONDecoder().decode(T.self, from: decryptedData)
         }
 
-        let expectedRespSig = SecureAPIClient.hmacHex("\(respPayload):\(nonce)", secret: secret)
-        guard respSig.lowercased() == expectedRespSig.lowercased() else {
-            SecurityGuard.shared.markCompromised(reason: "Server response signature verification failed")
-            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "App has been cracked. Response signature mismatch."])
+        // Nếu server trả về JSON dạng thường (trường hợp worker báo lỗi trực tiếp)
+        if let plainObj = try? JSONDecoder().decode(T.self, from: data) {
+            return plainObj
+        }
+        if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let errMsg = errObj["error"] as? String {
+            throw NSError(domain: "Security", code: 400, userInfo: [NSLocalizedDescriptionKey: errMsg])
         }
 
-        let respKey = deriveKey(seed: "\(secret):resp:\(nonce):\(ts)")
-        guard let combinedRespData = Data(base64Encoded: respPayload) else {
-            throw NSError(domain: "Security", code: 500, userInfo: [NSLocalizedDescriptionKey: "Base64 decode failed"])
-        }
-        let respBox = try AES.GCM.SealedBox(combined: combinedRespData)
-        let decryptedData = try AES.GCM.open(respBox, using: respKey)
-
-        return try JSONDecoder().decode(T.self, from: decryptedData)
+        throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Phản hồi từ server không hợp lệ."])
     }
 }
 
@@ -429,6 +301,7 @@ struct RemoteConfigDTO: Codable {
 
 struct ConfigResponse: Codable {
     let valid: Bool?
+    let createdAt: Int64?
     let expiresAt: Int64?
     let config: RemoteConfigDTO?
     let sessionToken: String?
@@ -437,6 +310,7 @@ struct ConfigResponse: Codable {
 
     enum CodingKeys: String, CodingKey {
         case valid, config, error, cracked
+        case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
     }
@@ -487,18 +361,14 @@ struct AppEndpoints {
 // ==========================================
 enum MachineID {
     static func get() -> String {
-        let k = "QT_MachineID"
-        if let saved = KeychainHelper.standard.readString(forKey: k) { return saved }
-        var systemInfo = utsname()
-        uname(&systemInfo)
-        let machineMirror = Mirror(reflecting: systemInfo.machine)
-        let model = machineMirror.children.reduce("") { identifier, element in
-            guard let value = element.value as? Int8, value != 0 else { return identifier }
-            return identifier + String(UnicodeScalar(UInt8(value)))
+        let k = "QT_MachineID_v2"
+        if let saved = KeychainHelper.standard.readString(forKey: k), !saved.isEmpty {
+            return saved
         }
         let vendor = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+        let model = UIDevice.current.model
         let bundle = Bundle.main.bundleIdentifier ?? "app"
-        let raw = "\(vendor)-\(model)-\(bundle)-v2"
+        let raw = "\(vendor)-\(model)-\(bundle)"
         let hash = SHA256.hash(data: Data(raw.utf8))
         let newID = hash.compactMap { String(format: "%02x", $0) }.joined()
         KeychainHelper.standard.saveString(newID, forKey: k)
@@ -2176,8 +2046,8 @@ final class LicenseManager: ObservableObject {
         if let s = KeychainHelper.standard.readString(forKey: activatedStoreKey),
            let d = Double(s) { activatedAt = Date(timeIntervalSince1970: d) }
 
-        if licenseKey == nil {
-            status = .cracked(reason: "App has been cracked. No license found.")
+        if licenseKey == nil || licenseKey?.isEmpty == true {
+            status = .notActivated
         } else {
             status = .checking
             Task { @MainActor [weak self] in await self?.refreshStatus() }
@@ -2186,7 +2056,7 @@ final class LicenseManager: ObservableObject {
 
     func activate(key: String) async -> LicenseStatus {
         let clean = key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        guard !clean.isEmpty else { status = .invalid(reason: "Key trống"); return status }
+        guard !clean.isEmpty else { status = .invalid(reason: "Vui lòng nhập License Key"); return status }
         isChecking = true
         defer { isChecking = false }
         do {
@@ -2196,36 +2066,34 @@ final class LicenseManager: ObservableObject {
                 return status
             }
             if let token = res.sessionToken {
-                guard SecurityGuard.shared.updateSessionToken(token) else {
-                    status = .cracked(reason: "Session permit corrupted")
-                    return status
-                }
+                _ = SecurityGuard.shared.updateSessionToken(token)
             }
             if let cfg = res.config {
                 AppEndpoints.apply(cfg)
             }
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
-            let now = Date()
+            let now = res.createdAt != nil ? Date(timeIntervalSince1970: Double(res.createdAt!) / 1000) : Date()
             KeychainHelper.standard.saveString(clean, forKey: keyStoreKey)
             KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
-            KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: lastCheckKey)
+            KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
             KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
-            licenseKey = clean; activatedAt = now
+            licenseKey = clean
+            activatedAt = now
             status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
             if !AppEndpoints.isLoaded {
                 await fetchAndApplyConfig(key: clean)
             }
             return status
         } catch {
-            status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
+            status = .invalid(reason: "Lỗi kích hoạt: \(error.localizedDescription)")
             return status
         }
     }
 
     func refreshStatus() async {
-        guard let key = licenseKey else {
+        guard let key = licenseKey, !key.isEmpty else {
             AppEndpoints.clear()
-            status = .cracked(reason: "App has been cracked. No license found.")
+            status = .notActivated
             return
         }
         isChecking = true
@@ -2239,20 +2107,21 @@ final class LicenseManager: ObservableObject {
             if res.cracked == true {
                 SecurityGuard.shared.markCompromised(reason: res.error ?? "App has been cracked")
                 AppEndpoints.clear()
-                status = .cracked(reason: res.error ?? "App has been cracked.")
+                status = .cracked(reason: res.error ?? "Key không hợp lệ hoặc đã bị vô hiệu hóa.")
                 return
             }
             guard res.valid == true, let cfg = res.config, let expMs = res.expiresAt else {
                 AppEndpoints.clear()
-                status = .cracked(reason: res.error ?? "App has been cracked.")
+                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc đã hết hạn.")
                 return
             }
             if let token = res.sessionToken {
-                guard SecurityGuard.shared.updateSessionToken(token) else {
-                    AppEndpoints.clear()
-                    status = .cracked(reason: "Invalid session permit")
-                    return
-                }
+                _ = SecurityGuard.shared.updateSessionToken(token)
+            }
+            if let ca = res.createdAt {
+                let actDate = Date(timeIntervalSince1970: Double(ca) / 1000)
+                activatedAt = actDate
+                KeychainHelper.standard.saveString("\(actDate.timeIntervalSince1970)", forKey: activatedStoreKey)
             }
             AppEndpoints.apply(cfg)
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
@@ -2260,9 +2129,16 @@ final class LicenseManager: ObservableObject {
             KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
             status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
         } catch {
-            AppEndpoints.clear()
-            SecurityGuard.shared.markCompromised(reason: "Verification failed")
-            status = .cracked(reason: "App has been cracked. Cannot verify license.")
+            if let s = KeychainHelper.standard.readString(forKey: expiryStoreKey),
+               let d = Double(s) {
+                let exp = Date(timeIntervalSince1970: d)
+                if Date() > exp {
+                    AppEndpoints.clear()
+                    status = .expired(expiresOn: exp)
+                    return
+                }
+            }
+            status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
         }
     }
 
@@ -2272,7 +2148,7 @@ final class LicenseManager: ObservableObject {
         }
         licenseKey = nil; activatedAt = nil
         AppEndpoints.clear()
-        status = .cracked(reason: "App has been cracked. No license found.")
+        status = .notActivated
     }
 
     var isUnlocked: Bool {
@@ -2280,20 +2156,43 @@ final class LicenseManager: ObservableObject {
         return false
     }
 
+    func formatDateTime(_ d: Date) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "dd/MM/yyyy HH:mm:ss"
+        df.locale = Locale(identifier: "vi_VN")
+        return df.string(from: d)
+    }
+
+    func formatDate(_ d: Date) -> String {
+        return formatDateTime(d)
+    }
+
+    func timeRemaining(until target: Date) -> String {
+        let now = Date()
+        guard target > now else { return "Đã hết hạn" }
+        let diff = Int(target.timeIntervalSince(now))
+        let days = diff / 86400
+        let hours = (diff % 86400) / 3600
+        let minutes = (diff % 3600) / 60
+        let seconds = diff % 60
+        if days > 0 {
+            return "\(days) ngày \(hours) giờ \(minutes) phút \(seconds) giây"
+        } else if hours > 0 {
+            return "\(hours) giờ \(minutes) phút \(seconds) giây"
+        } else {
+            return "\(minutes) phút \(seconds) giây"
+        }
+    }
+
     var statusText: String {
         switch status {
         case .notActivated: return "Chưa kích hoạt"
         case .checking: return "Đang kiểm tra..."
-        case .valid(let d): return "Còn hạn đến \(formatDate(d))"
-        case .expired(let d): return "Đã hết hạn ngày \(formatDate(d))"
+        case .valid(let d): return "Còn hạn đến \(formatDateTime(d))"
+        case .expired(let d): return "Đã hết hạn ngày \(formatDateTime(d))"
         case .invalid(let r): return r
         case .cracked(let r): return r
         }
-    }
-
-    func formatDate(_ d: Date) -> String {
-        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy"
-        return df.string(from: d)
     }
 }
 
@@ -2437,7 +2336,7 @@ struct LockView: View {
                                 case .valid: error = nil
                                 case .invalid(let r): error = r
                                 case .cracked(let r): error = r
-                                case .expired(let d): error = "Key đã hết hạn ngày \(fmt(d))"
+                                case .expired(let d): error = "Key đã hết hạn lúc \(fmt(d))"
                                 default: error = "Không thể kích hoạt"
                                 }
                             }
@@ -2453,7 +2352,7 @@ struct LockView: View {
                     }.padding(.horizontal, 30)
 
                     if case .expired(let d) = license.status {
-                        Text("⚠️ Key trước đó đã hết hạn ngày \(fmt(d))")
+                        Text("⚠️ Key trước đó đã hết hạn lúc: \(fmt(d))")
                             .font(.caption).foregroundStyle(.orange)
                             .multilineTextAlignment(.center).padding(.horizontal)
                     }
@@ -2468,7 +2367,9 @@ struct LockView: View {
     }
 
     private func fmt(_ d: Date) -> String {
-        let df = DateFormatter(); df.dateFormat = "dd/MM/yyyy"
+        let df = DateFormatter()
+        df.dateFormat = "dd/MM/yyyy HH:mm:ss"
+        df.locale = Locale(identifier: "vi_VN")
         return df.string(from: d)
     }
 }
@@ -2541,21 +2442,30 @@ struct AboutView: View {
                         }
                         Divider()
                         HStack {
-                            Text("Activated On").font(.subheadline)
+                            Text("Ngày giờ kích hoạt").font(.subheadline)
                             Spacer()
-                            Text(license.activatedAt != nil ? license.formatDate(license.activatedAt!) : "N/A")
+                            Text(license.activatedAt != nil ? license.formatDateTime(license.activatedAt!) : "N/A")
                                 .font(.subheadline.bold()).foregroundStyle(.secondary)
                         }
                         Divider()
                         HStack {
-                            Text("Expires On").font(.subheadline)
+                            Text("Ngày giờ hết hạn").font(.subheadline)
                             Spacer()
                             if case .valid(let exp) = license.status {
-                                Text(license.formatDate(exp)).font(.subheadline.bold()).foregroundStyle(.green)
+                                Text(license.formatDateTime(exp)).font(.subheadline.bold()).foregroundStyle(.green)
                             } else if case .expired(let exp) = license.status {
-                                Text(license.formatDate(exp)).font(.subheadline.bold()).foregroundStyle(.red)
+                                Text(license.formatDateTime(exp)).font(.subheadline.bold()).foregroundStyle(.red)
                             } else {
                                 Text("N/A").font(.subheadline.bold()).foregroundStyle(.secondary)
+                            }
+                        }
+                        if case .valid(let exp) = license.status {
+                            Divider()
+                            HStack {
+                                Text("Thời gian còn lại").font(.subheadline)
+                                Spacer()
+                                Text(license.timeRemaining(until: exp))
+                                    .font(.subheadline.bold()).foregroundStyle(.indigo)
                             }
                         }
                     }
@@ -2621,11 +2531,6 @@ struct SpamDiscordApp: App {
     @StateObject private var license = LicenseManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
-    init() {
-        SecurityGuard.shared.applyAntiDebug()
-        SecurityGuard.shared.startWatchdog()
-    }
-
     var body: some Scene {
         WindowGroup {
             Group {
@@ -2645,12 +2550,7 @@ struct SpamDiscordApp: App {
                 case .cracked(let reason):
                     CrackedView(message: reason).environmentObject(license)
                 case .notActivated, .expired, .invalid:
-                    if license.licenseKey == nil {
-                        CrackedView(message: "App has been cracked. No license found.")
-                            .environmentObject(license)
-                    } else {
-                        LockView().environmentObject(license)
-                    }
+                    LockView().environmentObject(license)
                 }
             }
             .onChange(of: scenePhase) { phase in

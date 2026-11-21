@@ -471,13 +471,13 @@ async function handleActivate(req, env) {
       await putLicense(env, key, lic);
       const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
       const { app_secret, ...publicCfg } = DISCORD_CONFIG;
-      respData = { valid: true, expires_at: lic.expires_at, session_token: sessionToken, config: publicCfg, message: "OK" };
+      respData = { valid: true, created_at: lic.created_at || nowMs(), expires_at: lic.expires_at, session_token: sessionToken, config: publicCfg, message: "OK" };
     } else if (lic.machine_id !== machineId) {
       respData = { valid: false, error: "Key đã được kích hoạt trên thiết bị khác" };
     } else {
       const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
       const { app_secret, ...publicCfg } = DISCORD_CONFIG;
-      respData = { valid: true, expires_at: lic.expires_at, session_token: sessionToken, config: publicCfg, message: "OK" };
+      respData = { valid: true, created_at: lic.created_at || nowMs(), expires_at: lic.expires_at, session_token: sessionToken, config: publicCfg, message: "OK" };
     }
   }
 
@@ -516,7 +516,7 @@ async function handleValidate(req, env) {
       respData = { valid: false, error: "Key đã dùng trên thiết bị khác" };
     } else {
       const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
-      respData = { valid: true, expires_at: lic.expires_at, session_token: sessionToken };
+      respData = { valid: true, created_at: lic.created_at || nowMs(), expires_at: lic.expires_at, session_token: sessionToken };
     }
   }
 
@@ -553,6 +553,7 @@ async function handleConfig(req, env) {
     const { app_secret, ...publicCfg } = DISCORD_CONFIG;
     respData = {
       valid: true,
+      created_at: lic.created_at || nowMs(),
       expires_at: lic.expires_at,
       session_token: sessionToken,
       config: publicCfg,
