@@ -1965,6 +1965,7 @@ final class IndexBox: @unchecked Sendable {
 // ==========================================
 struct LicenseActivationResponse: Codable {
     let valid: Bool?
+    let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
     let config: RemoteConfigDTO?
@@ -1973,6 +1974,7 @@ struct LicenseActivationResponse: Codable {
 
     enum CodingKeys: String, CodingKey {
         case valid, message, error, config
+        case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
     }
@@ -1980,12 +1982,14 @@ struct LicenseActivationResponse: Codable {
 
 struct LicenseValidationResponse: Codable {
     let valid: Bool?
+    let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
     let error: String?
 
     enum CodingKeys: String, CodingKey {
         case valid, error
+        case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
     }
