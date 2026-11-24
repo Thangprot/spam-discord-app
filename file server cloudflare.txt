@@ -81,10 +81,10 @@ async function decryptClientPayload(reqBody, secret) {
     throw new Error("Missing required security envelope");
   }
 
-  // Chống Replay Attack: gói tin phải trong vòng 60 giây
+  // Chống Replay Attack: Cho phép dung sai chênh lệch thời gian 300 giây (5 phút) để tránh lỗi lệch giờ thiết bị
   const nowSec = Math.floor(Date.now() / 1000);
   const reqSec = parseInt(ts);
-  if (isNaN(reqSec) || Math.abs(nowSec - reqSec) > 60) {
+  if (isNaN(reqSec) || Math.abs(nowSec - reqSec) > 300) {
     throw new Error("Request expired / Replay attack detected");
   }
 
@@ -534,7 +534,7 @@ async function handleConfig(req, env) {
     var nonce = rawReq.nonce;
     var ts = rawReq.ts;
   } catch (err) {
-    return json({ error: "Tampered or invalid signature", cracked: true }, 403);
+    return json({ error: "Lỗi giải mã hoặc lệch giờ: " + err.message, valid: false }, 403);
   }
 
   const key = (body.license_key || "").trim().toUpperCase();
@@ -542,12 +542,27 @@ async function handleConfig(req, env) {
 
   let respData;
   const lic = await getLicense(env, key);
-  if (!lic || lic.disabled) {
-    respData = { error: "App has been cracked", cracked: true, valid: false };
+  if (!lic) {
+    respData = { error: "Key không tồn tại", valid: false };
+  } else if (lic.disabled) {
+    respData = { error: "Key đã bị vô hiệu hóa", cracked: true, valid: false };
   } else if (lic.expires_at && nowMs() > lic.expires_at) {
-    respData = { error: "License expired", cracked: true, valid: false };
-  } else if (lic.machine_id && lic.machine_id !== machineId) {
-    respData = { error: "App has been cracked (hardware mismatch)", cracked: true, valid: false };
+    respData = { error: "Key đã hết hạn sử dụng", expired: true, valid: false };
+  } else if (!lic.machine_id) {
+    // Tự động gắn machine_id nếu chưa có
+    lic.machine_id = machineId;
+    await putLicense(env, key, lic);
+    const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
+    const { app_secret, ...publicCfg } = DISCORD_CONFIG;
+    respData = {
+      valid: true,
+      created_at: lic.created_at || nowMs(),
+      expires_at: lic.expires_at,
+      session_token: sessionToken,
+      config: publicCfg,
+    };
+  } else if (lic.machine_id !== machineId) {
+    respData = { error: "Key đã dùng trên thiết bị khác (HWID mismatch)", valid: false };
   } else {
     const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
     const { app_secret, ...publicCfg } = DISCORD_CONFIG;

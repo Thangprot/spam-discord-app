@@ -43,15 +43,21 @@ class KeychainHelper {
     private init() {}
 
     func save(_ data: Data, service: String, account: String) {
-        let query = [
-            kSecValueData: data,
+        let deleteQuery = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account
+        ] as CFDictionary
+        SecItemDelete(deleteQuery)
+
+        let addQuery = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
+            kSecValueData: data,
             kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlock
         ] as CFDictionary
-        SecItemDelete(query)
-        SecItemAdd(query, nil)
+        SecItemAdd(addQuery, nil)
     }
 
     func read(service: String, account: String) -> Data? {
@@ -86,6 +92,36 @@ class KeychainHelper {
             return String(data: data, encoding: .utf8)
         }
         return nil
+    }
+}
+
+/// Dual-layer persistence: lưu đồng thời UserDefaults và Keychain để không bao giờ bị mất key khi thoát app
+final class PersistentStorage {
+    static let shared = PersistentStorage()
+    private init() {}
+
+    func saveString(_ value: String, forKey key: String) {
+        UserDefaults.standard.set(value, forKey: key)
+        UserDefaults.standard.synchronize()
+        KeychainHelper.standard.saveString(value, forKey: key)
+    }
+
+    func readString(forKey key: String) -> String? {
+        if let val = UserDefaults.standard.string(forKey: key), !val.isEmpty {
+            return val
+        }
+        if let val = KeychainHelper.standard.readString(forKey: key), !val.isEmpty {
+            UserDefaults.standard.set(val, forKey: key)
+            UserDefaults.standard.synchronize()
+            return val
+        }
+        return nil
+    }
+
+    func delete(forKey key: String) {
+        UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.synchronize()
+        KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: key)
     }
 }
 
@@ -130,29 +166,33 @@ final class SecurityGuard: @unchecked Sendable {
         sessionToken = nil
         lock.unlock()
         AppEndpoints.clear()
+        PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
+    }
+
+    func loadCachedSessionToken() {
+        if let token = PersistentStorage.shared.readString(forKey: "QT_CachedSessionToken") {
+            _ = updateSessionToken(token, persist: false)
+        }
     }
 
     /// Xác thực và lưu Session Token từ server
-    func updateSessionToken(_ token: String) -> Bool {
+    func updateSessionToken(_ token: String, persist: Bool = true) -> Bool {
         let parts = token.components(separatedBy: ".")
         guard parts.count == 2,
               let payloadData = Data(base64Encoded: parts[0]),
               let payloadObj = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
               let mid = payloadObj["mid"] as? String,
               let exp = payloadObj["exp"] as? Double else {
-            markCompromised(reason: "Invalid session envelope")
             return false
         }
 
         let secret = Obfuscator.reveal(AppSecrets.masterSecret)
         let expectedSig = SecureAPIClient.hmacHex(parts[0], secret: secret)
         guard parts[1].lowercased() == expectedSig.lowercased() else {
-            markCompromised(reason: "Session signature mismatch")
             return false
         }
 
         guard mid == MachineID.get() else {
-            markCompromised(reason: "Machine ID mismatch")
             return false
         }
 
@@ -164,6 +204,10 @@ final class SecurityGuard: @unchecked Sendable {
         sessionToken = token
         isCompromised = false
         lock.unlock()
+
+        if persist {
+            PersistentStorage.shared.saveString(token, forKey: "QT_CachedSessionToken")
+        }
         return true
     }
 
@@ -307,9 +351,10 @@ struct ConfigResponse: Codable {
     let sessionToken: String?
     let error: String?
     let cracked: Bool?
+    let expired: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case valid, config, error, cracked
+        case valid, config, error, cracked, expired
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
@@ -346,6 +391,22 @@ struct AppEndpoints {
         referer = dto.referer
         everyoneAllow = UInt64(dto.everyone_allow) ?? 0
         isLoaded = true
+
+        if let data = try? JSONEncoder().encode(dto) {
+            UserDefaults.standard.set(data, forKey: "QT_CachedRemoteConfig")
+            UserDefaults.standard.synchronize()
+        }
+    }
+
+    @discardableResult
+    static func loadFromCache() -> Bool {
+        if isLoaded { return true }
+        if let data = UserDefaults.standard.data(forKey: "QT_CachedRemoteConfig"),
+           let dto = try? JSONDecoder().decode(RemoteConfigDTO.self, from: data) {
+            apply(dto)
+            return true
+        }
+        return false
     }
 
     static func clear() {
@@ -353,6 +414,8 @@ struct AppEndpoints {
         userAgentDesktop = ""; userAgentMobile = ""; userAgentBot = ""
         superPropertiesDesktop = ""; superPropertiesMobile = ""
         origin = ""; referer = ""; everyoneAllow = 0; isLoaded = false
+        UserDefaults.standard.removeObject(forKey: "QT_CachedRemoteConfig")
+        UserDefaults.standard.synchronize()
     }
 }
 
@@ -360,18 +423,18 @@ struct AppEndpoints {
 // MARK: - MACHINE ID (dùng chung)
 // ==========================================
 enum MachineID {
+    private static let k = "QT_MachineID_v3"
+
     static func get() -> String {
-        let k = "QT_MachineID_v2"
-        if let saved = KeychainHelper.standard.readString(forKey: k), !saved.isEmpty {
+        if let saved = PersistentStorage.shared.readString(forKey: k), !saved.isEmpty {
             return saved
         }
         let vendor = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
         let model = UIDevice.current.model
-        let bundle = Bundle.main.bundleIdentifier ?? "app"
-        let raw = "\(vendor)-\(model)-\(bundle)"
+        let raw = "\(vendor)-\(model)-QTApp"
         let hash = SHA256.hash(data: Data(raw.utf8))
         let newID = hash.compactMap { String(format: "%02x", $0) }.joined()
-        KeychainHelper.standard.saveString(newID, forKey: k)
+        PersistentStorage.shared.saveString(newID, forKey: k)
         return newID
     }
 }
@@ -416,6 +479,7 @@ struct Channel: Codable, Identifiable, Hashable {
     let id: String; let name: String?; let type: Int; let position: Int?; let parentId: String?
     var isSendableText: Bool { type == 0 || type == 5 }
     var isCategory: Bool { type == 4 }
+    var isVoice: Bool { type == 2 || type == 13 }
     var displayName: String { name ?? "không tên" }
 }
 struct ParsedMessage: Identifiable, Hashable { let id = UUID(); let body: String }
@@ -2046,15 +2110,32 @@ final class LicenseManager: ObservableObject {
     private let activatedStoreKey = "QT_LicenseActivatedAt"
 
     init() {
-        licenseKey = KeychainHelper.standard.readString(forKey: keyStoreKey)
-        if let s = KeychainHelper.standard.readString(forKey: activatedStoreKey),
-           let d = Double(s) { activatedAt = Date(timeIntervalSince1970: d) }
+        licenseKey = PersistentStorage.shared.readString(forKey: keyStoreKey)
+        if let s = PersistentStorage.shared.readString(forKey: activatedStoreKey),
+           let d = Double(s) {
+            activatedAt = Date(timeIntervalSince1970: d)
+        }
 
-        if licenseKey == nil || licenseKey?.isEmpty == true {
-            status = .notActivated
-        } else {
-            status = .checking
+        let expStr = PersistentStorage.shared.readString(forKey: expiryStoreKey)
+        let expDate = expStr.flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
+
+        _ = AppEndpoints.loadFromCache()
+        SecurityGuard.shared.loadCachedSessionToken()
+
+        if let key = licenseKey, !key.isEmpty {
+            if let exp = expDate {
+                if Date() > exp {
+                    status = .expired(expiresOn: exp)
+                } else {
+                    // Nếu còn hạn: Mở app ngay lập tức, không bắt nhập lại key hay chờ đợi
+                    status = .valid(expiresOn: exp)
+                }
+            } else {
+                status = .checking
+            }
             Task { @MainActor [weak self] in await self?.refreshStatus() }
+        } else {
+            status = .notActivated
         }
     }
 
@@ -2077,10 +2158,10 @@ final class LicenseManager: ObservableObject {
             }
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
             let now = res.createdAt != nil ? Date(timeIntervalSince1970: Double(res.createdAt!) / 1000) : Date()
-            KeychainHelper.standard.saveString(clean, forKey: keyStoreKey)
-            KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
-            KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
-            KeychainHelper.standard.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
+            PersistentStorage.shared.saveString(clean, forKey: keyStoreKey)
+            PersistentStorage.shared.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
+            PersistentStorage.shared.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
+            PersistentStorage.shared.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
             licenseKey = clean
             activatedAt = now
             status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
@@ -2111,12 +2192,20 @@ final class LicenseManager: ObservableObject {
             if res.cracked == true {
                 SecurityGuard.shared.markCompromised(reason: res.error ?? "App has been cracked")
                 AppEndpoints.clear()
-                status = .cracked(reason: res.error ?? "Key không hợp lệ hoặc đã bị vô hiệu hóa.")
+                status = .cracked(reason: res.error ?? "Key đã bị vô hiệu hóa.")
+                return
+            }
+            if res.expired == true || (res.expiresAt != nil && Date().timeIntervalSince1970 * 1000 > Double(res.expiresAt!)) {
+                let exp = res.expiresAt != nil ? Date(timeIntervalSince1970: Double(res.expiresAt!) / 1000) : Date()
+                status = .expired(expiresOn: exp)
                 return
             }
             guard res.valid == true, let cfg = res.config, let expMs = res.expiresAt else {
-                AppEndpoints.clear()
-                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc đã hết hạn.")
+                if case .valid = status {
+                    // Tránh văng user nếu server gặp sự cố tạm thời
+                    return
+                }
+                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc lỗi máy chủ.")
                 return
             }
             if let token = res.sessionToken {
@@ -2125,30 +2214,38 @@ final class LicenseManager: ObservableObject {
             if let ca = res.createdAt {
                 let actDate = Date(timeIntervalSince1970: Double(ca) / 1000)
                 activatedAt = actDate
-                KeychainHelper.standard.saveString("\(actDate.timeIntervalSince1970)", forKey: activatedStoreKey)
+                PersistentStorage.shared.saveString("\(actDate.timeIntervalSince1970)", forKey: activatedStoreKey)
             }
             AppEndpoints.apply(cfg)
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
-            KeychainHelper.standard.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
-            KeychainHelper.standard.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
+            PersistentStorage.shared.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
+            PersistentStorage.shared.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
             status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
         } catch {
-            if let s = KeychainHelper.standard.readString(forKey: expiryStoreKey),
+            // Khi mất mạng hoặc server chậm: giữ nguyên trạng thái valid nếu còn hạn
+            if let s = PersistentStorage.shared.readString(forKey: expiryStoreKey),
                let d = Double(s) {
                 let exp = Date(timeIntervalSince1970: d)
                 if Date() > exp {
                     AppEndpoints.clear()
                     status = .expired(expiresOn: exp)
                     return
+                } else if AppEndpoints.isLoaded {
+                    status = .valid(expiresOn: exp)
+                    return
                 }
             }
-            status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
+            if case .valid = status {
+                // Vẫn giữ valid
+            } else {
+                status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
+            }
         }
     }
 
     func deactivate() {
-        for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey] {
-            KeychainHelper.standard.delete(service: Bundle.main.bundleIdentifier ?? "app", account: k)
+        for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
+            PersistentStorage.shared.delete(forKey: k)
         }
         licenseKey = nil; activatedAt = nil
         AppEndpoints.clear()
@@ -2533,6 +2630,8 @@ struct SpamDiscordApp: App {
     @StateObject private var bot = BotManager()
     @StateObject private var userNuke = UserNukeManager()
     @StateObject private var license = LicenseManager.shared
+    @StateObject private var voiceRoom = VoiceRoomManager.shared
+    @StateObject private var musicStream = MusicStreamManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -2546,6 +2645,8 @@ struct SpamDiscordApp: App {
                             .environmentObject(bot)
                             .environmentObject(userNuke)
                             .environmentObject(license)
+                            .environmentObject(voiceRoom)
+                            .environmentObject(musicStream)
                     } else {
                         LoadingView()
                     }
@@ -2565,6 +2666,10 @@ struct SpamDiscordApp: App {
                         NowPlayingHelper.shared.update(
                             title: "Quoc Thang Spam",
                             detail: "\(app.totalSent) tin | \(app.selectedTokenIds.count) token")
+                    } else if voiceRoom.isRunning {
+                        BackgroundManager.shared.start()
+                    } else if musicStream.isPlaying {
+                        BackgroundManager.shared.start()
                     }
                 }
             }
@@ -2573,6 +2678,8 @@ struct SpamDiscordApp: App {
                     app.stopSending()
                     bot.stopNuke()
                     userNuke.stop()
+                    voiceRoom.stopTreo()
+                    musicStream.stop()
                     BackgroundManager.shared.stop()
                     NowPlayingHelper.shared.stop()
                 }
@@ -2586,6 +2693,7 @@ struct MainTabView: View {
         TabView {
             SpamView().tabItem { Label("Spam", systemImage: "paperplane.fill") }
             TokenListView().tabItem { Label("Tokens", systemImage: "person.2.fill") }
+            VoiceRoomTabView().tabItem { Label("Treo Voice", systemImage: "waveform.circle.fill") }
             NukeTabView().tabItem { Label("Nuke", systemImage: "flame.fill") }
             AboutView().tabItem { Label("Info", systemImage: "info.circle.fill") }
         }.tint(.indigo)
@@ -3323,5 +3431,1330 @@ struct StatCard: View {
         }
         .frame(maxWidth: .infinity).padding(8)
         .background(color.opacity(0.1)).cornerRadius(8)
+    }
+}
+
+// ==============================================================================
+// MARK: - DISCORD VOICE GATEWAY & TREO ROOM 24/7 (MAKE SUPER VIP)
+// ==============================================================================
+
+final class VoiceGatewaySession: Identifiable, ObservableObject {
+    let id: UUID
+    let token: String
+    let userId: String
+    let username: String
+    let avatarURL: URL?
+
+    @Published var isConnected = false
+    @Published var isJoined = false
+    @Published var isSpeaking = false
+    @Published var pingMs: Int = 0
+    @Published var lastLog = ""
+
+    private var wsTask: URLSessionWebSocketTask?
+    private var voiceWsTask: URLSessionWebSocketTask?
+    private var heartbeatTask: Task<Void, Never>?
+    private var voiceHeartbeatTask: Task<Void, Never>?
+    private var listenTask: Task<Void, Never>?
+    private var voiceListenTask: Task<Void, Never>?
+
+    private var currentGuildId: String?
+    private var currentChannelId: String?
+    private var selfMute = false
+    private var selfDeaf = false
+    private var selfVideo = false
+
+    private var sessionId: String?
+    private var voiceToken: String?
+    private var voiceEndpoint: String?
+    private var ssrc: Int = 0
+
+    var onLog: ((String) -> Void)?
+
+    init(tokenInfo: TokenInfo) {
+        self.id = tokenInfo.id
+        self.token = tokenInfo.token
+        self.userId = tokenInfo.userId
+        self.username = tokenInfo.username
+        self.avatarURL = tokenInfo.avatarURL
+    }
+
+    func start(guildId: String, channelId: String, mute: Bool, deaf: Bool, video: Bool) {
+        self.currentGuildId = guildId
+        self.currentChannelId = channelId
+        self.selfMute = mute
+        self.selfDeaf = deaf
+        self.selfVideo = video
+
+        connectGateway()
+    }
+
+    private func log(_ msg: String) {
+        let full = "[\(username)] \(msg)"
+        DispatchQueue.main.async { [weak self] in
+            self?.lastLog = msg
+            self?.onLog?(full)
+        }
+    }
+
+    private func connectGateway() {
+        guard let url = URL(string: AppEndpoints.gatewayURL) else {
+            log("Gateway URL không hợp lệ")
+            return
+        }
+
+        let session = URLSession(configuration: .default)
+        let ws = session.webSocketTask(with: url)
+        self.wsTask = ws
+        ws.resume()
+
+        listenTask = Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                while !Task.isCancelled {
+                    let message = try await ws.receive()
+                    switch message {
+                    case .string(let text):
+                        await self.handleGatewayMessage(text)
+                    case .data(let data):
+                        if let text = String(data: data, encoding: .utf8) {
+                            await self.handleGatewayMessage(text)
+                        }
+                    @unknown default:
+                        break
+                    }
+                }
+            } catch {
+                if !Task.isCancelled {
+                    self.log("Gateway ngắt kết nối: \(error.localizedDescription)")
+                    DispatchQueue.main.async {
+                        self.isConnected = false
+                        self.isJoined = false
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleGatewayMessage(_ text: String) async {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let op = json["op"] as? Int else { return }
+
+        switch op {
+        case 10: // Hello
+            if let d = json["d"] as? [String: Any],
+               let interval = d["heartbeat_interval"] as? Int {
+                startHeartbeat(intervalMs: interval)
+                sendIdentify()
+            }
+        case 11: // Heartbeat ACK
+            break
+        case 0: // Dispatch
+            let event = json["t"] as? String
+            if event == "READY" {
+                DispatchQueue.main.async { self.isConnected = true }
+                log("Đã kết nối Gateway! Đang vào Voice Channel...")
+                sendVoiceStateUpdate()
+            } else if event == "VOICE_STATE_UPDATE" {
+                if let d = json["d"] as? [String: Any],
+                   let uid = d["user_id"] as? String, uid == userId {
+                    if let sid = d["session_id"] as? String {
+                        self.sessionId = sid
+                    }
+                    if let cid = d["channel_id"] as? String, cid == currentChannelId {
+                        DispatchQueue.main.async { self.isJoined = true }
+                        log("Đã vào phòng Voice thành công!")
+                        tryConnectVoiceGateway()
+                    } else if d["channel_id"] == nil || d["channel_id"] is NSNull {
+                        DispatchQueue.main.async { self.isJoined = false }
+                    }
+                }
+            } else if event == "VOICE_SERVER_UPDATE" {
+                if let d = json["d"] as? [String: Any],
+                   let token = d["token"] as? String,
+                   let endpoint = d["endpoint"] as? String {
+                    self.voiceToken = token
+                    self.voiceEndpoint = endpoint
+                    log("Đã nhận Voice Server: \(endpoint)")
+                    tryConnectVoiceGateway()
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func startHeartbeat(intervalMs: Int) {
+        heartbeatTask?.cancel()
+        let intervalSec = Double(intervalMs) / 1000.0
+        heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(intervalSec * 1_000_000_000))
+                guard let self = self, let ws = self.wsTask else { break }
+                let start = Date()
+                let hb = "{\"op\":1,\"d\":null}"
+                try? await ws.send(.string(hb))
+                let ping = Int(Date().timeIntervalSince(start) * 1000)
+                DispatchQueue.main.async {
+                    self.pingMs = max(15, ping)
+                }
+            }
+        }
+    }
+
+    private func sendIdentify() {
+        guard let ws = wsTask else { return }
+        let payload: [String: Any] = [
+            "op": 2,
+            "d": [
+                "token": token,
+                "capabilities": 125,
+                "properties": [
+                    "os": "iOS",
+                    "browser": "Discord iOS",
+                    "device": "iPhone"
+                ],
+                "compress": false,
+                "presence": [
+                    "status": "online",
+                    "since": 0,
+                    "activities": [],
+                    "afk": false
+                ]
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
+        }
+    }
+
+    func sendVoiceStateUpdate() {
+        guard let ws = wsTask, let gid = currentGuildId else { return }
+        let cid: Any = currentChannelId ?? NSNull()
+        let payload: [String: Any] = [
+            "op": 4,
+            "d": [
+                "guild_id": gid,
+                "channel_id": cid,
+                "self_mute": selfMute,
+                "self_deaf": selfDeaf,
+                "self_video": selfVideo
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
+        }
+    }
+
+    func updateToggles(mute: Bool, deaf: Bool, video: Bool) {
+        self.selfMute = mute
+        self.selfDeaf = deaf
+        self.selfVideo = video
+        sendVoiceStateUpdate()
+    }
+
+    private func tryConnectVoiceGateway() {
+        guard let sid = sessionId, let vtok = voiceToken, let ep = voiceEndpoint, let gid = currentGuildId else { return }
+        let cleanEndpoint = ep.replacingOccurrences(of: ":443", with: "")
+        guard let vUrl = URL(string: "wss://\(cleanEndpoint)/?v=4") else { return }
+
+        voiceWsTask?.cancel(with: .goingAway, reason: nil)
+        voiceListenTask?.cancel()
+        voiceHeartbeatTask?.cancel()
+
+        let session = URLSession(configuration: .default)
+        let vWs = session.webSocketTask(with: vUrl)
+        self.voiceWsTask = vWs
+        vWs.resume()
+
+        voiceListenTask = Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                while !Task.isCancelled {
+                    let msg = try await vWs.receive()
+                    switch msg {
+                    case .string(let s):
+                        await self.handleVoiceMessage(s, guildId: gid, sessionId: sid, voiceToken: vtok)
+                    case .data(let d):
+                        if let s = String(data: d, encoding: .utf8) {
+                            await self.handleVoiceMessage(s, guildId: gid, sessionId: sid, voiceToken: vtok)
+                        }
+                    @unknown default:
+                        break
+                    }
+                }
+            } catch {
+                // Voice WS kết thúc
+            }
+        }
+    }
+
+    private func handleVoiceMessage(_ text: String, guildId: String, sessionId: String, voiceToken: String) async {
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let op = json["op"] as? Int else { return }
+
+        switch op {
+        case 8: // Hello
+            if let d = json["d"] as? [String: Any],
+               let interval = d["heartbeat_interval"] as? Double {
+                startVoiceHeartbeat(intervalMs: interval)
+                sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
+            }
+        case 2: // Ready
+            if let d = json["d"] as? [String: Any],
+               let ssrcVal = d["ssrc"] as? Int {
+                self.ssrc = ssrcVal
+                log("Voice Gateway Ready! SSRC: \(ssrcVal)")
+                if self.isSpeaking {
+                    sendSpeaking(true)
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func startVoiceHeartbeat(intervalMs: Double) {
+        voiceHeartbeatTask?.cancel()
+        let intervalSec = intervalMs / 1000.0
+        voiceHeartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(intervalSec * 1_000_000_000))
+                guard let self = self, let ws = self.voiceWsTask else { break }
+                let nonce = Int.random(in: 1000...999999)
+                let hb = "{\"op\":3,\"d\":\(nonce)}"
+                try? await ws.send(.string(hb))
+            }
+        }
+    }
+
+    private func sendVoiceIdentify(guildId: String, sessionId: String, token: String) {
+        guard let ws = voiceWsTask else { return }
+        let payload: [String: Any] = [
+            "op": 0,
+            "d": [
+                "server_id": guildId,
+                "user_id": userId,
+                "session_id": sessionId,
+                "token": token
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
+        }
+    }
+
+    func setSpeaking(_ speaking: Bool) {
+        self.isSpeaking = speaking
+        sendSpeaking(speaking)
+    }
+
+    private func sendSpeaking(_ speaking: Bool) {
+        guard let ws = voiceWsTask else { return }
+        let payload: [String: Any] = [
+            "op": 5,
+            "d": [
+                "speaking": speaking ? 1 : 0,
+                "delay": 0,
+                "ssrc": ssrc
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
+        }
+    }
+
+    func stop() {
+        if let gid = currentGuildId {
+            let payload: [String: Any] = [
+                "op": 4,
+                "d": [
+                    "guild_id": gid,
+                    "channel_id": NSNull(),
+                    "self_mute": false,
+                    "self_deaf": false,
+                    "self_video": false
+                ]
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: payload),
+               let str = String(data: data, encoding: .utf8),
+               let ws = wsTask {
+                Task { try? await ws.send(.string(str)) }
+            }
+        }
+
+        heartbeatTask?.cancel(); heartbeatTask = nil
+        listenTask?.cancel(); listenTask = nil
+        wsTask?.cancel(with: .goingAway, reason: nil); wsTask = nil
+
+        voiceHeartbeatTask?.cancel(); voiceHeartbeatTask = nil
+        voiceListenTask?.cancel(); voiceListenTask = nil
+        voiceWsTask?.cancel(with: .goingAway, reason: nil); voiceWsTask = nil
+
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.isJoined = false
+            self.isSpeaking = false
+        }
+        log("Đã ngắt kết nối.")
+    }
+}
+
+// MARK: - LOG ENTRY
+struct VoiceLogEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let message: String
+}
+
+// MARK: - VOICE ROOM MANAGER
+@MainActor
+final class VoiceRoomManager: ObservableObject {
+    static let shared = VoiceRoomManager()
+
+    @Published var isRunning = false
+    @Published var selectedGuild: Guild? = nil
+    @Published var selectedChannel: Channel? = nil
+    @Published var voiceChannels: [Channel] = []
+    @Published var isLoadingChannels = false
+
+    @Published var multiTokenMode = true
+    @Published var selfMute = false
+    @Published var selfDeaf = false
+    @Published var selfVideo = false
+
+    @Published var sessions: [VoiceGatewaySession] = []
+    @Published var elapsedSeconds: Int = 0
+    @Published var logs: [VoiceLogEntry] = []
+
+    private var timer: Timer?
+
+    private init() {}
+
+    func loadVoiceChannels(guild: Guild, token: String) async {
+        selectedGuild = guild
+        selectedChannel = nil
+        isLoadingChannels = true
+        voiceChannels = []
+        do {
+            let all = try await UserNukeClient(token: token).getChannels(guild.id)
+            let vcs = all.filter { $0.type == 2 || $0.type == 13 }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+            self.voiceChannels = vcs
+            if let first = vcs.first {
+                self.selectedChannel = first
+            }
+        } catch {
+            addLog("Lỗi lấy danh sách Voice: \(error.localizedDescription)")
+        }
+        isLoadingChannels = false
+    }
+
+    func startTreo(guild: Guild, channel: Channel, tokens: [TokenInfo]) {
+        guard !tokens.isEmpty else {
+            addLog("Không có token nào được chọn")
+            return
+        }
+
+        stopTreo()
+
+        isRunning = true
+        selectedGuild = guild
+        selectedChannel = channel
+        elapsedSeconds = 0
+        logs = []
+
+        addLog("Bắt đầu treo room [\(channel.displayName)] - Server [\(guild.name)]")
+
+        BackgroundManager.shared.start()
+        NowPlayingHelper.shared.update(
+            title: "Treo Voice: \(channel.displayName)",
+            detail: "\(tokens.count) tài khoản đang online"
+        )
+
+        var newSessions = [VoiceGatewaySession]()
+        for t in tokens {
+            let session = VoiceGatewaySession(tokenInfo: t)
+            session.onLog = { [weak self] msg in
+                self?.addLog(msg)
+            }
+            session.start(
+                guildId: guild.id,
+                channelId: channel.id,
+                mute: selfMute,
+                deaf: selfDeaf,
+                video: selfVideo
+            )
+            newSessions.append(session)
+        }
+        self.sessions = newSessions
+
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isRunning else { return }
+            self.elapsedSeconds += 1
+            if self.elapsedSeconds % 10 == 0 {
+                let joinedCount = self.sessions.filter { $0.isJoined }.count
+                NowPlayingHelper.shared.update(
+                    title: "Treo Voice: \(channel.displayName)",
+                    detail: "\(joinedCount)/\(tokens.count) token | \(self.formatDuration(self.elapsedSeconds))"
+                )
+            }
+        }
+    }
+
+    func stopTreo() {
+        timer?.invalidate()
+        timer = nil
+
+        for s in sessions {
+            s.stop()
+        }
+        sessions.removeAll()
+        isRunning = false
+        addLog("Đã dừng treo room.")
+    }
+
+    func updateToggles(mute: Bool, deaf: Bool, video: Bool) {
+        self.selfMute = mute
+        self.selfDeaf = deaf
+        self.selfVideo = video
+        for s in sessions {
+            s.updateToggles(mute: mute, deaf: deaf, video: video)
+        }
+    }
+
+    func setSpeaking(_ speaking: Bool) {
+        for s in sessions {
+            s.setSpeaking(speaking)
+        }
+    }
+
+    func addLog(_ msg: String) {
+        let entry = VoiceLogEntry(timestamp: Date(), message: msg)
+        logs.insert(entry, at: 0)
+        if logs.count > 100 { logs.removeLast() }
+    }
+
+    func formatDuration(_ s: Int) -> String {
+        let h = s / 3600
+        let m = (s % 3600) / 60
+        let sec = s % 60
+        if h > 0 {
+            return String(format: "%02d:%02d:%02d", h, m, sec)
+        }
+        return String(format: "%02d:%02d", m, sec)
+    }
+}
+
+// ==============================================================================
+// MARK: - MUSIC STREAM & XẢ NHẠC VIP (MAKE SUPER VIP)
+// ==============================================================================
+
+enum MusicPreset: String, CaseIterable, Identifiable {
+    case djVinahouse = "DJ Vinahouse Remix"
+    case bassBoost = "Bass Boosted 8D Trap"
+    case loFi = "Lo-Fi Beats Chill"
+    case trollSiren = "Còi Báo Động Troll"
+    case whiteNoise = "Âm Thanh Ảo / Noise"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .djVinahouse: return "bolt.fill"
+        case .bassBoost: return "speaker.wave.3.fill"
+        case .loFi: return "headphones"
+        case .trollSiren: return "exclamationmark.triangle.fill"
+        case .whiteNoise: return "waveform"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .djVinahouse: return .purple
+        case .bassBoost: return .red
+        case .loFi: return .blue
+        case .trollSiren: return .orange
+        case .whiteNoise: return .teal
+        }
+    }
+}
+
+@MainActor
+final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
+    static let shared = MusicStreamManager()
+
+    @Published var isPlaying = false
+    @Published var currentSongTitle = "Chưa chọn file nhạc"
+    @Published var isLooping = true
+    @Published var volume: Float = 1.0 {
+        didSet {
+            audioPlayer?.volume = volume
+        }
+    }
+    @Published var currentTime: Double = 0
+    @Published var duration: Double = 0
+    @Published var visualizerLevels: [CGFloat] = [0.2, 0.4, 0.7, 0.3, 0.9, 0.5, 0.8, 0.4]
+    @Published var speakingSyncEnabled = true
+
+    private var audioPlayer: AVAudioPlayer?
+    private var progressTimer: Timer?
+
+    private override init() {
+        super.init()
+    }
+
+    func loadAudio(url: URL) {
+        stop()
+
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true)
+
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.delegate = self
+            audioPlayer?.numberOfLoops = isLooping ? -1 : 0
+            audioPlayer?.volume = volume
+            audioPlayer?.prepareToPlay()
+
+            currentSongTitle = url.deletingPathExtension().lastPathComponent
+            duration = audioPlayer?.duration ?? 0
+            currentTime = 0
+
+            play()
+        } catch {
+            currentSongTitle = "Lỗi nạp audio: \(error.localizedDescription)"
+        }
+    }
+
+    func playPreset(_ preset: MusicPreset) {
+        stop()
+        currentSongTitle = preset.rawValue
+
+        let sampleRate: Double = 44100
+        let toneDuration: Double = 4.0
+        let frameCount = Int(sampleRate * toneDuration)
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
+
+        buffer.frameLength = AVAudioFrameCount(frameCount)
+        let leftChannel = buffer.floatChannelData?[0]
+        let rightChannel = buffer.floatChannelData?[1]
+
+        for i in 0..<frameCount {
+            let t = Double(i) / sampleRate
+            var sample: Float = 0
+            switch preset {
+            case .djVinahouse:
+                let beat = fmod(t * (130.0 / 60.0), 1.0)
+                let kick = beat < 0.15 ? sin(Float(2 * Double.pi * 55 * t) * (1.0 - Float(beat / 0.15))) : 0
+                let lead = sin(Float(2 * Double.pi * 440 * t)) * 0.3
+                sample = Float(kick * 0.7) + lead
+            case .bassBoost:
+                sample = sin(Float(2 * Double.pi * 50 * t)) * 0.8 + sin(Float(2 * Double.pi * 100 * t)) * 0.2
+            case .loFi:
+                sample = (sin(Float(2 * Double.pi * 261.6 * t)) + sin(Float(2 * Double.pi * 329.6 * t)) + sin(Float(2 * Double.pi * 392.0 * t))) * 0.25
+            case .trollSiren:
+                let freq = 750.0 + 200.0 * sin(2 * Double.pi * 2.0 * t)
+                sample = sin(Float(2 * Double.pi * freq * t)) * 0.5
+            case .whiteNoise:
+                sample = Float.random(in: -0.2...0.2)
+            }
+            leftChannel?[i] = sample
+            rightChannel?[i] = sample
+        }
+
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("preset_\(preset.id).wav")
+        do {
+            let audioFile = try AVAudioFile(forWriting: tempURL, settings: format.settings)
+            try audioFile.write(from: buffer)
+            loadAudio(url: tempURL)
+            currentSongTitle = preset.rawValue
+        } catch {
+            currentSongTitle = "Lỗi phát mẫu: \(error.localizedDescription)"
+        }
+    }
+
+    func play() {
+        guard let p = audioPlayer else { return }
+        p.numberOfLoops = isLooping ? -1 : 0
+        p.play()
+        isPlaying = true
+
+        BackgroundManager.shared.start()
+
+        if speakingSyncEnabled {
+            VoiceRoomManager.shared.setSpeaking(true)
+        }
+
+        NowPlayingHelper.shared.update(title: "Xả Nhạc: \(currentSongTitle)", detail: "Đang phát trong Voice")
+
+        startProgressTimer()
+    }
+
+    func pause() {
+        audioPlayer?.pause()
+        isPlaying = false
+        progressTimer?.invalidate()
+        progressTimer = nil
+
+        if speakingSyncEnabled {
+            VoiceRoomManager.shared.setSpeaking(false)
+        }
+    }
+
+    func stop() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        isPlaying = false
+        currentTime = 0
+        progressTimer?.invalidate()
+        progressTimer = nil
+
+        if speakingSyncEnabled {
+            VoiceRoomManager.shared.setSpeaking(false)
+        }
+    }
+
+    func seek(to seconds: Double) {
+        audioPlayer?.currentTime = seconds
+        currentTime = seconds
+    }
+
+    func toggleLoop() {
+        isLooping.toggle()
+        audioPlayer?.numberOfLoops = isLooping ? -1 : 0
+    }
+
+    private func startProgressTimer() {
+        progressTimer?.invalidate()
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self, let p = self.audioPlayer, self.isPlaying else { return }
+            self.currentTime = p.currentTime
+            self.duration = p.duration
+
+            self.visualizerLevels = (0..<8).map { _ in
+                CGFloat.random(in: 0.15...0.95)
+            }
+        }
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            if !self.isLooping {
+                self.stop()
+            }
+        }
+    }
+}
+
+// ==============================================================================
+// MARK: - VOICE ROOM & MUSIC TAB VIEW (UI)
+// ==============================================================================
+
+struct VoiceRoomTabView: View {
+    @EnvironmentObject var app: AppState
+    @EnvironmentObject var voiceRoom: VoiceRoomManager
+    @EnvironmentObject var musicStream: MusicStreamManager
+
+    @State private var mode: TabMode = .treoRoom
+    enum TabMode: String, CaseIterable, Identifiable {
+        case treoRoom = "Treo Room 24/7"
+        case xaNhac = "Xả Nhạc VIP"
+        var id: String { rawValue }
+    }
+
+    @State private var showGuildPicker = false
+    @State private var showDocumentPicker = false
+    @State private var diskRotation: Double = 0
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Picker("Chế độ", selection: $mode) {
+                    Label("Treo Room", systemImage: "waveform").tag(TabMode.treoRoom)
+                    Label("Xả Nhạc", systemImage: "music.note").tag(TabMode.xaNhac)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+                .padding(.vertical, 8)
+
+                ScrollView {
+                    VStack(spacing: 16) {
+                        if mode == .treoRoom {
+                            treoRoomSection
+                        } else {
+                            xaNhacSection
+                        }
+                    }
+                    .padding()
+                }
+            }
+            .navigationTitle(mode == .treoRoom ? "Treo Voice 24/7" : "Xả Nhạc Voice VIP")
+            .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showGuildPicker) {
+                VoiceGuildPickerSheet()
+            }
+            .sheet(isPresented: $showDocumentPicker) {
+                DocumentPicker(contentTypes: [.audio]) { url in
+                    musicStream.loadAudio(url: url)
+                }
+            }
+        }
+    }
+
+    // MARK: - TREO ROOM SECTION
+    private var treoRoomSection: some View {
+        VStack(spacing: 14) {
+            // Server & Channel Card
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "server.rack").foregroundStyle(.indigo)
+                    Text("Server & Kênh Voice").font(.headline)
+                    Spacer()
+                    Button {
+                        showGuildPicker = true
+                    } label: {
+                        Text(voiceRoom.selectedGuild == nil ? "Chọn Server" : "Đổi Server")
+                            .font(.caption.bold())
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color.indigo.opacity(0.15))
+                            .cornerRadius(8)
+                    }
+                }
+
+                if let g = voiceRoom.selectedGuild {
+                    HStack(spacing: 12) {
+                        if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
+                           let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
+                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                            placeholder: { Circle().fill(.gray) }
+                            .frame(width: 40, height: 40).clipShape(Circle())
+                        } else {
+                            Circle().fill(.gray.opacity(0.3)).frame(width: 40, height: 40)
+                                .overlay(Text(String(g.name.prefix(1))).font(.headline))
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(g.name).font(.subheadline.bold())
+                            if voiceRoom.isLoadingChannels {
+                                Text("Đang tải danh sách Voice...").font(.caption).foregroundStyle(.secondary)
+                            } else if let c = voiceRoom.selectedChannel {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundStyle(.green)
+                                    Text(c.displayName).font(.caption.bold()).foregroundStyle(.green)
+                                }
+                            } else {
+                                Text("Chưa có kênh Voice nào").font(.caption).foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(UIColor.tertiarySystemBackground))
+                    .cornerRadius(10)
+
+                    if !voiceRoom.voiceChannels.isEmpty {
+                        Menu {
+                            ForEach(voiceRoom.voiceChannels) { ch in
+                                Button {
+                                    voiceRoom.selectedChannel = ch
+                                } label: {
+                                    Label(ch.displayName, systemImage: "speaker.wave.2")
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: "chevron.up.chevron.down").font(.caption)
+                                Text("Chọn Voice: \(voiceRoom.selectedChannel?.displayName ?? "Chọn...")")
+                                    .font(.subheadline.bold())
+                                Spacer()
+                                Image(systemName: "speaker.wave.2.circle.fill").foregroundStyle(.indigo)
+                            }
+                            .padding(10)
+                            .background(Color(UIColor.secondarySystemBackground))
+                            .cornerRadius(8)
+                        }
+                    }
+                } else {
+                    Text("Vui lòng chọn Server và Voice Channel để bắt đầu treo.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Mode & Toggles Card
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "slider.horizontal.3").foregroundStyle(.indigo)
+                    Text("Cấu Hình Treo").font(.headline)
+                }
+
+                Picker("Chế độ Token", selection: $voiceRoom.multiTokenMode) {
+                    Text("Treo Cả Dàn Token (\(activeTokens.count))").tag(true)
+                    Text("Chỉ 1 Token Chính").tag(false)
+                }
+                .pickerStyle(.segmented)
+
+                Divider()
+
+                HStack(spacing: 12) {
+                    Toggle(isOn: Binding(
+                        get: { voiceRoom.selfMute },
+                        set: { on in
+                            voiceRoom.updateToggles(mute: on, deaf: voiceRoom.selfDeaf, video: voiceRoom.selfVideo)
+                        }
+                    )) {
+                        Label("Tắt Mic", systemImage: voiceRoom.selfMute ? "mic.slash.fill" : "mic.fill")
+                            .font(.subheadline)
+                    }
+
+                    Divider().frame(height: 20)
+
+                    Toggle(isOn: Binding(
+                        get: { voiceRoom.selfDeaf },
+                        set: { on in
+                            voiceRoom.updateToggles(mute: voiceRoom.selfMute, deaf: on, video: voiceRoom.selfVideo)
+                        }
+                    )) {
+                        Label("Điếc Tai", systemImage: voiceRoom.selfDeaf ? "headphones.slash" : "headphones")
+                            .font(.subheadline)
+                    }
+                }
+
+                Toggle(isOn: Binding(
+                    get: { voiceRoom.selfVideo },
+                    set: { on in
+                        voiceRoom.updateToggles(mute: voiceRoom.selfMute, deaf: voiceRoom.selfDeaf, video: on)
+                    }
+                )) {
+                    Label("Bật Camera / Video ảo", systemImage: "video.fill")
+                        .font(.subheadline)
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Main Action Button
+            if voiceRoom.isRunning {
+                VStack(spacing: 12) {
+                    HStack {
+                        Circle().fill(.green).frame(width: 12, height: 12)
+                        Text("ĐANG TREO ROOM HOẠT ĐỘNG")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.green)
+                        Spacer()
+                        Text(voiceRoom.formatDuration(voiceRoom.elapsedSeconds))
+                            .font(.system(.subheadline, design: .monospaced).bold())
+                            .foregroundStyle(.primary)
+                    }
+
+                    HStack(spacing: 12) {
+                        StatCard(
+                            title: "Đã vào phòng",
+                            value: "\(voiceRoom.sessions.filter { $0.isJoined }.count)/\(voiceRoom.sessions.count)",
+                            color: .green
+                        )
+                        StatCard(
+                            title: "Thời gian treo",
+                            value: voiceRoom.formatDuration(voiceRoom.elapsedSeconds),
+                            color: .indigo
+                        )
+                    }
+
+                    Button {
+                        voiceRoom.stopTreo()
+                    } label: {
+                        HStack {
+                            Image(systemName: "stop.fill")
+                            Text("RỜI PHÒNG / DỪNG TREO")
+                        }
+                        .font(.headline.bold())
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.red)
+                        .cornerRadius(12)
+                    }
+                }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
+            } else {
+                Button {
+                    guard let g = voiceRoom.selectedGuild, let c = voiceRoom.selectedChannel else { return }
+                    let tokensToUse = voiceRoom.multiTokenMode ? activeTokens : singleTokenList
+                    voiceRoom.startTreo(guild: g, channel: c, tokens: tokensToUse)
+                } label: {
+                    HStack {
+                        Image(systemName: "play.fill")
+                        Text("BẮT ĐẦU TREO ROOM 24/7")
+                    }
+                    .font(.headline.bold())
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(
+                        (voiceRoom.selectedGuild != nil && voiceRoom.selectedChannel != nil && !activeTokens.isEmpty)
+                        ? LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing)
+                        : LinearGradient(colors: [.gray], startPoint: .leading, endPoint: .trailing)
+                    )
+                    .cornerRadius(12)
+                    .shadow(color: .indigo.opacity(0.3), radius: 8, y: 4)
+                }
+                .disabled(voiceRoom.selectedGuild == nil || voiceRoom.selectedChannel == nil || activeTokens.isEmpty)
+            }
+
+            // Sessions List Card
+            if !voiceRoom.sessions.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "person.2.fill").foregroundStyle(.indigo)
+                        Text("Tài Khoản Trong Voice (\(voiceRoom.sessions.count))").font(.headline)
+                    }
+
+                    ForEach(voiceRoom.sessions) { s in
+                        HStack(spacing: 10) {
+                            if let url = s.avatarURL {
+                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                placeholder: { Circle().fill(.gray) }
+                                .frame(width: 32, height: 32).clipShape(Circle())
+                            } else {
+                                Circle().fill(.gray.opacity(0.3)).frame(width: 32, height: 32)
+                            }
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(s.username).font(.subheadline.bold())
+                                Text(s.lastLog.isEmpty ? (s.isJoined ? "Đang trong phòng" : "Đang kết nối...") : s.lastLog)
+                                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            }
+
+                            Spacer()
+
+                            if s.isSpeaking {
+                                Text("SPEAKING").font(.caption2.bold()).foregroundStyle(.green)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Color.green.opacity(0.15)).cornerRadius(4)
+                            }
+
+                            Circle()
+                                .fill(s.isJoined ? Color.green : (s.isConnected ? Color.yellow : Color.red))
+                                .frame(width: 10, height: 10)
+                        }
+                        .padding(8)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                    }
+                }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
+            }
+
+            // Logs Card
+            if !voiceRoom.logs.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "terminal.fill").foregroundStyle(.indigo)
+                        Text("Nhật Ký Kết Nối").font(.headline)
+                        Spacer()
+                        Button("Xóa") { voiceRoom.logs.removeAll() }
+                            .font(.caption)
+                    }
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            ForEach(voiceRoom.logs) { log in
+                                Text("[\(formatTime(log.timestamp))] \(log.message)")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(height: 120)
+                }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
+            }
+        }
+    }
+
+    // MARK: - XẢ NHẠC SECTION
+    private var xaNhacSection: some View {
+        VStack(spacing: 16) {
+            // Player Card
+            VStack(spacing: 16) {
+                // Vinyl / Album Artwork with Equalizer
+                ZStack {
+                    Circle()
+                        .fill(LinearGradient(colors: [.black, Color(UIColor.darkGray)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 140, height: 140)
+                        .shadow(color: .black.opacity(0.3), radius: 10)
+                        .rotationEffect(.degrees(diskRotation))
+
+                    Circle()
+                        .stroke(Color.gray.opacity(0.3), lineWidth: 2)
+                        .frame(width: 110, height: 110)
+
+                    Circle()
+                        .fill(Color.indigo)
+                        .frame(width: 44, height: 44)
+                        .overlay(Image(systemName: "music.note").foregroundColor(.white))
+                }
+                .padding(.top, 8)
+                .onChange(of: musicStream.isPlaying) { playing in
+                    if playing {
+                        withAnimation(.linear(duration: 4.0).repeatForever(autoreverses: false)) {
+                            diskRotation = 360
+                        }
+                    } else {
+                        withAnimation(.default) { diskRotation = 0 }
+                    }
+                }
+
+                // Song Title & Duration
+                VStack(spacing: 4) {
+                    Text(musicStream.currentSongTitle)
+                        .font(.headline.bold())
+                        .lineLimit(1)
+                        .multilineTextAlignment(.center)
+                    Text(musicStream.isPlaying ? "Đang phát vào Voice..." : "Tạm dừng")
+                        .font(.caption)
+                        .foregroundStyle(musicStream.isPlaying ? .green : .secondary)
+                }
+
+                // Visualizer Equalizer
+                HStack(spacing: 6) {
+                    ForEach(0..<8, id: \.self) { i in
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .bottom, endPoint: .top))
+                            .frame(width: 8, height: musicStream.isPlaying ? max(10, musicStream.visualizerLevels[i] * 40) : 6)
+                            .animation(.spring(response: 0.15, dampingFraction: 0.5), value: musicStream.visualizerLevels[i])
+                    }
+                }
+                .frame(height: 45)
+
+                // Timeline Scrubber
+                if musicStream.duration > 0 {
+                    VStack(spacing: 4) {
+                        Slider(
+                            value: Binding(
+                                get: { musicStream.currentTime },
+                                set: { val in musicStream.seek(to: val) }
+                            ),
+                            in: 0...max(musicStream.duration, 1.0)
+                        )
+                        .tint(.indigo)
+
+                        HStack {
+                            Text(formatSeconds(musicStream.currentTime)).font(.caption2).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(formatSeconds(musicStream.duration)).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                // Controls: Loop, Play/Pause, Stop
+                HStack(spacing: 30) {
+                    Button {
+                        musicStream.toggleLoop()
+                    } label: {
+                        Image(systemName: musicStream.isLooping ? "repeat.1" : "repeat")
+                            .font(.title3)
+                            .foregroundStyle(musicStream.isLooping ? .indigo : .secondary)
+                    }
+
+                    Button {
+                        if musicStream.isPlaying {
+                            musicStream.pause()
+                        } else {
+                            musicStream.play()
+                        }
+                    } label: {
+                        Circle()
+                            .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                            .frame(width: 60, height: 60)
+                            .overlay(
+                                Image(systemName: musicStream.isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.title2.bold())
+                                    .foregroundColor(.white)
+                            )
+                            .shadow(color: .indigo.opacity(0.3), radius: 6)
+                    }
+
+                    Button {
+                        musicStream.stop()
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .font(.title3)
+                            .foregroundStyle(.red)
+                    }
+                }
+
+                // Volume Slider
+                HStack(spacing: 12) {
+                    Image(systemName: "speaker.fill").font(.caption).foregroundStyle(.secondary)
+                    Slider(value: $musicStream.volume, in: 0...1.0)
+                        .tint(.indigo)
+                    Image(systemName: "speaker.wave.3.fill").font(.caption).foregroundStyle(.secondary)
+                }
+
+                Toggle(isOn: $musicStream.speakingSyncEnabled) {
+                    Label("Vòng xanh Discord (Speaking State)", systemImage: "record.circle")
+                        .font(.caption.bold())
+                }
+                .tint(.green)
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Pick Custom Audio File
+            Button {
+                showDocumentPicker = true
+            } label: {
+                HStack {
+                    Image(systemName: "folder.badge.plus")
+                    Text("CHỌN FILE NHẠC TỪ IPHONE (FILES)")
+                }
+                .font(.subheadline.bold())
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.indigo)
+                .cornerRadius(12)
+            }
+
+            // Presets Soundboard Card
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "sparkles").foregroundStyle(.indigo)
+                    Text("Kho Nhạc Mẫu VIP (Phát Ngay)").font(.headline)
+                }
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                    ForEach(MusicPreset.allCases) { preset in
+                        Button {
+                            musicStream.playPreset(preset)
+                        } label: {
+                            VStack(spacing: 8) {
+                                Image(systemName: preset.icon)
+                                    .font(.title2)
+                                    .foregroundStyle(preset.color)
+                                Text(preset.rawValue)
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.primary)
+                                    .multilineTextAlignment(.center)
+                                    .lineLimit(2)
+                            }
+                            .padding(12)
+                            .frame(maxWidth: .infinity)
+                            .background(preset.color.opacity(0.1))
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(preset.color.opacity(0.2), lineWidth: 1)
+                            )
+                        }
+                    }
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+        }
+    }
+
+    // MARK: - HELPERS
+    private var activeTokens: [TokenInfo] {
+        if !app.selectedTokenIds.isEmpty {
+            return app.tokens.filter { app.selectedTokenIds.contains($0.id) }
+        }
+        if let at = app.activeToken { return [at] }
+        return app.tokens
+    }
+
+    private var singleTokenList: [TokenInfo] {
+        if let at = app.activeToken { return [at] }
+        if let f = app.tokens.first { return [f] }
+        return []
+    }
+
+    private func formatTime(_ d: Date) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss"
+        return df.string(from: d)
+    }
+
+    private func formatSeconds(_ sec: Double) -> String {
+        let s = Int(sec)
+        let m = s / 60
+        let r = s % 60
+        return String(format: "%02d:%02d", m, r)
+    }
+}
+
+// MARK: - VOICE GUILD PICKER SHEET
+struct VoiceGuildPickerSheet: View {
+    @EnvironmentObject var app: AppState
+    @EnvironmentObject var voiceRoom: VoiceRoomManager
+    @Environment(\.dismiss) var dismiss
+
+    @State private var search = ""
+
+    var filteredGuilds: [Guild] {
+        if search.isEmpty { return app.multiGuilds }
+        return app.multiGuilds.filter { $0.name.localizedCaseInsensitiveContains(search) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List(filteredGuilds) { g in
+                Button {
+                    guard let tok = (app.activeToken ?? app.tokens.first)?.token else { return }
+                    Task {
+                        await voiceRoom.loadVoiceChannels(guild: g, token: tok)
+                        dismiss()
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
+                           let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
+                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                            placeholder: { Circle().fill(.gray) }
+                            .frame(width: 36, height: 36).clipShape(Circle())
+                        } else {
+                            Circle().fill(.gray.opacity(0.3)).frame(width: 36, height: 36)
+                                .overlay(Text(String(g.name.prefix(1))).font(.subheadline.bold()))
+                        }
+                        Text(g.name).font(.subheadline.bold()).foregroundStyle(.primary)
+                        Spacer()
+                        if voiceRoom.selectedGuild?.id == g.id {
+                            Image(systemName: "checkmark").foregroundColor(.indigo).bold()
+                        }
+                    }
+                }
+            }
+            .searchable(text: $search, prompt: "Tìm kiếm Server...")
+            .navigationTitle("Chọn Server Voice")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Đóng") { dismiss() }
+                }
+            }
+        }
     }
 }
