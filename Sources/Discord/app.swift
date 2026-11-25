@@ -3486,6 +3486,16 @@ func fetchGuildIdForChannel(token: String, channelId: String) async -> String? {
     return nil
 }
 
+/// Trích xuất hostname sạch từ Voice Endpoint (loại bỏ wss:// và mọi :port phía sau)
+func cleanVoiceEndpoint(_ endpoint: String) -> String {
+    var ep = endpoint
+    if ep.hasPrefix("wss://") { ep = String(ep.dropFirst(6)) }
+    if ep.hasPrefix("ws://") { ep = String(ep.dropFirst(5)) }
+    if let slash = ep.firstIndex(of: "/") { ep = String(ep[..<slash]) }
+    if let colon = ep.firstIndex(of: ":") { ep = String(ep[..<colon]) }
+    return ep.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 // MARK: - DISCORD VOICE UDP CLIENT & PROTOCOL HANDSHAKE
 final class DiscordVoiceUDPClient {
     private var sockfd: Int32 = -1
@@ -3519,7 +3529,7 @@ final class DiscordVoiceUDPClient {
         return true
     }
 
-    /// IP Discovery (Discord Voice UDP Protocol RFC)
+    /// IP Discovery (Discord Voice UDP Protocol RFC - Hỗ trợ retry 3 lần)
     func discoverIP(ssrc: UInt32) -> (ip: String, port: UInt16)? {
         guard sockfd >= 0, var addr = serverAddr else { return nil }
 
@@ -3533,37 +3543,43 @@ final class DiscordVoiceUDPClient {
         packet[6] = UInt8((ssrc >> 8) & 0xFF)
         packet[7] = UInt8(ssrc & 0xFF)
 
-        let sent = withUnsafePointer(to: &addr) { ptr -> Int in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                packet.withUnsafeBufferPointer { buf in
-                    Darwin.sendto(sockfd, buf.baseAddress, 74, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        var tv = timeval(tv_sec: 1, tv_usec: 0)
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        for _ in 0..<3 {
+            let sent = withUnsafePointer(to: &addr) { ptr -> Int in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    packet.withUnsafeBufferPointer { buf in
+                        Darwin.sendto(sockfd, buf.baseAddress, 74, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+            guard sent == 74 else { continue }
+
+            var response = [UInt8](repeating: 0, count: 74)
+            var fromAddr = sockaddr_in()
+            var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+
+            let recvd = withUnsafeMutablePointer(to: &fromAddr) { ptr -> Int in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    response.withUnsafeMutableBufferPointer { buf in
+                        Darwin.recvfrom(sockfd, buf.baseAddress, 74, 0, sa, &fromLen)
+                    }
+                }
+            }
+            if recvd >= 74 {
+                var ipBytes = [UInt8]()
+                for i in 8..<72 {
+                    if response[i] == 0 { break }
+                    ipBytes.append(response[i])
+                }
+                if let myIP = String(bytes: ipBytes, encoding: .utf8), !myIP.isEmpty {
+                    let myPort = (UInt16(response[72]) << 8) | UInt16(response[73])
+                    return (myIP, myPort)
                 }
             }
         }
-        guard sent == 74 else { return nil }
-
-        var response = [UInt8](repeating: 0, count: 74)
-        var fromAddr = sockaddr_in()
-        var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-
-        let recvd = withUnsafeMutablePointer(to: &fromAddr) { ptr -> Int in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                response.withUnsafeMutableBufferPointer { buf in
-                    Darwin.recvfrom(sockfd, buf.baseAddress, 74, 0, sa, &fromLen)
-                }
-            }
-        }
-        guard recvd >= 74 else { return nil }
-
-        var ipBytes = [UInt8]()
-        for i in 8..<72 {
-            if response[i] == 0 { break }
-            ipBytes.append(response[i])
-        }
-        guard let myIP = String(bytes: ipBytes, encoding: .utf8), !myIP.isEmpty else { return nil }
-
-        let myPort = (UInt16(response[72]) << 8) | UInt16(response[73])
-        return (myIP, myPort)
+        return nil
     }
 
     func sendPacket(_ data: Data) {
@@ -3855,6 +3871,8 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
     private var wsTask: URLSessionWebSocketTask?
     private var voiceWsTask: URLSessionWebSocketTask?
+    private var gatewaySession: URLSession?
+    private var voiceGatewaySession: URLSession?
     private var heartbeatTask: Task<Void, Never>?
     private var voiceHeartbeatTask: Task<Void, Never>?
     private var listenTask: Task<Void, Never>?
@@ -3911,9 +3929,19 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
             return
         }
 
-        let session = URLSession(configuration: .default)
+        wsTask?.cancel(with: .goingAway, reason: nil)
+        listenTask?.cancel()
+        heartbeatTask?.cancel()
+        gatewaySession?.invalidateAndCancel()
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 30
+        let session = URLSession(configuration: config)
+        self.gatewaySession = session
+
         let ws = session.webSocketTask(with: url)
-        // 64MB buffer để tránh lỗi "Message too long" khi tài khoản có nhiều server
+        // Cố định buffer để tránh lỗi "Message too long" khi tài khoản có nhiều server
         ws.maximumMessageSize = 64 * 1024 * 1024
         self.wsTask = ws
         ws.resume()
@@ -4078,18 +4106,28 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
     private func tryConnectVoiceGateway() {
         guard let sid = sessionId, let vtok = voiceToken, let ep = voiceEndpoint, let gid = currentGuildId else { return }
-        let cleanEndpoint = ep.replacingOccurrences(of: ":443", with: "")
-        guard let vUrl = URL(string: "wss://\(cleanEndpoint)/?v=4") else { return }
+        let cleanHost = cleanVoiceEndpoint(ep)
+        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=8") else {
+            log("Lỗi: Voice Endpoint không hợp lệ (\(ep))")
+            return
+        }
 
         voiceWsTask?.cancel(with: .goingAway, reason: nil)
         voiceListenTask?.cancel()
         voiceHeartbeatTask?.cancel()
+        voiceGatewaySession?.invalidateAndCancel()
 
-        let session = URLSession(configuration: .default)
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 30
+        let session = URLSession(configuration: config)
+        self.voiceGatewaySession = session
+
         let vWs = session.webSocketTask(with: vUrl)
         vWs.maximumMessageSize = 32 * 1024 * 1024
         self.voiceWsTask = vWs
         vWs.resume()
+        log("Đang bắt tay Voice Gateway: \(vUrl.absoluteString)...")
 
         voiceListenTask = Task { [weak self] in
             guard let self = self else { return }
@@ -4108,7 +4146,9 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                     }
                 }
             } catch {
-                // Voice WS ended
+                if !Task.isCancelled {
+                    self.log("Voice Gateway WS ngắt: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -4120,9 +4160,13 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
         switch op {
         case 8: // Hello
-            if let d = json["d"] as? [String: Any],
-               let interval = d["heartbeat_interval"] as? Double {
+            if let d = json["d"] as? [String: Any] {
+                let interval: Double = (d["heartbeat_interval"] as? Double)
+                    ?? (d["heartbeat_interval"] as? Int).map { Double($0) }
+                    ?? ((d["heartbeat_interval"] as? NSNumber)?.doubleValue)
+                    ?? 41250.0
                 startVoiceHeartbeat(intervalMs: interval)
+                log("Nhận Voice Hello (HB: \(Int(interval))ms). Đang gửi Identify...")
                 sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
             }
         case 2: // Ready
@@ -4132,7 +4176,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                 }
                 let ip = d["ip"] as? String ?? ""
                 let port = d["port"] as? Int ?? 0
-                log("Voice Gateway Ready! SSRC: \(self.ssrc). Đang kết nối UDP...")
+                log("Voice Ready! SSRC: \(self.ssrc), UDP Server: \(ip):\(port). Đang bắt tay UDP...")
                 startVoiceUDP(ip: ip, port: port)
             }
         case 4: // Session Description
@@ -4152,12 +4196,29 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                     sendSpeaking(true)
                 }
             }
+        case 6: // Heartbeat ACK
+            break
+        case 9: // Resumed
+            log("Voice Gateway đã hồi phục phiên (Resumed).")
         default:
             break
         }
     }
 
+    private func fetchPublicIP() async -> String? {
+        guard let url = URL(string: "https://api.ipify.org") else { return nil }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 3
+        if let (data, _) = try? await URLSession.shared.data(for: req),
+           let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !ip.isEmpty {
+            return ip
+        }
+        return nil
+    }
+
     private func startVoiceUDP(ip: String, port: Int) {
+        log("Đang mở socket UDP tới \(ip):\(port)...")
         guard udpClient.connect(ip: ip, port: UInt16(port)) else {
             log("Lỗi khởi tạo UDP socket")
             return
@@ -4165,7 +4226,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
         Task.detached { [weak self] in
             guard let self = self else { return }
-            var extIP = ip
+            var extIP = ""
             var extPort = port
 
             if let disc = self.udpClient.discoverIP(ssrc: UInt32(self.ssrc)) {
@@ -4173,13 +4234,18 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                 extPort = Int(disc.port)
                 self.log("Phát hiện UDP IP ngoại vi: \(extIP):\(extPort)")
             } else {
-                // Nếu discovery timeout, giải mã hostname sang dotted IPv4
-                if let resolved = resolveHostToIPv4(ip) {
+                if let pub = await self.fetchPublicIP() {
+                    extIP = pub
+                    self.log("Dùng Public IPv4 fallback: \(extIP):\(extPort)")
+                } else if let resolved = resolveHostToIPv4(ip) {
                     extIP = resolved
+                    self.log("Dùng Host IP trực tiếp: \(extIP):\(extPort)")
+                } else {
+                    extIP = ip
                 }
-                self.log("Dùng IP trực tiếp: \(extIP):\(extPort)")
             }
 
+            self.log("Gửi Select Protocol tới Voice Gateway...")
             self.sendSelectProtocol(ip: extIP, port: extPort)
         }
     }
@@ -4324,10 +4390,12 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         heartbeatTask?.cancel(); heartbeatTask = nil
         listenTask?.cancel(); listenTask = nil
         wsTask?.cancel(with: .goingAway, reason: nil); wsTask = nil
+        gatewaySession?.invalidateAndCancel(); gatewaySession = nil
 
         voiceHeartbeatTask?.cancel(); voiceHeartbeatTask = nil
         voiceListenTask?.cancel(); voiceListenTask = nil
         voiceWsTask?.cancel(with: .goingAway, reason: nil); voiceWsTask = nil
+        voiceGatewaySession?.invalidateAndCancel(); voiceGatewaySession = nil
         udpClient.close()
 
         DispatchQueue.main.async {
@@ -4866,7 +4934,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 let session = VoiceGatewaySession(tokenInfo: token)
                 session.onLog = { [weak self] msg in
                     DispatchQueue.main.async {
-                        self?.addLog("[\(token.username)] \(msg)")
+                        self?.addLog(msg)
                     }
                 }
                 session.start(
