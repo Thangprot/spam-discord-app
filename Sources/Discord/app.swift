@@ -3496,6 +3496,20 @@ func cleanVoiceEndpoint(_ endpoint: String) -> String {
     return ep.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// Trích xuất User ID snowflake trực tiếp từ Token Discord (phần Base64 đầu tiên)
+func extractUserId(from token: String) -> String? {
+    let parts = token.components(separatedBy: ".")
+    guard let first = parts.first, !first.isEmpty else { return nil }
+    var base64 = first.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+    while base64.count % 4 != 0 { base64.append("=") }
+    if let data = Data(base64Encoded: base64),
+       let idStr = String(data: data, encoding: .utf8),
+       !idStr.isEmpty, idStr.allSatisfy({ $0.isNumber }) {
+        return idStr
+    }
+    return nil
+}
+
 // MARK: - DISCORD VOICE UDP CLIENT & PROTOCOL HANDSHAKE
 final class DiscordVoiceUDPClient {
     private var sockfd: Int32 = -1
@@ -3855,7 +3869,7 @@ enum PlaylistLoopMode: String, CaseIterable, Identifiable {
 }
 
 // MARK: - VOICE GATEWAY SESSION (DISCORD GATEWAY + VOICE WEBSOCKET + UDP RTP)
-final class VoiceGatewaySession: Identifiable, ObservableObject {
+final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSessionWebSocketDelegate {
     let id: UUID
     let token: String
     var userId: String
@@ -3890,6 +3904,9 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
     private var ssrc: Int = 0
     private var secretKey: Data?
 
+    private var isVoiceConnecting = false
+    private var activeVoiceToken: String?
+
     private let udpClient = DiscordVoiceUDPClient()
     private var rtpSequence: UInt16 = UInt16.random(in: 0...65535)
     private var rtpTimestamp: UInt32 = UInt32.random(in: 0...4000000)
@@ -3900,9 +3917,14 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
     init(tokenInfo: TokenInfo) {
         self.id = tokenInfo.id
         self.token = tokenInfo.token
-        self.userId = tokenInfo.userId
+        var uid = tokenInfo.userId
+        if (uid.isEmpty || uid == "0"), let ext = extractUserId(from: tokenInfo.token) {
+            uid = ext
+        }
+        self.userId = uid
         self.username = tokenInfo.username
         self.avatarURL = tokenInfo.avatarURL
+        super.init()
     }
 
     func start(guildId: String, channelId: String, mute: Bool, deaf: Bool, video: Bool) {
@@ -3992,8 +4014,13 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         case 0: // Dispatch
             let event = json["t"] as? String
             if event == "READY" {
-                if let d = json["d"] as? [String: Any], let user = d["user"] as? [String: Any], let uid = user["id"] as? String, self.userId.isEmpty {
-                    self.userId = uid
+                if let d = json["d"] as? [String: Any] {
+                    if let user = d["user"] as? [String: Any], let uid = user["id"] as? String, !uid.isEmpty {
+                        self.userId = uid
+                    }
+                    if let sid = d["session_id"] as? String, !sid.isEmpty {
+                        self.sessionId = sid
+                    }
                 }
                 DispatchQueue.main.async { self.isConnected = true }
                 log("Đã kết nối Gateway! Đang vào Voice Channel...")
@@ -4001,21 +4028,21 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
             } else if event == "VOICE_STATE_UPDATE" {
                 if let d = json["d"] as? [String: Any],
                    let uid = d["user_id"] as? String {
-                    if self.userId.isEmpty { self.userId = uid }
+                    if (self.userId.isEmpty || self.userId == "0") { self.userId = uid }
                     if uid == self.userId {
-                    if let sid = d["session_id"] as? String {
-                        self.sessionId = sid
-                    }
-                    if let cid = d["channel_id"] as? String, cid == currentChannelId {
-                        DispatchQueue.main.async { self.isJoined = true }
-                        log("Đã vào phòng Voice! Đang kết nối máy chủ âm thanh...")
-                        tryConnectVoiceGateway()
-                    } else if d["channel_id"] == nil || d["channel_id"] is NSNull {
-                        DispatchQueue.main.async {
-                            self.isJoined = false
-                            self.isVoiceUDPReady = false
+                        if let sid = d["session_id"] as? String, !sid.isEmpty {
+                            self.sessionId = sid
                         }
-                    }
+                        if let cid = d["channel_id"] as? String, cid == currentChannelId {
+                            DispatchQueue.main.async { self.isJoined = true }
+                            log("Đã vào phòng Voice! Đang kết nối máy chủ âm thanh...")
+                            tryConnectVoiceGateway()
+                        } else if d["channel_id"] == nil || d["channel_id"] is NSNull {
+                            DispatchQueue.main.async {
+                                self.isJoined = false
+                                self.isVoiceUDPReady = false
+                            }
+                        }
                     }
                 }
             } else if event == "VOICE_SERVER_UPDATE" {
@@ -4024,6 +4051,9 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                    let endpoint = d["endpoint"] as? String {
                     self.voiceToken = token
                     self.voiceEndpoint = endpoint
+                    if let gid = d["guild_id"] as? String, !gid.isEmpty {
+                        self.currentGuildId = gid
+                    }
                     log("Đã nhận Voice Server: \(endpoint)")
                     tryConnectVoiceGateway()
                 }
@@ -4105,10 +4135,26 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
     }
 
     private func tryConnectVoiceGateway() {
-        guard let sid = sessionId, let vtok = voiceToken, let ep = voiceEndpoint, let gid = currentGuildId else { return }
+        guard let sid = sessionId, !sid.isEmpty,
+              let vtok = voiceToken, !vtok.isEmpty,
+              let ep = voiceEndpoint, !ep.isEmpty,
+              let gid = currentGuildId, !gid.isEmpty else { return }
+
+        // Chống race condition: không hủy kết nối đang bắt tay nếu token và endpoint không đổi
+        if isVoiceConnecting && activeVoiceToken == vtok {
+            return
+        }
+        if isVoiceUDPReady && activeVoiceToken == vtok {
+            return
+        }
+
+        isVoiceConnecting = true
+        activeVoiceToken = vtok
+
         let cleanHost = cleanVoiceEndpoint(ep)
-        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=8") else {
+        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=4") else {
             log("Lỗi: Voice Endpoint không hợp lệ (\(ep))")
+            isVoiceConnecting = false
             return
         }
 
@@ -4120,7 +4166,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
-        let session = URLSession(configuration: config)
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.voiceGatewaySession = session
 
         let vWs = session.webSocketTask(with: vUrl)
@@ -4146,7 +4192,8 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                     }
                 }
             } catch {
-                if !Task.isCancelled {
+                if !Task.isCancelled && self.voiceWsTask === vWs {
+                    self.isVoiceConnecting = false
                     self.log("Voice Gateway WS ngắt: \(error.localizedDescription)")
                 }
             }
@@ -4171,6 +4218,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
             }
         case 2: // Ready
             if let d = json["d"] as? [String: Any] {
+                self.isVoiceConnecting = false
                 if let ssrcVal = d["ssrc"] as? Int {
                     self.ssrc = ssrcVal
                 }
@@ -4285,15 +4333,23 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
     private func sendVoiceIdentify(guildId: String, sessionId: String, token: String) {
         guard let ws = voiceWsTask else { return }
+
+        var uid = self.userId
+        if (uid.isEmpty || uid == "0"), let ext = extractUserId(from: self.token) {
+            uid = ext
+            self.userId = ext
+        }
+
         let payload: [String: Any] = [
             "op": 0,
             "d": [
                 "server_id": guildId,
-                "user_id": userId,
+                "user_id": uid,
                 "session_id": sessionId,
                 "token": token
             ]
         ]
+        log("Gửi Voice Identify: Server=\(guildId), User=\(uid)...")
         if let data = try? JSONSerialization.data(withJSONObject: payload),
            let str = String(data: data, encoding: .utf8) {
             Task { try? await ws.send(.string(str)) }
@@ -4368,7 +4424,14 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         }
     }
 
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        log("Voice WebSocket đóng [Mã \(closeCode.rawValue)]: \(reasonStr)")
+    }
+
     func stop() {
+        isVoiceConnecting = false
+        activeVoiceToken = nil
         if let gid = currentGuildId {
             let payload: [String: Any] = [
                 "op": 4,
