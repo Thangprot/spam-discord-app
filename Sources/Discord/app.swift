@@ -3486,13 +3486,13 @@ func fetchGuildIdForChannel(token: String, channelId: String) async -> String? {
     return nil
 }
 
-/// Trích xuất hostname sạch từ Voice Endpoint (loại bỏ wss:// và mọi :port phía sau)
+/// Chuẩn hóa Voice Endpoint (GIỮ NGUYÊN :port như :2053, :2083, :8443 để tránh lỗi 4006)
 func cleanVoiceEndpoint(_ endpoint: String) -> String {
-    var ep = endpoint
+    var ep = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
     if ep.hasPrefix("wss://") { ep = String(ep.dropFirst(6)) }
     if ep.hasPrefix("ws://") { ep = String(ep.dropFirst(5)) }
     if let slash = ep.firstIndex(of: "/") { ep = String(ep[..<slash]) }
-    if let colon = ep.firstIndex(of: ":") { ep = String(ep[..<colon]) }
+    if ep.hasSuffix(":80") { ep = String(ep.dropLast(3)) }
     return ep.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
@@ -4137,7 +4137,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var selfDeaf = false
     private var selfVideo = false
 
-    private var sessionId: String?
+    private var gatewaySeq: Int?
+    private var voiceSessionId: String?
     private var voiceToken: String?
     private var voiceEndpoint: String?
     private var ssrc: Int = 0
@@ -4147,10 +4148,13 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var daveSession: DaveE2EESession?
     private var hasLoggedAudioStart = false
     private var hasLoggedDaveReady = false
+    private var hasSentVoiceIdentify = false
+    private var hasSentSelectProtocol = false
     private let packetLock = NSLock()
 
     private var isVoiceConnecting = false
     private var activeVoiceToken: String?
+    private var activeVoiceSessionId: String?
 
     private let udpClient = DiscordVoiceUDPClient()
     private var rtpSequence: UInt16 = UInt16.random(in: 0...65535)
@@ -4179,6 +4183,15 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         self.selfMute = mute
         self.selfDeaf = deaf
         self.selfVideo = video
+        self.gatewaySeq = nil
+        self.voiceSessionId = nil
+        self.voiceToken = nil
+        self.voiceEndpoint = nil
+        self.activeVoiceToken = nil
+        self.activeVoiceSessionId = nil
+        self.isVoiceConnecting = false
+        self.hasSentVoiceIdentify = false
+        self.hasSentSelectProtocol = false
 
         connectGateway()
     }
@@ -4203,9 +4216,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         gatewaySession?.invalidateAndCancel()
 
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 30
-        let session = URLSession(configuration: config)
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 604800 // Không tự cắt WebSocket sau 30 giây
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.gatewaySession = session
 
         let ws = session.webSocketTask(with: url)
@@ -4231,7 +4244,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     }
                 }
             } catch {
-                if !Task.isCancelled {
+                if !Task.isCancelled && self.wsTask === ws {
                     self.log("Gateway ngắt kết nối: \(error.localizedDescription)")
                     DispatchQueue.main.async {
                         self.isConnected = false
@@ -4248,10 +4261,14 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let op = json["op"] as? Int else { return }
 
+        if let seq = json["s"] as? Int {
+            self.gatewaySeq = seq
+        }
+
         switch op {
         case 10: // Hello
             if let d = json["d"] as? [String: Any],
-               let interval = d["heartbeat_interval"] as? Int {
+               let interval = (d["heartbeat_interval"] as? Int) ?? (d["heartbeat_interval"] as? NSNumber)?.intValue {
                 startHeartbeat(intervalMs: interval)
                 sendIdentify()
             }
@@ -4264,9 +4281,6 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     if let user = d["user"] as? [String: Any], let uid = user["id"] as? String, !uid.isEmpty {
                         self.userId = uid
                     }
-                    if let sid = d["session_id"] as? String, !sid.isEmpty {
-                        self.sessionId = sid
-                    }
                 }
                 DispatchQueue.main.async { self.isConnected = true }
                 log("Đã kết nối Gateway! Đang vào Voice Channel...")
@@ -4276,14 +4290,17 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                    let uid = d["user_id"] as? String {
                     if (self.userId.isEmpty || self.userId == "0") { self.userId = uid }
                     if uid == self.userId {
-                        if let sid = d["session_id"] as? String, !sid.isEmpty {
-                            self.sessionId = sid
-                        }
                         if let cid = d["channel_id"] as? String, cid == currentChannelId {
+                            if let sid = d["session_id"] as? String, !sid.isEmpty {
+                                self.voiceSessionId = sid
+                                log("Đã vào phòng Voice (Session: \(sid.prefix(8))...)! Đang chờ Voice Server...")
+                            } else {
+                                log("Đã vào phòng Voice! Đang kết nối máy chủ âm thanh...")
+                            }
                             DispatchQueue.main.async { self.isJoined = true }
-                            log("Đã vào phòng Voice! Đang kết nối máy chủ âm thanh...")
                             tryConnectVoiceGateway()
                         } else if d["channel_id"] == nil || d["channel_id"] is NSNull {
+                            self.voiceSessionId = nil
                             DispatchQueue.main.async {
                                 self.isJoined = false
                                 self.isVoiceUDPReady = false
@@ -4294,11 +4311,15 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             } else if event == "VOICE_SERVER_UPDATE" {
                 if let d = json["d"] as? [String: Any],
                    let token = d["token"] as? String,
-                   let endpoint = d["endpoint"] as? String {
+                   let endpoint = d["endpoint"] as? String, !endpoint.isEmpty {
+                    let gid = d["guild_id"] as? String
+                    if let curGid = self.currentGuildId, let evGid = gid, !evGid.isEmpty, evGid != curGid {
+                        return
+                    }
                     self.voiceToken = token
                     self.voiceEndpoint = endpoint
-                    if let gid = d["guild_id"] as? String, !gid.isEmpty {
-                        self.currentGuildId = gid
+                    if let evGid = gid, !evGid.isEmpty {
+                        self.currentGuildId = evGid
                     }
                     log("Đã nhận Voice Server: \(endpoint)")
                     tryConnectVoiceGateway()
@@ -4317,7 +4338,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 try? await Task.sleep(nanoseconds: UInt64(intervalSec * 1_000_000_000))
                 guard let self = self, let ws = self.wsTask else { break }
                 let start = Date()
-                let hb = "{\"op\":1,\"d\":null}"
+                let seqStr = self.gatewaySeq.map { String($0) } ?? "null"
+                let hb = "{\"op\":1,\"d\":\(seqStr)}"
                 try? await ws.send(.string(hb))
                 let ping = Int(Date().timeIntervalSince(start) * 1000)
                 DispatchQueue.main.async {
@@ -4381,24 +4403,28 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     }
 
     private func tryConnectVoiceGateway() {
-        guard let sid = sessionId, !sid.isEmpty,
+        // Phải có đủ cả voiceSessionId (từ VOICE_STATE_UPDATE) và voiceToken + voiceEndpoint (từ VOICE_SERVER_UPDATE)
+        guard let sid = voiceSessionId, !sid.isEmpty,
               let vtok = voiceToken, !vtok.isEmpty,
               let ep = voiceEndpoint, !ep.isEmpty,
               let gid = currentGuildId, !gid.isEmpty else { return }
 
-        // Chống race condition: không hủy kết nối đang bắt tay nếu token không đổi
-        if isVoiceConnecting && activeVoiceToken == vtok {
+        // Chống race condition: không hủy kết nối đang bắt tay nếu token & session không đổi
+        if isVoiceConnecting && activeVoiceToken == vtok && activeVoiceSessionId == sid {
             return
         }
-        if isVoiceUDPReady && activeVoiceToken == vtok {
+        if isVoiceUDPReady && activeVoiceToken == vtok && activeVoiceSessionId == sid {
             return
         }
 
         isVoiceConnecting = true
         activeVoiceToken = vtok
+        activeVoiceSessionId = sid
         voiceSeq = -1
         hasLoggedAudioStart = false
         hasLoggedDaveReady = false
+        hasSentVoiceIdentify = false
+        hasSentSelectProtocol = false
         daveSession?.destroy()
         daveSession = nil
 
@@ -4416,8 +4442,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         voiceGatewaySession?.invalidateAndCancel()
 
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 30
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 604800 // Không tự cắt Voice WebSocket sau 30 giây
         let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.voiceGatewaySession = session
 
@@ -4482,8 +4508,11 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     ?? ((d["heartbeat_interval"] as? NSNumber)?.doubleValue)
                     ?? 13750.0
                 startVoiceHeartbeat(intervalMs: interval)
-                log("Nhận Voice Hello (HB: \(Int(interval))ms). Đang gửi Identify v8 (DAVE v\(DaveE2EESession.maxProtocolVersion))...")
-                await sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
+                if !hasSentVoiceIdentify {
+                    hasSentVoiceIdentify = true
+                    log("Nhận Voice Hello (HB: \(Int(interval))ms). Đang gửi Identify v8 (DAVE v\(DaveE2EESession.maxProtocolVersion))...")
+                    await sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
+                }
             }
         case 2: // Ready
             if let d = json["d"] as? [String: Any] {
@@ -4722,6 +4751,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     }
 
     private func sendSelectProtocol(ip: String, port: Int) async {
+        guard !hasSentSelectProtocol else { return }
+        hasSentSelectProtocol = true
         let payload: [String: Any] = [
             "op": 1,
             "d": [
@@ -4772,7 +4803,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 "max_dave_protocol_version": DaveE2EESession.maxProtocolVersion
             ]
         ]
-        log("Gửi Voice Identify v8: Server=\(guildId), User=\(uid), DAVE=\(DaveE2EESession.maxProtocolVersion)...")
+        log("Gửi Voice Identify v8: Server=\(guildId), User=\(uid), Session=\(sessionId.prefix(8))..., DAVE=\(DaveE2EESession.maxProtocolVersion)...")
         await sendVoiceJSON(payload)
     }
 
@@ -4904,14 +4935,22 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        log("Voice WebSocket đóng [Mã \(closeCode.rawValue)]: \(reasonStr)")
+        let label = (webSocketTask === wsTask) ? "Gateway chính" : "Voice WebSocket"
+        log("\(label) đóng [Mã \(closeCode.rawValue)]: \(reasonStr)")
     }
 
     func stop() {
         isVoiceConnecting = false
         activeVoiceToken = nil
+        activeVoiceSessionId = nil
+        voiceSessionId = nil
+        voiceToken = nil
+        voiceEndpoint = nil
+        gatewaySeq = nil
         hasLoggedAudioStart = false
         hasLoggedDaveReady = false
+        hasSentVoiceIdentify = false
+        hasSentSelectProtocol = false
         if let gid = currentGuildId {
             let payload: [String: Any] = [
                 "op": 4,
