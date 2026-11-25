@@ -4495,57 +4495,64 @@ final class VoiceRoomManager: ObservableObject {
 }
 
 // ==============================================================================
-// MARK: - MUSIC STREAM MANAGER (XẢ MIC / XẢ ROOM VIP - HOẠT ĐỘNG ĐỘC LẬP)
+// MARK: - MUSIC STREAM MANAGER (HỆ THỐNG TIÊN NGHỊCH [XẢ CHA - ĐỘC TÔN] - MAKE SUPER VIP)
 // ==============================================================================
 @MainActor
 final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
     static let shared = MusicStreamManager()
 
     @Published var isPlaying = false
-    @Published var statusText = "Chưa hoạt động"
+    @Published var isPaused = false
+    @Published var statusText = "⛩️ Bế quan (Chưa hoạt động)"
     @Published var logs: [VoiceRoomLog] = []
 
-    // Target Selection (Độc lập: chọn token chạy và chọn phòng xả)
+    // Trận pháp Đạo Hữu (Đa Token / 1 Token)
+    @Published var multiTokenMode: Bool = true // Mặc định chạy cả dàn token như Make Super VIP
     @Published var selectedToken: TokenInfo? = nil
     @Published var customToken: String = ""
     @Published var targetChannelId: String = ""
     @Published var selectedGuild: Guild? = nil
     @Published var selectedChannel: Channel? = nil
 
-    // Multi-track Playlist (Nhiều bài nhạc, có thể bấm chọn bài)
+    // Linh Hồn Hàng Đợi (Playlist Queue)
     @Published var playlist: [PlaylistItem] = []
     @Published var currentTrackIndex: Int = 0
-
-    // Currently playing info
-    @Published var currentSongTitle = "Chưa chọn file nhạc"
+    @Published var currentSongTitle = "Chưa nạp pháp bảo nhạc"
     @Published var audioFileURL: URL? = nil
     @Published var currentTime: Double = 0
     @Published var duration: Double = 0
     @Published var visualizerLevels: [CGFloat] = [0.2, 0.4, 0.7, 0.3, 0.9, 0.5, 0.8, 0.4]
 
-    // Cấu hình âm thanh & Chế độ nhạc VIP
-    @Published var volume: Float = 1.0 { // 0.0 to 2.0 (0% -> 200%)
-        didSet {
-            localPlayer?.volume = min(1.0, volume)
-        }
+    // Cấu hình âm thanh & Sát chiêu chiến đấu Make Super VIP
+    @Published var volume: Float = 1.0 { // Chân hỏa: 0.0 to 2.0 (0% - 200%)
+        didSet { localPlayer?.volume = min(1.0, volume) }
     }
-    @Published var playbackSpeed: Float = 1.0 // 0.75, 1.0, 1.25, 1.5, 2.0
-    @Published var bassBoost: Bool = false
+    @Published var boostMultiplier: Float = 1.0 // Ép xung: 1.0 to 5.0 (100% - 500%)
+    @Published var bassAmount: Float = 0.0 // Trọng lực Bass: 0 to 100
+    @Published var isCleanMode: Bool = false // !xoatapam: Lọc ồn chủ động (Highpass 150Hz + Lowpass 10kHz)
+    @Published var isMaxMode: Bool = false // !max: Sát chiêu V9 Tối Thượng (EQ 80Hz + 3500Hz + Boost 2.5x)
+    @Published var playbackSpeed: Float = 1.0 // Tốc độ phát: 0.75, 1.0, 1.25, 1.5
     @Published var audioFX: SpamAudioFX = .normal
-    @Published var loopMode: PlaylistLoopMode = .loopAll
-    @Published var playLocalSpeaker: Bool = false // Mặc định TẮT: Âm thanh xả thẳng vào Discord Voice
+    @Published var loopMode: PlaylistLoopMode = .loopAll // Vòng lặp vô hạn
+    @Published var playLocalSpeaker: Bool = false // Loa ngoài (Mặc định tắt)
 
-    // Engine & Streaming
-    private var activeVoiceSession: VoiceGatewaySession?
+    // Dàn phiên âm thanh (Đa phân thân)
+    @Published var activeSessions: [VoiceGatewaySession] = []
     private var streamTask: Task<Void, Never>?
     var currentDecoder: AudioTrackDecoder?
     private let opusEncoder = NativeOpusEncoder()
     private var streamFrameIndex = 0
     private var localPlayer: AVAudioPlayer?
 
-    // DSP State for Bass Boost
+    // DSP Filter States
     private var bassStateL: Float = 0
     private var bassStateR: Float = 0
+    private var hpStateL: Float = 0
+    private var hpStateR: Float = 0
+    private var prevInL: Float = 0
+    private var prevInR: Float = 0
+    private var lpStateL: Float = 0
+    private var lpStateR: Float = 0
 
     private override init() {
         super.init()
@@ -4562,7 +4569,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         if logs.count > 100 { logs.removeFirst(logs.count - 100) }
     }
 
-    // MARK: - PLAYLIST MANAGEMENT
+    // MARK: - PLAYLIST QUEUE MANAGEMENT
     func addFiles(urls: [URL]) {
         for url in urls {
             let title = url.deletingPathExtension().lastPathComponent
@@ -4581,8 +4588,8 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 playlist.append(item)
             }
         }
-        addLog("Đã thêm \(urls.count) bài nhạc vào danh sách")
-        statusText = "Đã có \(playlist.count) bài trong danh sách"
+        addLog("📥 Đã nạp thêm \(urls.count) pháp bảo vào Linh Hồn Hàng Đợi (Tổng: \(playlist.count) bài)")
+        statusText = "Đã có \(playlist.count) pháp bảo trong hàng đợi"
 
         if currentDecoder == nil && !playlist.isEmpty {
             selectTrack(index: 0)
@@ -4599,7 +4606,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             preset: preset
         )
         playlist.append(item)
-        addLog("Đã thêm nhạc mẫu: \(preset.rawValue)")
+        addLog("📥 Đã nạp pháp bảo mẫu VIP: \(preset.rawValue)")
         if currentDecoder == nil {
             selectTrack(index: playlist.count - 1)
         }
@@ -4617,11 +4624,11 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             if playlist.isEmpty {
                 stopSpam()
                 currentDecoder = nil
-                currentSongTitle = "Chưa chọn file nhạc"
+                currentSongTitle = "Chưa nạp pháp bảo nhạc"
                 audioFileURL = nil
                 duration = 0
                 currentTime = 0
-                statusText = "Danh sách nhạc trống"
+                statusText = "Linh hồn hàng đợi đang trống rỗng"
             } else if currentTrackIndex >= playlist.count {
                 selectTrack(index: playlist.count - 1)
             } else if currentTrackIndex == idx {
@@ -4634,12 +4641,12 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         stopSpam()
         playlist.removeAll()
         currentDecoder = nil
-        currentSongTitle = "Chưa chọn file nhạc"
+        currentSongTitle = "Chưa nạp pháp bảo nhạc"
         audioFileURL = nil
         duration = 0
         currentTime = 0
-        statusText = "Đã xóa toàn bộ danh sách nhạc"
-        addLog("Đã xóa sạch danh sách bài hát")
+        statusText = "Đã giải tán toàn bộ hàng đợi nhạc"
+        addLog("🗑️ Đã xóa sạch Linh Hồn Hàng Đợi")
     }
 
     func selectTrack(index: Int) {
@@ -4696,17 +4703,17 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     self.currentDecoder = decoder
                     self.duration = decoder.durationSeconds
                     self.currentTime = 0
-                    self.statusText = self.isPlaying ? "🔊 Đang xả: \(self.currentSongTitle)" : "Đã sẵn sàng: \(self.currentSongTitle)"
+                    self.statusText = self.isPlaying ? "🔥 Đang xả: \(self.currentSongTitle)" : "Đã sẵn sàng: \(self.currentSongTitle)"
                     if self.playLocalSpeaker {
                         self.setupLocalPlayer(url: url)
-                        if self.isPlaying {
+                        if self.isPlaying && !self.isPaused {
                             self.localPlayer?.play()
                         }
                     }
                 }
             } else {
                 await MainActor.run {
-                    self.statusText = "❌ Lỗi định dạng file nhạc không hỗ trợ"
+                    self.statusText = "❌ Lỗi định dạng pháp bảo không hỗ trợ"
                 }
             }
         }
@@ -4749,7 +4756,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         self.currentDecoder = decoder
         self.duration = toneDuration
         self.currentTime = 0
-        self.statusText = self.isPlaying ? "🔊 Đang xả: \(preset.rawValue)" : "Đã chọn: \(preset.rawValue)"
+        self.statusText = self.isPlaying ? "🔥 Đang xả: \(preset.rawValue)" : "Đã chọn: \(preset.rawValue)"
     }
 
     private func setupLocalPlayer(url: URL) {
@@ -4763,56 +4770,62 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             localPlayer?.numberOfLoops = (loopMode == .loopOne) ? -1 : 0
             localPlayer?.volume = min(1.0, volume)
             localPlayer?.prepareToPlay()
-        } catch {
-            // Local player optional
-        }
+        } catch {}
     }
 
-    // MARK: - BẮT ĐẦU XẢ ROOM (ĐỘC LẬP HOÀN TOÀN)
+    // MARK: - BẮT ĐẦU XẢ ROOM TIÊN NGHỊCH (ĐA TOKEN ĐỒNG LOẠT MAKE SUPER VIP)
     func startSpam(app: AppState) {
         guard let decoder = currentDecoder, !decoder.leftSamples.isEmpty else {
-            statusText = "❌ Chưa có nhạc trong danh sách (Bấm 'Thêm nhiều file')"
-            return
-        }
-
-        let tokenToUse: TokenInfo?
-        if let st = selectedToken {
-            tokenToUse = st
-        } else if !customToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let t = customToken.trimmingCharacters(in: .whitespacesAndNewlines)
-            tokenToUse = TokenInfo(id: UUID(), token: t, userId: "", username: "Custom Token", avatar: nil)
-        } else if let at = app.activeToken {
-            tokenToUse = at
-        } else if let f = app.tokens.first {
-            tokenToUse = f
-        } else {
-            tokenToUse = nil
-        }
-
-        guard let token = tokenToUse else {
-            statusText = "❌ Chưa chọn Token nào để xả mic"
+            statusText = "❌ Chưa nạp pháp bảo nhạc vào hàng đợi"
             return
         }
 
         let inputCID = targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines)
         let channelId = !inputCID.isEmpty ? inputCID : (selectedChannel?.id ?? "")
         guard !channelId.isEmpty else {
-            statusText = "❌ Vui lòng nhập Channel ID hoặc chọn kênh voice"
+            statusText = "❌ Vui lòng nhập Channel ID hoặc chọn phòng xả"
+            return
+        }
+
+        // Xác định danh sách Token tham chiến
+        var tokensToUse: [TokenInfo] = []
+        if multiTokenMode {
+            if !app.selectedTokenIds.isEmpty {
+                tokensToUse = app.tokens.filter { app.selectedTokenIds.contains($0.id) }
+            } else if !app.tokens.isEmpty {
+                tokensToUse = app.tokens
+            }
+        } else {
+            if let st = selectedToken {
+                tokensToUse = [st]
+            } else if !customToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let t = customToken.trimmingCharacters(in: .whitespacesAndNewlines)
+                tokensToUse = [TokenInfo(id: UUID(), token: t, userId: "", username: "Custom Token", avatar: nil)]
+            } else if let at = app.activeToken {
+                tokensToUse = [at]
+            } else if let f = app.tokens.first {
+                tokensToUse = [f]
+            }
+        }
+
+        guard !tokensToUse.isEmpty else {
+            statusText = "❌ Chưa có Token nào sẵn sàng xuất thủ"
             return
         }
 
         stopSpam()
 
         isPlaying = true
-        statusText = "Đang đăng nhập Gateway..."
+        isPaused = false
+        statusText = "⚡ Triệu tập \(tokensToUse.count) Đạo hữu xuất thủ..."
         streamFrameIndex = 0
         currentTime = 0
-        addLog("Khởi động xả room với token [\(token.username)] vào phòng [\(channelId)]")
+        addLog("⚡ Khởi động HỆ THỐNG TIÊN NGHỊCH: Triệu tập \(tokensToUse.count) Đạo hữu vào phòng [\(channelId)]")
 
         BackgroundManager.shared.start()
         NowPlayingHelper.shared.update(
-            title: "Xả Mic: \(currentSongTitle)",
-            detail: "Đang phát vào kênh [\(channelId)]"
+            title: "Xả Cha VIP: \(currentSongTitle)",
+            detail: "Đang phát vào kênh [\(channelId)] (\(tokensToUse.count) bot)"
         )
 
         Task { [weak self] in
@@ -4820,57 +4833,63 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
             var guildId = self.selectedGuild?.id
             if guildId == nil || guildId!.isEmpty {
-                await MainActor.run { self.statusText = "Đang tìm Server của kênh \(channelId)..." }
-                guildId = await fetchGuildIdForChannel(token: token.token, channelId: channelId)
+                await MainActor.run { self.statusText = "Đang tra cứu Server của phòng \(channelId)..." }
+                if let firstTok = tokensToUse.first?.token {
+                    guildId = await fetchGuildIdForChannel(token: firstTok, channelId: channelId)
+                }
             }
 
             guard let gid = guildId, !gid.isEmpty else {
                 await MainActor.run {
                     self.statusText = "❌ Không tìm thấy Server (Kiểm tra Channel ID hoặc quyền token)"
-                    self.addLog("❌ Không tìm thấy Guild ID cho kênh \(channelId)")
+                    self.addLog("❌ Không tra cứu được Guild ID cho phòng \(channelId)")
                     self.isPlaying = false
                 }
                 return
             }
 
             await MainActor.run {
-                self.statusText = "Đang vào Voice Channel & kết nối UDP..."
+                self.statusText = "Đang kết nối toàn bộ \(tokensToUse.count) phân thân vào Voice UDP..."
             }
 
-            let session = VoiceGatewaySession(tokenInfo: token)
-            await MainActor.run {
-                self.activeVoiceSession = session
-            }
-
-            session.onLog = { [weak self] msg in
-                DispatchQueue.main.async {
-                    self?.addLog(msg)
-                    if self?.isPlaying == true {
-                        self?.statusText = msg
+            var createdSessions: [VoiceGatewaySession] = []
+            for token in tokensToUse {
+                let session = VoiceGatewaySession(tokenInfo: token)
+                session.onLog = { [weak self] msg in
+                    DispatchQueue.main.async {
+                        self?.addLog("[\(token.username)] \(msg)")
                     }
                 }
+                session.start(
+                    guildId: gid,
+                    channelId: channelId,
+                    mute: false,
+                    deaf: false,
+                    video: false
+                )
+                createdSessions.append(session)
             }
 
-            session.start(
-                guildId: gid,
-                channelId: channelId,
-                mute: false,
-                deaf: false,
-                video: false
-            )
+            await MainActor.run {
+                self.activeSessions = createdSessions
+            }
 
-            // Đợi kết nối Voice UDP hoàn tất
             var waited = 0
-            while !session.isVoiceUDPReady && waited < 50 && self.isPlaying {
+            while waited < 50 && self.isPlaying {
+                let readyCount = createdSessions.filter { $0.isVoiceUDPReady }.count
+                if readyCount > 0 && (readyCount == createdSessions.count || waited > 15) {
+                    break
+                }
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 waited += 1
             }
 
-            guard session.isVoiceUDPReady && self.isPlaying else {
+            let readySessions = createdSessions.filter { $0.isVoiceUDPReady }
+            guard !readySessions.isEmpty && self.isPlaying else {
                 await MainActor.run {
                     if self.isPlaying {
                         self.statusText = "❌ Kết nối Voice thất bại (Hết thời gian chờ UDP)"
-                        self.addLog("❌ Hết thời gian chờ kết nối UDP Voice")
+                        self.addLog("❌ Không thể thiết lập kênh UDP cho các phân thân")
                         self.stopSpam()
                     }
                 }
@@ -4878,40 +4897,68 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
 
             await MainActor.run {
-                self.statusText = "🔊 Đang xả: \(self.currentSongTitle)"
-                self.addLog("🔊 Kênh UDP sẵn sàng! Đang phát nhạc trực tiếp vào Discord.")
-                session.setSpeaking(true)
+                self.statusText = "🔥 Đang xả hỏa lực: \(self.currentSongTitle) (\(readySessions.count) Đạo hữu)"
+                self.addLog("🔥 Trận pháp đã kết thành! \(readySessions.count)/\(createdSessions.count) phân thân bắt đầu xả nhạc đồng loạt!")
+
+                for s in readySessions {
+                    s.setSpeaking(true)
+                }
 
                 if self.playLocalSpeaker, let url = self.audioFileURL {
                     self.setupLocalPlayer(url: url)
                     self.localPlayer?.play()
                 }
 
-                self.startStreamingTask(session: session)
+                self.startStreamingTask()
             }
         }
     }
 
+    // MARK: - SÁT CHIÊU CÂM MỒM (!cam) & SỦA TIẾP (!sua)
+    func pauseSpam() {
+        guard isPlaying else { return }
+        isPaused = true
+        for s in activeSessions {
+            s.setSpeaking(false)
+        }
+        localPlayer?.pause()
+        statusText = "🔇 Đã phong ấn âm thanh (Câm mồm)"
+        addLog("🔇 Đã phong ấn âm thanh (Câm mồm). Giữ nguyên toàn bộ phân thân trong phòng.")
+    }
+
+    func resumeSpam() {
+        guard isPlaying else { return }
+        isPaused = false
+        for s in activeSessions where s.isVoiceUDPReady {
+            s.setSpeaking(true)
+        }
+        localPlayer?.play()
+        statusText = "🔊 Đã giải ấn! Tiếp tục xả hỏa lực"
+        addLog("🔊 Đã giải ấn! Tiếp tục xả hỏa lực y như lúc ban đầu.")
+    }
+
+    // MARK: - BẾ QUAN / THU HỒI PHÂN THÂN (!exit)
     func stopSpam() {
         isPlaying = false
+        isPaused = false
         streamTask?.cancel()
         streamTask = nil
 
-        if let session = activeVoiceSession {
-            let silence = Data([0xF8, 0xFF, 0xFE])
+        let silence = Data([0xF8, 0xFF, 0xFE])
+        for session in activeSessions {
             for _ in 0..<5 {
                 session.sendOpusPacket(silence)
             }
             session.setSpeaking(false)
             session.stop()
         }
-        activeVoiceSession = nil
+        activeSessions.removeAll()
 
         localPlayer?.stop()
         localPlayer = nil
 
-        statusText = "Đã dừng xả room"
-        addLog("Đã ngắt kết nối và dừng xả room")
+        statusText = "⛩️ Bế quan (Đã thu hồi toàn bộ phân thân)"
+        addLog("⛩️ Đã bế quan, giải tán hàng đợi nhạc và thu hồi toàn bộ phân thân.")
         currentTime = 0
         streamFrameIndex = 0
     }
@@ -4924,8 +4971,8 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         localPlayer?.currentTime = seconds
     }
 
-    // MARK: - STREAMING ENGINE 20MS OPUS UDP
-    private func startStreamingTask(session: VoiceGatewaySession) {
+    // MARK: - STREAMING ENGINE ĐA PHÂN THÂN MAKE SUPER VIP
+    private func startStreamingTask() {
         streamTask?.cancel()
 
         streamTask = Task.detached { [weak self] in
@@ -4937,18 +4984,33 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
                 var curIdx = 0
                 var currentVol: Float = 1.0
+                var currentBoost: Float = 1.0
+                var bassAmt: Float = 0
+                var isClean = false
+                var isMax = false
+                var isPausedLocal = false
                 var currentFX: SpamAudioFX = .normal
-                var isBass: Bool = false
                 var currentSpeed: Float = 1.0
                 var decoderRef: AudioTrackDecoder?
+                var readySessions: [VoiceGatewaySession] = []
 
                 await MainActor.run {
                     curIdx = self.streamFrameIndex
                     currentVol = self.volume
+                    currentBoost = self.boostMultiplier
+                    bassAmt = self.bassAmount
+                    isClean = self.isCleanMode
+                    isMax = self.isMaxMode
+                    isPausedLocal = self.isPaused
                     currentFX = self.audioFX
-                    isBass = self.bassBoost
                     currentSpeed = self.playbackSpeed
                     decoderRef = self.currentDecoder
+                    readySessions = self.activeSessions.filter { $0.isVoiceUDPReady }
+                }
+
+                if isPausedLocal {
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    continue
                 }
 
                 guard let decoder = decoderRef, !decoder.leftSamples.isEmpty else {
@@ -4974,47 +5036,81 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 var chunkL = Array(leftSamples[startSample..<endSample])
                 var chunkR = Array(rightSamples[startSample..<endSample])
 
-                // 1. Áp dụng âm lượng (0% -> 200% với soft clamping)
-                if currentVol != 1.0 {
-                    for i in 0..<960 {
-                        chunkL[i] = max(-1.0, min(1.0, chunkL[i] * currentVol))
-                        chunkR[i] = max(-1.0, min(1.0, chunkR[i] * currentVol))
-                    }
-                }
-
-                // 2. Áp dụng Bass Boost
-                if isBass || currentFX == .bassBoost {
+                // 1. Lọc ồn chủ động (!xoatapam: Highpass 150Hz + Lowpass 10kHz)
+                if isClean {
                     for i in 0..<960 {
                         await MainActor.run {
-                            self.bassStateL += 0.28 * (chunkL[i] - self.bassStateL)
-                            chunkL[i] = max(-1.0, min(1.0, chunkL[i] + self.bassStateL * 1.8))
-                            self.bassStateR += 0.28 * (chunkR[i] - self.bassStateR)
-                            chunkR[i] = max(-1.0, min(1.0, chunkR[i] + self.bassStateR * 1.8))
+                            self.hpStateL = 0.98 * (self.hpStateL + chunkL[i] - self.prevInL)
+                            self.prevInL = chunkL[i]
+                            chunkL[i] = self.hpStateL
+
+                            self.hpStateR = 0.98 * (self.hpStateR + chunkR[i] - self.prevInR)
+                            self.prevInR = chunkR[i]
+                            chunkR[i] = self.hpStateR
+
+                            self.lpStateL += 0.75 * (chunkL[i] - self.lpStateL)
+                            chunkL[i] = self.lpStateL
+                            self.lpStateR += 0.75 * (chunkR[i] - self.lpStateR)
+                            chunkR[i] = self.lpStateR
                         }
                     }
                 }
 
-                // 3. Áp dụng hiệu ứng âm thanh (SpamAudioFX)
-                switch currentFX {
-                case .normal, .bassBoost:
-                    break
-                case .earrape:
+                // 2. Sát chiêu V9 Tối Thượng (!max) hoặc Trọng Lực Bass (!bass)
+                if isMax {
+                    for i in 0..<960 {
+                        await MainActor.run {
+                            self.bassStateL += 0.35 * (chunkL[i] - self.bassStateL)
+                            chunkL[i] = chunkL[i] + self.bassStateL * 2.2
+                            self.bassStateR += 0.35 * (chunkR[i] - self.bassStateR)
+                            chunkR[i] = chunkR[i] + self.bassStateR * 2.2
+
+                            let biteL = chunkL[i] - self.bassStateL
+                            chunkL[i] += biteL * 1.6
+                            let biteR = chunkR[i] - self.bassStateR
+                            chunkR[i] += biteR * 1.6
+
+                            chunkL[i] = tanh(chunkL[i] * 2.5)
+                            chunkR[i] = tanh(chunkR[i] * 2.5)
+                        }
+                    }
+                } else if bassAmt > 0 || currentFX == .bassBoost {
+                    let factor = (bassAmt / 50.0) + (currentFX == .bassBoost ? 1.0 : 0.0)
+                    for i in 0..<960 {
+                        await MainActor.run {
+                            self.bassStateL += 0.28 * (chunkL[i] - self.bassStateL)
+                            chunkL[i] = max(-1.0, min(1.0, chunkL[i] + self.bassStateL * (1.2 * factor)))
+                            self.bassStateR += 0.28 * (chunkR[i] - self.bassStateR)
+                            chunkR[i] = max(-1.0, min(1.0, chunkR[i] + self.bassStateR * (1.2 * factor)))
+                        }
+                    }
+                }
+
+                // 3. Earrape FX
+                if currentFX == .earrape {
                     for i in 0..<960 {
                         chunkL[i] = tanh(chunkL[i] * 4.0)
                         chunkR[i] = tanh(chunkR[i] * 4.0)
                     }
-                case .nightcore:
-                    break
-                case .slowed:
-                    break
                 }
 
-                // 4. Mã hóa Opus và truyền UDP RTP vào phòng Voice Discord
+                // 4. Chân hỏa Volume & Ép xung Boost (Volume * Boost)
+                let totalGain = currentVol * currentBoost
+                if totalGain != 1.0 {
+                    for i in 0..<960 {
+                        chunkL[i] = tanh(chunkL[i] * totalGain)
+                        chunkR[i] = tanh(chunkR[i] * totalGain)
+                    }
+                }
+
+                // 5. Mã hóa Opus và bắn đồng loạt sang toàn bộ các phân thân Đạo Hữu
                 if let opus = self.opusEncoder?.encode(leftChannel: chunkL, rightChannel: chunkR) {
-                    session.sendOpusPacket(opus)
+                    for s in readySessions {
+                        s.sendOpusPacket(opus)
+                    }
                 }
 
-                // 5. Cập nhật tiến độ & tốc độ phát
+                // 6. Cập nhật tiến độ & visualizer
                 await MainActor.run {
                     var effSpeed = currentSpeed
                     if currentFX == .nightcore { effSpeed = 1.25 }
@@ -5031,7 +5127,6 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     }
                 }
 
-                // Chu kỳ 20ms cho mỗi gói tin Opus
                 let elapsedNanos = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
                 let targetNanos: UInt64 = 20_000_000
                 if targetNanos > elapsedNanos {
@@ -5050,7 +5145,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 }
 
 // ==============================================================================
-// MARK: - VOICE ROOM & XẢ MIC TAB VIEW (GIAO DIỆN CHÍNH)
+// MARK: - VOICE ROOM & XẢ MIC TAB VIEW (GIAO DIỆN CHÍNH MAKE SUPER VIP)
 // ==============================================================================
 struct VoiceRoomTabView: View {
     @EnvironmentObject var app: AppState
@@ -5059,7 +5154,7 @@ struct VoiceRoomTabView: View {
 
     @State private var mode: TabMode = .xaMic
     enum TabMode: String, CaseIterable, Identifiable {
-        case xaMic = "Xả Nhạc (Spam Voice)"
+        case xaMic = "Xả Nhạc (Super VIP)"
         case treoRoom = "Treo Room 24/7"
         var id: String { rawValue }
     }
@@ -5070,8 +5165,11 @@ struct VoiceRoomTabView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                // Header Banner Tiên Nghịch Make Super VIP
+                headerBanner
+
                 Picker("Chế độ", selection: $mode) {
-                    Label("Xả Nhạc (Spam Voice)", systemImage: "music.mic").tag(TabMode.xaMic)
+                    Label("Xả Nhạc (Super VIP)", systemImage: "flame.fill").tag(TabMode.xaMic)
                     Label("Treo Room 24/7", systemImage: "waveform").tag(TabMode.treoRoom)
                 }
                 .pickerStyle(.segmented)
@@ -5081,7 +5179,7 @@ struct VoiceRoomTabView: View {
                 ScrollView {
                     VStack(spacing: 16) {
                         if mode == .xaMic {
-                            xaMicSection
+                            makeSuperVipSection
                         } else {
                             treoRoomSection
                         }
@@ -5089,7 +5187,7 @@ struct VoiceRoomTabView: View {
                     .padding()
                 }
             }
-            .navigationTitle(mode == .xaMic ? "Xả Nhạc Vào Voice VIP" : "Treo Voice 24/7")
+            .navigationTitle(mode == .xaMic ? "Xả Nhạc Make Super VIP" : "Treo Voice 24/7")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showGuildPicker) {
                 VoiceGuildPickerSheet(isForSpam: mode == .xaMic)
@@ -5102,37 +5200,71 @@ struct VoiceRoomTabView: View {
         }
     }
 
-    // MARK: - XẢ NHẠC SECTION (HOÀN TOÀN ĐỘC LẬP Y HỆT BẢN PC)
-    private var xaMicSection: some View {
+    // MARK: - HEADER BANNER TIÊN NGHỊCH MAKE SUPER VIP
+    private var headerBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "flame.fill")
+                .foregroundColor(.red)
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("TIÊN NGHỊCH [XẢ CHA - ĐỘC TÔN]")
+                    .font(.caption.bold())
+                    .foregroundColor(.red)
+                Text("HỆ THỐNG XẢ NHẠC ĐA PHÂN THÂN BẤT TỬ")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            Text("MAKE SUPER VIP")
+                .font(.system(size: 10, weight: .black))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(LinearGradient(colors: [.red, .purple], startPoint: .leading, endPoint: .trailing))
+                .foregroundColor(.white)
+                .cornerRadius(6)
+        }
+        .padding(.horizontal)
+        .padding(.top, 6)
+    }
+
+    // MARK: - MAKE SUPER VIP SECTION (XẢ NHẠC TIÊN NGHỊCH ĐA PHÂN THÂN)
+    private var makeSuperVipSection: some View {
         VStack(spacing: 14) {
-            // Card 1: Trạng Thái Hoạt Động & Now Playing Controller
+            // Card 1: Trạng Thái Hỏa Lực & Now Playing Controller
             VStack(spacing: 12) {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(musicStream.isPlaying ? Color.green : (musicStream.statusText.contains("Đang") ? Color.yellow : Color.secondary))
+                        .fill(musicStream.isPlaying ? (musicStream.isPaused ? Color.yellow : Color.red) : Color.secondary)
                         .frame(width: 10, height: 10)
+
                     Text(musicStream.statusText)
                         .font(.subheadline.bold())
-                        .foregroundStyle(musicStream.isPlaying ? .green : .primary)
+                        .foregroundStyle(musicStream.isPlaying ? (musicStream.isPaused ? .yellow : .red) : .primary)
                         .lineLimit(1)
+
                     Spacer()
+
                     if musicStream.isPlaying {
-                        Text("Trực tiếp Opus")
-                            .font(.caption2.bold())
+                        let readyCount = musicStream.activeSessions.filter { $0.isVoiceUDPReady }.count
+                        Text("⚡ \(readyCount) ĐẠO HỮU")
+                            .font(.system(size: 10, weight: .black))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(Color.green.opacity(0.15))
-                            .foregroundStyle(.green)
+                            .background(Color.red.opacity(0.15))
+                            .foregroundStyle(.red)
                             .cornerRadius(4)
                     }
                 }
 
                 // Waveform Visualizer
-                if musicStream.isPlaying {
+                if musicStream.isPlaying && !musicStream.isPaused {
                     HStack(spacing: 6) {
                         ForEach(0..<8, id: \.self) { i in
                             RoundedRectangle(cornerRadius: 3)
-                                .fill(LinearGradient(colors: [.indigo, .purple, .pink], startPoint: .bottom, endPoint: .top))
+                                .fill(LinearGradient(colors: [.red, .orange, .purple], startPoint: .bottom, endPoint: .top))
                                 .frame(width: 8, height: max(10, musicStream.visualizerLevels[i] * 38))
                                 .animation(.spring(response: 0.15, dampingFraction: 0.5), value: musicStream.visualizerLevels[i])
                         }
@@ -5143,9 +5275,10 @@ struct VoiceRoomTabView: View {
                 // Tên bài hát đang phát
                 HStack(spacing: 8) {
                     Image(systemName: "music.note")
-                        .foregroundStyle(.indigo)
-                    Text(musicStream.currentSongTitle)
-                        .font(.headline)
+                        .foregroundStyle(.red)
+                    Text(musicStream.isPlaying ? "▶️ [ĐANG XẢ]: \(musicStream.currentSongTitle)" : musicStream.currentSongTitle)
+                        .font(.subheadline.bold())
+                        .foregroundColor(musicStream.isPlaying ? .red : .primary)
                         .lineLimit(1)
                     Spacer()
                 }
@@ -5160,7 +5293,7 @@ struct VoiceRoomTabView: View {
                             ),
                             in: 0...max(musicStream.duration, 1.0)
                         )
-                        .tint(.indigo)
+                        .tint(.red)
 
                         HStack {
                             Text(formatSeconds(musicStream.currentTime)).font(.caption2).foregroundStyle(.secondary)
@@ -5170,42 +5303,58 @@ struct VoiceRoomTabView: View {
                     }
                 }
 
-                // Playback Control Buttons (Previous, Play/Stop, Next, Loop)
-                HStack(spacing: 16) {
+                // Thanh Sát Chiêu Thực Địa: !cam, !sua, !next, !loop, !exit
+                HStack(spacing: 12) {
+                    // Câm Mồm (!cam) / Sủa Tiếp (!sua)
+                    if musicStream.isPlaying {
+                        Button {
+                            if musicStream.isPaused {
+                                musicStream.resumeSpam()
+                            } else {
+                                musicStream.pauseSpam()
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: musicStream.isPaused ? "speaker.wave.3.fill" : "speaker.slash.fill")
+                                Text(musicStream.isPaused ? "🔊 Sủa Tiếp" : "🔇 Câm Mồm")
+                            }
+                            .font(.caption.bold())
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background(musicStream.isPaused ? Color.green.opacity(0.15) : Color.yellow.opacity(0.15))
+                            .foregroundColor(musicStream.isPaused ? .green : .yellow)
+                            .cornerRadius(8)
+                        }
+                    }
+
+                    // Bài Trước
                     Button {
                         musicStream.playPrevious()
                     } label: {
                         Image(systemName: "backward.fill")
-                            .font(.title3)
+                            .font(.subheadline)
                             .foregroundColor(.primary)
                     }
                     .disabled(musicStream.playlist.isEmpty)
 
-                    Button {
-                        if musicStream.isPlaying {
-                            musicStream.stopSpam()
-                        } else {
-                            musicStream.startSpam(app: app)
-                        }
-                    } label: {
-                        Image(systemName: musicStream.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                            .font(.system(size: 42))
-                            .foregroundColor(musicStream.isPlaying ? .red : .green)
-                    }
-                    .disabled(musicStream.playlist.isEmpty && musicStream.currentDecoder == nil)
-
+                    // Bài Sau (!next / !skip)
                     Button {
                         musicStream.playNext()
                     } label: {
-                        Image(systemName: "forward.fill")
-                            .font(.title3)
-                            .foregroundColor(.primary)
+                        HStack(spacing: 2) {
+                            Text("⏭️")
+                            Text("Next").font(.caption.bold())
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(6)
                     }
                     .disabled(musicStream.playlist.isEmpty)
 
                     Spacer()
 
-                    // Loop mode badge button
+                    // Vòng Lặp Vô Hạn (!loop)
                     Button {
                         switch musicStream.loopMode {
                         case .loopAll: musicStream.loopMode = .loopOne
@@ -5219,8 +5368,8 @@ struct VoiceRoomTabView: View {
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 6)
-                        .background(Color.indigo.opacity(0.15))
-                        .foregroundColor(.indigo)
+                        .background(Color.red.opacity(0.15))
+                        .foregroundColor(.red)
                         .cornerRadius(8)
                     }
                 }
@@ -5229,51 +5378,61 @@ struct VoiceRoomTabView: View {
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
 
-            // Card 2: Chọn Token & Kênh Voice Xả Nhạc (ĐỘC LẬP)
+            // Card 2: Cấu Hình Trận Pháp & Phòng Xả
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Image(systemName: "person.crop.circle.badge.checkmark").foregroundStyle(.indigo)
-                    Text("Tài Khoản & Kênh Xả Room").font(.headline)
+                    Image(systemName: "person.3.fill").foregroundStyle(.red)
+                    Text("Trận Pháp Đạo Hữu").font(.headline)
                     Spacer()
-                    Text("Độc lập").font(.caption2.bold()).foregroundStyle(.secondary)
+                    Text(musicStream.multiTokenMode ? "⚔️ Toàn Bộ Dàn ((activeTokens.count))" : "Chỉ 1 Token")
+                        .font(.caption2.bold())
+                        .foregroundColor(.red)
                 }
 
-                // Chọn Token chạy
-                HStack {
-                    Text("Token chạy:").font(.subheadline.bold())
-                    Spacer()
-                    Menu {
-                        ForEach(app.tokens) { t in
-                            Button {
-                                musicStream.selectedToken = t
-                            } label: {
-                                HStack {
-                                    Text(t.username)
-                                    if (musicStream.selectedToken?.id ?? app.activeToken?.id) == t.id {
-                                        Image(systemName: "checkmark")
+                // Chế độ chạy: Cả Dàn Token vs 1 Token
+                Picker("Chế độ Token", selection: $musicStream.multiTokenMode) {
+                    Text("⚔️ Xả Cả Dàn Token (\(activeTokens.count))").tag(true)
+                    Text("Chỉ 1 Token").tag(false)
+                }
+                .pickerStyle(.segmented)
+
+                if !musicStream.multiTokenMode {
+                    HStack {
+                        Text("Token xuất thủ:").font(.subheadline.bold())
+                        Spacer()
+                        Menu {
+                            ForEach(app.tokens) { t in
+                                Button {
+                                    musicStream.selectedToken = t
+                                } label: {
+                                    HStack {
+                                        Text(t.username)
+                                        if (musicStream.selectedToken?.id ?? app.activeToken?.id) == t.id {
+                                            Image(systemName: "checkmark")
+                                        }
                                     }
                                 }
                             }
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            let currentTok = musicStream.selectedToken ?? app.activeToken ?? app.tokens.first
-                            if let t = currentTok {
-                                if let url = t.avatarURL {
-                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                    placeholder: { Circle().fill(.gray) }
-                                    .frame(width: 22, height: 22).clipShape(Circle())
+                        } label: {
+                            HStack(spacing: 6) {
+                                let currentTok = musicStream.selectedToken ?? app.activeToken ?? app.tokens.first
+                                if let t = currentTok {
+                                    if let url = t.avatarURL {
+                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                        placeholder: { Circle().fill(.gray) }
+                                        .frame(width: 22, height: 22).clipShape(Circle())
+                                    }
+                                    Text(t.username).font(.subheadline.bold())
+                                } else {
+                                    Text("Chưa có token").font(.subheadline).foregroundStyle(.secondary)
                                 }
-                                Text(t.username).font(.subheadline.bold())
-                            } else {
-                                Text("Chưa có token").font(.subheadline).foregroundStyle(.secondary)
+                                Image(systemName: "chevron.up.chevron.down").font(.caption)
                             }
-                            Image(systemName: "chevron.up.chevron.down").font(.caption)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color(UIColor.tertiarySystemBackground))
+                            .cornerRadius(8)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
                     }
                 }
 
@@ -5283,7 +5442,7 @@ struct VoiceRoomTabView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Kênh Thoại (Channel ID):").font(.subheadline.bold())
                     HStack(spacing: 8) {
-                        TextField("Dán Channel ID vào đây...", text: $musicStream.targetChannelId)
+                        TextField("Dán ID Room Voice xả...", text: $musicStream.targetChannelId)
                             .textFieldStyle(.plain)
                             .padding(10)
                             .background(Color(UIColor.tertiarySystemBackground))
@@ -5301,7 +5460,7 @@ struct VoiceRoomTabView: View {
                             .foregroundColor(.white)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 10)
-                            .background(Color.indigo)
+                            .background(Color.red)
                             .cornerRadius(8)
                         }
                     }
@@ -5318,11 +5477,11 @@ struct VoiceRoomTabView: View {
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
 
-            // Card 3: Danh Sách Nhạc (Playlist) - Nhập nhiều nhạc & Bấm chọn bài
+            // Card 3: Linh Hồn Hàng Đợi (Queue Playlist)
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Image(systemName: "music.note.list").foregroundStyle(.indigo)
-                    Text("Danh Sách Phát (\(musicStream.playlist.count) bài)").font(.headline)
+                    Image(systemName: "music.note.list").foregroundStyle(.red)
+                    Text("📜 Danh Sách Pháp Bảo (\(musicStream.playlist.count) bài)").font(.headline)
                     Spacer()
 
                     Button {
@@ -5330,24 +5489,24 @@ struct VoiceRoomTabView: View {
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "folder.badge.plus")
-                            Text("➕ Thêm file")
+                            Text("➕ Nạp file")
                         }
                         .font(.caption.bold())
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(Color.indigo.opacity(0.15))
+                        .background(Color.red.opacity(0.15))
                         .cornerRadius(8)
                     }
                 }
 
-                // Actions row: Add presets, Clear
+                // Quick buttons
                 HStack(spacing: 8) {
                     Button {
                         musicStream.addAllPresets()
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "star.fill").font(.caption2)
-                            Text("Thêm Mẫu VIP").font(.caption.bold())
+                            Text("Nạp Mẫu VIP").font(.caption.bold())
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 5)
@@ -5373,19 +5532,18 @@ struct VoiceRoomTabView: View {
                     }
                 }
 
-                // Playlist Items
+                // Queue Item List
                 if musicStream.playlist.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "music.note")
                             .font(.system(size: 32))
                             .foregroundStyle(.secondary)
-                        Text("Chưa có bài hát nào trong danh sách.")
+                        Text("📭 Linh hồn hàng đợi đang trống rỗng.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text("Bấm '➕ Thêm file' để chọn nhiều file .mp3, .m4a, .wav cùng lúc hoặc 'Thêm Mẫu VIP'.")
+                        Text("Bấm '➕ Nạp file' để chọn nhiều file .mp3, .m4a, .wav cùng lúc.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 16)
@@ -5400,26 +5558,25 @@ struct VoiceRoomTabView: View {
                                     musicStream.selectTrack(index: index)
                                 } label: {
                                     HStack(spacing: 10) {
-                                        // Playing indicator or index
                                         if isCurrent && musicStream.isPlaying {
-                                            Image(systemName: "speaker.wave.3.fill")
-                                                .font(.caption.bold())
-                                                .foregroundColor(.green)
+                                            Text("▶️ [ĐANG XẢ]")
+                                                .font(.caption2.bold())
+                                                .foregroundColor(.red)
                                         } else {
-                                            Text("#\(index + 1)")
+                                            Text("⏳ #\(index + 1)")
                                                 .font(.caption.bold())
-                                                .foregroundColor(isCurrent ? .indigo : .secondary)
-                                                .frame(width: 24, alignment: .leading)
+                                                .foregroundColor(isCurrent ? .red : .secondary)
+                                                .frame(width: 48, alignment: .leading)
                                         }
 
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(item.title)
                                                 .font(.subheadline.bold())
-                                                .foregroundColor(isCurrent ? .indigo : .primary)
+                                                .foregroundColor(isCurrent ? .red : .primary)
                                                 .lineLimit(1)
                                             HStack(spacing: 6) {
                                                 if item.isPreset {
-                                                    Text("Nhạc VIP")
+                                                    Text("Pháp Bảo VIP")
                                                         .font(.caption2.bold())
                                                         .foregroundColor(.orange)
                                                 }
@@ -5430,16 +5587,6 @@ struct VoiceRoomTabView: View {
                                         }
 
                                         Spacer()
-
-                                        if isCurrent {
-                                            Text("Đang chọn")
-                                                .font(.caption2.bold())
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Color.indigo.opacity(0.15))
-                                                .foregroundColor(.indigo)
-                                                .cornerRadius(4)
-                                        }
 
                                         Button {
                                             musicStream.removeTrack(id: item.id)
@@ -5452,11 +5599,11 @@ struct VoiceRoomTabView: View {
                                     }
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 8)
-                                    .background(isCurrent ? Color.indigo.opacity(0.1) : Color(UIColor.tertiarySystemBackground))
+                                    .background(isCurrent ? Color.red.opacity(0.1) : Color(UIColor.tertiarySystemBackground))
                                     .cornerRadius(8)
                                     .overlay(
                                         RoundedRectangle(cornerRadius: 8)
-                                            .stroke(isCurrent ? Color.indigo.opacity(0.4) : Color.clear, lineWidth: 1)
+                                            .stroke(isCurrent ? Color.red.opacity(0.4) : Color.clear, lineWidth: 1)
                                     )
                                 }
                                 .buttonStyle(.plain)
@@ -5470,60 +5617,134 @@ struct VoiceRoomTabView: View {
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
 
-            // Card 4: Cấu Hình Âm Lượng & Chế Độ Nhạc VIP
+            // Card 4: Sát Chiêu Thực Địa & Điều Chỉnh Chân Hỏa (Make Super VIP)
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
-                    Image(systemName: "slider.horizontal.3").foregroundStyle(.indigo)
-                    Text("Cấu Hình Âm Thanh").font(.headline)
-                    Spacer()
-                    Text("Âm lượng: \(Int(musicStream.volume * 100))%")
-                        .font(.subheadline.bold())
-                        .foregroundStyle(musicStream.volume > 1.0 ? .pink : .indigo)
+                    Image(systemName: "flame.fill").foregroundStyle(.red)
+                    Text("Sát Chiêu Chiến Đấu Thực Địa").font(.headline)
                 }
 
-                // Volume Slider (0% - 200%)
-                HStack(spacing: 10) {
-                    Image(systemName: "speaker.wave.1.fill").foregroundStyle(.secondary)
-                    Slider(value: $musicStream.volume, in: 0.0...2.0, step: 0.05)
-                        .tint(musicStream.volume > 1.0 ? .pink : .indigo)
-                    Image(systemName: "speaker.wave.3.fill").foregroundStyle(.indigo)
-                }
-
-                // Nút nhanh âm lượng
-                HStack(spacing: 8) {
-                    ForEach([0.5, 1.0, 1.5, 2.0], id: \.self) { v in
-                        Button {
-                            musicStream.volume = Float(v)
-                        } label: {
-                            Text(v == 2.0 ? "200% MAX" : "\(Int(v * 100))%")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(musicStream.volume == Float(v) ? Color.indigo : Color(UIColor.tertiarySystemBackground))
-                                .foregroundColor(musicStream.volume == Float(v) ? .white : .primary)
-                                .cornerRadius(6)
-                        }
-                    }
-                }
-
-                Divider()
-
-                // Bass Boost Toggle Switch
-                Toggle(isOn: $musicStream.bassBoost) {
+                // Sát chiêu 1: 🔴 CHIẾN ĐẤU V9 TỐI THƯỢNG (!max)
+                Toggle(isOn: $musicStream.isMaxMode) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Label("Tăng Cường Bass (Bass Boost)", systemImage: "bolt.fill")
-                            .font(.subheadline.bold())
-                            .foregroundColor(.orange)
-                        Text("Khuếch đại âm trầm đập cực mạnh trong phòng Discord Voice.")
+                        HStack(spacing: 4) {
+                            Text("🔴")
+                            Text("CHIẾN ĐẤU V9 TỐI THƯỢNG (!max)").font(.subheadline.bold()).foregroundColor(.red)
+                        }
+                        Text("Khai mở cực hạn hỏa lực: EQ 80Hz + 3500Hz + Volume 2.5x vượt bậc!")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
 
                 Divider()
 
-                // Chế độ hiệu ứng của nhạc
+                // Sát chiêu 2: 🧹 LỌC ỒN CHỦ ĐỘNG (!xoatapam)
+                Toggle(isOn: $musicStream.isCleanMode) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 4) {
+                            Text("🧹")
+                            Text("LỌC ỒN CHỦ ĐỘNG (!xoatapam)").font(.subheadline.bold()).foregroundColor(.teal)
+                        }
+                        Text("Lọc tạp âm, chống rè nhiễu dải tần Highpass 150Hz & Lowpass 10kHz.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+
+                Divider()
+
+                // Chân hỏa: Volume (!volume)
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Chế độ của nhạc:").font(.subheadline)
+                    HStack {
+                        Text("🔊 Chân Hỏa (Volume):").font(.subheadline.bold())
+                        Spacer()
+                        Text("\(Int(musicStream.volume * 100))%")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.red)
+                    }
+                    Slider(value: $musicStream.volume, in: 0.0...2.0, step: 0.05)
+                        .tint(.red)
+                    HStack(spacing: 8) {
+                        ForEach([0.5, 1.0, 1.5, 2.0], id: \.self) { v in
+                            Button {
+                                musicStream.volume = Float(v)
+                            } label: {
+                                Text(v == 2.0 ? "200% MAX" : "\(Int(v * 100))%")
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(musicStream.volume == Float(v) ? Color.red : Color(UIColor.tertiarySystemBackground))
+                                    .foregroundColor(musicStream.volume == Float(v) ? .white : .primary)
+                                    .cornerRadius(6)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Ép xung: Boost (!boost)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("🚀 Ép Xung Hỏa Lực (Boost):").font(.subheadline.bold())
+                        Spacer()
+                        Text("\(Int(musicStream.boostMultiplier * 100))%")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.orange)
+                    }
+                    Slider(value: $musicStream.boostMultiplier, in: 1.0...5.0, step: 0.25)
+                        .tint(.orange)
+                    HStack(spacing: 8) {
+                        ForEach([1.0, 2.0, 3.0, 5.0], id: \.self) { b in
+                            Button {
+                                musicStream.boostMultiplier = Float(b)
+                            } label: {
+                                Text(b == 5.0 ? "500% CỰC HẠN" : "\(Int(b * 100))%")
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(musicStream.boostMultiplier == Float(b) ? Color.orange : Color(UIColor.tertiarySystemBackground))
+                                    .foregroundColor(musicStream.boostMultiplier == Float(b) ? .white : .primary)
+                                    .cornerRadius(6)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Trọng lực: Bass (!bass)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("💣 Trọng Lực Bass (!bass):").font(.subheadline.bold())
+                        Spacer()
+                        Text("+\(Int(musicStream.bassAmount))")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $musicStream.bassAmount, in: 0...100, step: 5)
+                        .tint(.purple)
+                    HStack(spacing: 8) {
+                        ForEach([0, 25, 50, 100], id: \.self) { b in
+                            Button {
+                                musicStream.bassAmount = Float(b)
+                            } label: {
+                                Text(b == 0 ? "0 (Gốc)" : "+\(b)")
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(musicStream.bassAmount == Float(b) ? Color.purple : Color(UIColor.tertiarySystemBackground))
+                                    .foregroundColor(musicStream.bassAmount == Float(b) ? .white : .primary)
+                                    .cornerRadius(6)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Chế độ hiệu ứng & Tốc độ
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Chế độ âm thanh:").font(.subheadline)
                     Picker("Chế độ", selection: $musicStream.audioFX) {
                         ForEach(SpamAudioFX.allCases) { fx in
                             Text(fx.rawValue).tag(fx)
@@ -5531,33 +5752,6 @@ struct VoiceRoomTabView: View {
                     }
                     .pickerStyle(.segmented)
                 }
-
-                // Tốc độ phát (Speed)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Tốc độ phát:").font(.subheadline)
-                    Picker("Tốc độ", selection: $musicStream.playbackSpeed) {
-                        Text("0.75x").tag(Float(0.75))
-                        Text("1.0x Chuẩn").tag(Float(1.0))
-                        Text("1.25x").tag(Float(1.25))
-                        Text("1.5x").tag(Float(1.5))
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                Divider()
-
-                // Chế độ lặp
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Chế độ lặp danh sách:").font(.subheadline)
-                    Picker("Chế độ lặp", selection: $musicStream.loopMode) {
-                        ForEach(PlaylistLoopMode.allCases) { lm in
-                            Label(lm.rawValue, systemImage: lm.icon).tag(lm)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-
-                Divider()
 
                 // Nghe loa ngoài điện thoại (Monitor)
                 Toggle(isOn: $musicStream.playLocalSpeaker) {
@@ -5573,14 +5767,14 @@ struct VoiceRoomTabView: View {
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
 
-            // Nút Bắt Đầu / Dừng Xả Mic Lớn
+            // Nút Bắt Đầu / Dừng Xuất Thủ Lớn
             if musicStream.isPlaying {
                 Button {
                     musicStream.stopSpam()
                 } label: {
                     HStack {
                         Image(systemName: "stop.fill")
-                        Text("■  DỪNG XẢ ROOM")
+                        Text("⛩️  BẾ QUAN (THU HỒI PHÂN THÂN)")
                     }
                     .font(.headline.bold())
                     .foregroundColor(.white)
@@ -5594,8 +5788,8 @@ struct VoiceRoomTabView: View {
                     musicStream.startSpam(app: app)
                 } label: {
                     HStack {
-                        Image(systemName: "play.fill")
-                        Text("▶  BẮT ĐẦU XẢ ROOM")
+                        Image(systemName: "flame.fill")
+                        Text("⚡  XUẤT THỦ XẢ NHẠC BẤT TỬ")
                     }
                     .font(.headline.bold())
                     .foregroundColor(.white)
@@ -5603,21 +5797,21 @@ struct VoiceRoomTabView: View {
                     .padding()
                     .background(
                         (musicStream.currentDecoder != nil)
-                        ? LinearGradient(colors: [.green, Color(red: 0.1, green: 0.7, blue: 0.3)], startPoint: .leading, endPoint: .trailing)
+                        ? LinearGradient(colors: [.red, Color(red: 0.8, green: 0.1, blue: 0.1), .orange], startPoint: .leading, endPoint: .trailing)
                         : LinearGradient(colors: [.gray], startPoint: .leading, endPoint: .trailing)
                     )
                     .cornerRadius(12)
-                    .shadow(color: .green.opacity(0.3), radius: 8, y: 4)
+                    .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
                 }
                 .disabled(musicStream.currentDecoder == nil)
             }
 
-            // Nhật Ký Xả Room
+            // Nhật Ký Xuất Thủ Make Super VIP
             if !musicStream.logs.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Image(systemName: "terminal.fill").foregroundStyle(.indigo)
-                        Text("Nhật Ký Xả Room").font(.headline)
+                        Image(systemName: "terminal.fill").foregroundStyle(.red)
+                        Text("Nhật Ký Xuất Thủ Tiên Nghịch").font(.headline)
                         Spacer()
                         Button("Xóa") { musicStream.logs.removeAll() }
                             .font(.caption)
@@ -5632,7 +5826,7 @@ struct VoiceRoomTabView: View {
                             }
                         }
                     }
-                    .frame(height: 100)
+                    .frame(height: 120)
                 }
                 .padding()
                 .background(Color(UIColor.secondarySystemBackground))
