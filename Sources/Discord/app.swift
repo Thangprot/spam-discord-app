@@ -4343,9 +4343,15 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 // MARK: - LOG ENTRY
 typealias VoiceRoomLog = VoiceLogEntry
 struct VoiceLogEntry: Identifiable {
-    let id = UUID()
+    var id: UUID = UUID()
     let timestamp: Date
     let message: String
+
+    init(id: UUID = UUID(), timestamp: Date, message: String) {
+        self.id = id
+        self.timestamp = timestamp
+        self.message = message
+    }
 }
 
 // ==============================================================================
@@ -4567,7 +4573,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     func addLog(_ msg: String) {
-        let log = VoiceRoomLog(id: UUID(), timestamp: Date(), message: msg)
+        let log = VoiceLogEntry(id: UUID(), timestamp: Date(), message: msg)
         logs.append(log)
         if logs.count > 100 { logs.removeFirst(logs.count - 100) }
     }
@@ -5112,16 +5118,16 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 }
 
                 // 6. Cập nhật tiến độ & visualizer
+                var effSpeed = snapshot.currentSpeed
+                if snapshot.currentFX == .nightcore { effSpeed = 1.25 }
+                else if snapshot.currentFX == .slowed { effSpeed = 0.85 }
+
+                speedAccumulator += effSpeed
+                let advance = max(1, Int(speedAccumulator))
+                speedAccumulator -= Float(advance)
+
                 await MainActor.run {
-                    var effSpeed = snapshot.currentSpeed
-                    if snapshot.currentFX == .nightcore { effSpeed = 1.25 }
-                    else if snapshot.currentFX == .slowed { effSpeed = 0.85 }
-
-                    speedAccumulator += effSpeed
-                    let advance = max(1, Int(speedAccumulator))
-                    speedAccumulator -= Float(advance)
                     self.streamFrameIndex += advance
-
                     if self.streamFrameIndex % 5 == 0 {
                         self.currentTime = Double(self.streamFrameIndex * 960) / 48000.0
                         self.visualizerLevels = (0..<8).map { _ in CGFloat.random(in: 0.2...0.95) }
