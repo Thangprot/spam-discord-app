@@ -114,6 +114,29 @@ struct TreoMediaSource: Identifiable, Equatable {
 }
 
 // ==============================================================================
+// MARK: - SHARED TRANSPORT NONCE COUNTER (CHỐNG TRÙNG NONCE AUDIO/VIDEO AEAD)
+// ==============================================================================
+
+final class TransportNonceBox {
+    private let lock = NSLock()
+    private var counter: UInt32 = 0
+
+    func reset() {
+        lock.lock()
+        counter = 0
+        lock.unlock()
+    }
+
+    func next() -> UInt32 {
+        lock.lock()
+        counter = counter &+ 1
+        let val = counter
+        lock.unlock()
+        return val
+    }
+}
+
+// ==============================================================================
 // MARK: - H.264 ANNEX-B SPLITTER & DISCORD UDP RTP VIDEO PACKETIZER (RFC 6184)
 // ==============================================================================
 
@@ -156,27 +179,44 @@ enum H264AnnexBHelper {
         }
         return nalus
     }
+
+    /// Viết lại SPS VUI (max_num_reorder_frames = 0, bỏ video_signal_type) để Discord Desktop/Chrome giải mã ngay lập tức
+    static func rewriteSPSVUI(_ spsNalu: Data) -> Data {
+        guard spsNalu.count >= 4, (spsNalu[spsNalu.startIndex] & 0x1F) == 7 else {
+            return spsNalu
+        }
+        let rewritten: Data? = spsNalu.withUnsafeBytes { raw in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            let buf = dave_h264_rewrite_sps_vui(ptr, spsNalu.count)
+            defer { dave_buffer_free(buf) }
+            guard let outPtr = buf.ptr, buf.len > 0 else { return nil }
+            return Data(bytes: outPtr, count: buf.len)
+        }
+        return rewritten ?? spsNalu
+    }
 }
 
-/// Đóng gói khung H.264 Annex-B thành các gói RTP (Single NALU / FU-A) + One-Byte Extension (0xBE 0xDE)
-/// + mã hóa AEAD (_rtpsize) + RTCP Sender Report, chuẩn Discord UDP Video Protocol.
+/// Đóng gói khung H.264 Annex-B thành các gói RTP chuẩn RFC 6184:
+/// - STAP-A (Type 24) gộp SPS + PPS (và các NALU nhỏ) để SFU & Chrome nhận diện Keyframe tức thì
+/// - Single NALU (<= 1200B) và FU-A (Type 28, > 1200B)
+/// - One-Byte Extension Header 0xBE 0xDE + Playout Delay chuẩn 3 byte (0x52 00 00 0A)
+/// - Dùng chung bộ đếm nonce AEAD với Audio để không bị anti-replay SFU loại bỏ
 final class DiscordRtpVideoPacketizer {
     private let lock = NSLock()
     private let payloadType: UInt8 = 101 // H264 payload type chuẩn Discord
-    private let mtu: Int = 1200
+    private let mtu: Int = 1150
 
     private var ssrc: UInt32 = 0
     private var sequence: UInt16 = UInt16.random(in: 0...65535)
     private var timestamp: UInt32 = UInt32.random(in: 0...4_000_000)
-    private var nonceCounter: UInt32 = 0
     private var totalPackets: UInt32 = 0
     private var totalBytes: UInt32 = 0
     private var prevSrPackets: UInt32 = 0
     private let srInterval: UInt32 = 150
 
-    // One-byte RTP header extension: playout-delay (id=5, len=2, val=0)
+    // One-byte RTP header extension: playout-delay (id=5, len=3 -> 0x52, min=0, max=10)
     private let extHeader: [UInt8] = [0xBE, 0xDE, 0x00, 0x01]
-    private let extPayload: [UInt8] = [0x51, 0x00, 0x00, 0x00]
+    private let extPayload: [UInt8] = [0x52, 0x00, 0x00, 0x0A]
 
     func configure(ssrc: UInt32) {
         lock.lock()
@@ -188,44 +228,32 @@ final class DiscordRtpVideoPacketizer {
     }
 
     /// Đóng gói & gửi khung H.264 Annex-B (đã qua DAVE E2EE nếu có) ra UDP socket
+    @discardableResult
     func sendFrame(
         annexBFrame: Data,
         frametimeMs: Double,
         secretKey: Data,
         encryptionMode: String,
+        nonceBox: TransportNonceBox,
         udpClient: DiscordVoiceUDPClient
-    ) {
-        guard secretKey.count == 32, !annexBFrame.isEmpty else { return }
+    ) -> Int {
+        guard secretKey.count == 32, !annexBFrame.isEmpty else { return 0 }
         let nalus = H264AnnexBHelper.splitNALUs(annexBFrame)
-        guard !nalus.isEmpty else { return }
+        guard !nalus.isEmpty else { return 0 }
 
-        lock.lock()
-        let curSsrc = self.ssrc
-        guard curSsrc != 0 else {
-            lock.unlock()
-            return
-        }
-        let curTs = self.timestamp
-        var packetsOut: [Data] = []
-        packetsOut.reserveCapacity(max(nalus.count, annexBFrame.count / mtu + 2))
+        // Bước 1: Tạo danh sách RTP payloads (STAP-A cho cụm NALU nhỏ như SPS+PPS, Single NALU, hoặc FU-A)
+        var rtpPayloads: [Data] = []
+        rtpPayloads.reserveCapacity(max(nalus.count, annexBFrame.count / mtu + 2))
 
-        for (nalIdx, nalu) in nalus.enumerated() {
-            guard !nalu.isEmpty else { continue }
-            let isLastNal = (nalIdx == nalus.count - 1)
+        var idx = 0
+        while idx < nalus.count {
+            let nalu = nalus[idx]
+            if nalu.isEmpty {
+                idx += 1
+                continue
+            }
 
-            if nalu.count <= mtu {
-                // Single NAL Unit Packet
-                let seq = nextSeqLocked()
-                let nonceVal = nextNonceLocked()
-                let aad = makeRtpHeaderWithExt(seq: seq, ts: curTs, ssrc: curSsrc, marker: isLastNal)
-                var plaintext = Data(capacity: 4 + nalu.count)
-                plaintext.append(contentsOf: extPayload)
-                plaintext.append(nalu)
-
-                if let pkt = encryptTransport(aad: aad, plaintext: plaintext, nonceVal: nonceVal, key: secretKey, mode: encryptionMode) {
-                    packetsOut.append(pkt)
-                }
-            } else {
+            if nalu.count > mtu {
                 // Fragmentation Unit A (FU-A, RFC 6184)
                 let nal0 = nalu[nalu.startIndex]
                 let nalType = nal0 & 0x1F
@@ -239,32 +267,92 @@ final class DiscordRtpVideoPacketizer {
                     let chunkLen = min(mtu, totalLen - offset)
                     let isFirst = (offset == 0)
                     let isFinal = (offset + chunkLen >= totalLen)
-                    let marker = isLastNal && isFinal
 
                     var fuHeader: UInt8 = nalType
                     if isFirst { fuHeader |= 0x80 }
                     else if isFinal { fuHeader |= 0x40 }
 
-                    let seq = nextSeqLocked()
-                    let nonceVal = nextNonceLocked()
-                    let aad = makeRtpHeaderWithExt(seq: seq, ts: curTs, ssrc: curSsrc, marker: marker)
-
-                    var plaintext = Data(capacity: 6 + chunkLen)
-                    plaintext.append(contentsOf: extPayload)
-                    plaintext.append(fuIndicator)
-                    plaintext.append(fuHeader)
+                    var fuPacket = Data(capacity: 2 + chunkLen)
+                    fuPacket.append(fuIndicator)
+                    fuPacket.append(fuHeader)
                     let chunkStart = payloadData.startIndex + offset
-                    plaintext.append(payloadData[chunkStart..<(chunkStart + chunkLen)])
-
-                    if let pkt = encryptTransport(aad: aad, plaintext: plaintext, nonceVal: nonceVal, key: secretKey, mode: encryptionMode) {
-                        packetsOut.append(pkt)
-                    }
+                    fuPacket.append(payloadData[chunkStart..<(chunkStart + chunkLen)])
+                    rtpPayloads.append(fuPacket)
                     offset += chunkLen
                 }
+                idx += 1
+            } else {
+                // Kiểm tra gộp STAP-A (Type 24) nếu có >= 2 NALU nhỏ liên tiếp (đặc biệt SPS + PPS) vừa trong MTU
+                var group: [Data] = [nalu]
+                var stapSize = 1 + 2 + nalu.count
+                var nextIdx = idx + 1
+                while nextIdx < nalus.count {
+                    let candidate = nalus[nextIdx]
+                    if candidate.isEmpty {
+                        nextIdx += 1
+                        continue
+                    }
+                    let added = 2 + candidate.count
+                    if stapSize + added <= mtu {
+                        group.append(candidate)
+                        stapSize += added
+                        nextIdx += 1
+                    } else {
+                        break
+                    }
+                }
+
+                if group.count > 1 {
+                    var maxNri: UInt8 = 0
+                    for g in group {
+                        let nri = g[g.startIndex] & 0x60
+                        if nri > maxNri { maxNri = nri }
+                    }
+                    var stap = Data(capacity: stapSize)
+                    stap.append(maxNri | 24) // STAP-A header (Type 24)
+                    for g in group {
+                        let len = UInt16(g.count)
+                        stap.append(UInt8((len >> 8) & 0xFF))
+                        stap.append(UInt8(len & 0xFF))
+                        stap.append(g)
+                    }
+                    rtpPayloads.append(stap)
+                } else {
+                    rtpPayloads.append(nalu)
+                }
+                idx = nextIdx
             }
         }
 
-        // Cập nhật thống kê & RTCP Sender Report mỗi ~150 gói
+        guard !rtpPayloads.isEmpty else { return 0 }
+
+        // Bước 2: Mã hóa AEAD từng gói RTP với chung TransportNonceBox & marker M=1 trên gói cuối
+        lock.lock()
+        let curSsrc = self.ssrc
+        guard curSsrc != 0 else {
+            lock.unlock()
+            return 0
+        }
+        let curTs = self.timestamp
+        var packetsOut: [Data] = []
+        packetsOut.reserveCapacity(rtpPayloads.count)
+
+        for (pIdx, rtpBody) in rtpPayloads.enumerated() {
+            let isLastPacket = (pIdx == rtpPayloads.count - 1)
+            let seq = nextSeqLocked()
+            let nonceVal = nonceBox.next()
+            let aad = makeRtpHeaderWithExt(seq: seq, ts: curTs, ssrc: curSsrc, marker: isLastPacket)
+
+            var plaintext = Data(capacity: 4 + rtpBody.count)
+            plaintext.append(contentsOf: extPayload)
+            plaintext.append(rtpBody)
+
+            if let pkt = encryptTransport(aad: aad, plaintext: plaintext, nonceVal: nonceVal, key: secretKey, mode: encryptionMode) {
+                packetsOut.append(pkt)
+            }
+        }
+
+        // Thống kê & RTCP Sender Report mỗi ~150 gói
         let sentCount = UInt32(packetsOut.count)
         let sentBytes = packetsOut.reduce(UInt32(0)) { $0 &+ UInt32($1.count) }
         self.totalPackets = self.totalPackets &+ sentCount
@@ -273,7 +361,7 @@ final class DiscordRtpVideoPacketizer {
         var srPacket: Data? = nil
         if (self.totalPackets / srInterval) > (self.prevSrPackets / srInterval) {
             self.prevSrPackets = self.totalPackets
-            let srNonce = nextNonceLocked()
+            let srNonce = nonceBox.next()
             srPacket = makeRtcpSenderReport(
                 ssrc: curSsrc,
                 rtpTs: curTs,
@@ -296,17 +384,13 @@ final class DiscordRtpVideoPacketizer {
         if let sr = srPacket {
             udpClient.sendPacket(sr)
         }
+        return packetsOut.count
     }
 
     private func nextSeqLocked() -> UInt16 {
         let s = self.sequence
         self.sequence = self.sequence &+ 1
         return s
-    }
-
-    private func nextNonceLocked() -> UInt32 {
-        self.nonceCounter = self.nonceCounter &+ 1
-        return self.nonceCounter
     }
 
     private func makeRtpHeaderWithExt(seq: UInt16, ts: UInt32, ssrc: UInt32, marker: Bool) -> [UInt8] {
@@ -349,7 +433,6 @@ final class DiscordRtpVideoPacketizer {
         header[6] = UInt8((ssrc >> 8) & 0xFF)
         header[7] = UInt8(ssrc & 0xFF)
 
-        // NTP timestamp (giây kể từ 1900-01-01 = Unix + 2,208,988,800)
         let ntpSec = Date().timeIntervalSince1970 + 2_208_988_800.0
         let ntpMsw = UInt32(truncatingIfNeeded: UInt64(max(0, floor(ntpSec))))
         let ntpLsw = UInt32(truncatingIfNeeded: UInt64(max(0, (ntpSec - floor(ntpSec)) * 4_294_967_296.0)))
@@ -434,16 +517,17 @@ final class DiscordRtpVideoPacketizer {
 }
 
 // ==============================================================================
-// MARK: - HARDWARE H.264 ENCODER (APPLE VIDEOTOOLBOX -> ANNEX-B)
+// MARK: - HARDWARE H.264 ENCODER (APPLE VIDEOTOOLBOX -> ANNEX-B + SPS VUI FIX)
 // ==============================================================================
 
 final class HardwareH264Encoder {
     private var session: VTCompressionSession?
-    private let width: Int
-    private let height: Int
+    let width: Int
+    let height: Int
     private let fps: Int
     private let bitrateKbps: Int
     private let maxBitrateKbps: Int
+    private var hasLoggedEncodeErr = false
 
     init?(width: Int, height: Int, fps: Int, bitrateKbps: Int, maxBitrateKbps: Int) {
         self.width = max(160, (width / 2) * 2)
@@ -471,6 +555,7 @@ final class HardwareH264Encoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: self.fps * 2))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: 2.0))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: self.fps))
@@ -498,6 +583,7 @@ final class HardwareH264Encoder {
         pts: CMTime,
         duration: CMTime,
         forceKeyFrame: Bool,
+        onError: ((OSStatus) -> Void)? = nil,
         completion: @escaping (Data, Bool) -> Void
     ) {
         guard let s = session else { return }
@@ -507,19 +593,30 @@ final class HardwareH264Encoder {
             frameProps = dict as CFDictionary
         }
 
-        _ = VTCompressionSessionEncodeFrame(
+        let encStatus = VTCompressionSessionEncodeFrame(
             s,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: pts,
             duration: duration,
             frameProperties: frameProps,
             infoFlagsOut: nil
-        ) { status, _, sampleBuffer in
-            guard status == noErr, let sb = sampleBuffer else { return }
+        ) { [weak self] status, _, sampleBuffer in
+            if status != noErr {
+                if let self = self, !self.hasLoggedEncodeErr {
+                    self.hasLoggedEncodeErr = true
+                    onError?(status)
+                }
+                return
+            }
+            guard let sb = sampleBuffer else { return }
             let isKey = HardwareH264Encoder.isKeyFrame(sb)
             guard let annexB = HardwareH264Encoder.extractAnnexB(from: sb, includeParameterSets: isKey),
                   !annexB.isEmpty else { return }
             completion(annexB, isKey)
+        }
+        if encStatus != noErr && !hasLoggedEncodeErr {
+            hasLoggedEncodeErr = true
+            onError?(encStatus)
         }
     }
 
@@ -563,8 +660,12 @@ final class HardwareH264Encoder {
                         nalUnitHeaderLengthOut: nil
                     )
                     if st == noErr, let p = ptr, size > 0 {
+                        let rawParam = Data(bytes: p, count: size)
+                        // Viết lại SPS VUI (max_num_reorder_frames = 0) chuẩn WebRTC/Chrome
+                        let nalType = rawParam[rawParam.startIndex] & 0x1F
+                        let finalParam = (nalType == 7) ? H264AnnexBHelper.rewriteSPSVUI(rawParam) : rawParam
                         output.append(contentsOf: startCode)
-                        output.append(p, count: size)
+                        output.append(finalParam)
                     }
                 }
             }
@@ -574,37 +675,38 @@ final class HardwareH264Encoder {
             return output.isEmpty ? nil : output
         }
 
-        var lengthAtOffset: Int = 0
-        var totalLength: Int = 0
-        var rawPtr: UnsafeMutablePointer<Int8>?
-        let st = CMBlockBufferGetDataPointer(
-            blockBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: &lengthAtOffset,
-            totalLengthOut: &totalLength,
-            dataPointerOut: &rawPtr
-        )
-        guard st == kCMBlockBufferNoErr, let ptr = rawPtr, totalLength > 4 else {
+        let totalLength = CMBlockBufferGetDataLength(blockBuffer)
+        guard totalLength > 4 else {
             return output.isEmpty ? nil : output
         }
 
-        let u8Ptr = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+        var contiguousBytes = [UInt8](repeating: 0, count: totalLength)
+        let copySt = contiguousBytes.withUnsafeMutableBytes { rawBuf -> OSStatus in
+            guard let dst = rawBuf.baseAddress else { return -1 }
+            return CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: totalLength, destination: dst)
+        }
+        guard copySt == kCMBlockBufferNoErr else {
+            return output.isEmpty ? nil : output
+        }
+
         var offset = 0
         while offset + 4 <= totalLength {
             let naluLen = Int(
-                (UInt32(u8Ptr[offset]) << 24)
-                | (UInt32(u8Ptr[offset + 1]) << 16)
-                | (UInt32(u8Ptr[offset + 2]) << 8)
-                | UInt32(u8Ptr[offset + 3])
+                (UInt32(contiguousBytes[offset]) << 24)
+                | (UInt32(contiguousBytes[offset + 1]) << 16)
+                | (UInt32(contiguousBytes[offset + 2]) << 8)
+                | UInt32(contiguousBytes[offset + 3])
             )
             offset += 4
             guard naluLen > 0, offset + naluLen <= totalLength else { break }
 
-            let nalType = u8Ptr[offset] & 0x1F
+            let nalType = contiguousBytes[offset] & 0x1F
             // Bỏ qua AUD (9) và SEI (6) để tối ưu băng thông & tương thích DAVE H.264
             if nalType != 9 && nalType != 6 {
+                let rawNalu = Data(contiguousBytes[offset..<(offset + naluLen)])
+                let finalNalu = (nalType == 7) ? H264AnnexBHelper.rewriteSPSVUI(rawNalu) : rawNalu
                 output.append(contentsOf: startCode)
-                output.append(u8Ptr + offset, count: naluLen)
+                output.append(finalNalu)
             }
             offset += naluLen
         }
@@ -642,7 +744,6 @@ final class HardwareH264Encoder {
                 memset(yBase, 16, yStride * h)
                 memset(uvBase, 128, uvStride * (h / 2))
             } else {
-                // Tạo sóng màu chuyển động mượt cho Video/Cam ảo mẫu
                 let yPtr = yBase.assumingMemoryBound(to: UInt8.self)
                 let uvPtr = uvBase.assumingMemoryBound(to: UInt8.self)
                 let shift = (frameIndex * 6) % max(1, w)
@@ -694,6 +795,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 
     private let udpClient = DiscordVoiceUDPClient()
     private let videoPacketizer = DiscordRtpVideoPacketizer()
+    private let transportNonce = TransportNonceBox()
     private let packetLock = NSLock()
 
     private var audioSsrc: Int = 0
@@ -706,13 +808,14 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 
     private var rtpAudioSeq: UInt16 = UInt16.random(in: 0...65535)
     private var rtpAudioTs: UInt32 = UInt32.random(in: 0...4_000_000)
-    private var rtpAudioNonce: UInt32 = 0
     private var udpKeepAliveCounter: UInt32 = 0
 
     private var hasSentIdentify = false
     private var hasSentSelectProtocol = false
     private var hasLoggedDaveReady = false
     private var hasLoggedVideoStart = false
+    private var hasLoggedDaveVidErr = false
+    private var hasLoggedWaitingDave = false
     private var isStopped = false
 
     private(set) var isReady = false
@@ -723,6 +826,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 
     var onLog: ((String) -> Void)?
     var onReady: (() -> Void)?
+    var onRequestKeyFrame: (() -> Void)?
 
     init(
         rtcServerId: String,
@@ -759,7 +863,10 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         hasSentSelectProtocol = false
         hasLoggedDaveReady = false
         hasLoggedVideoStart = false
+        hasLoggedDaveVidErr = false
+        hasLoggedWaitingDave = false
         voiceSeq = -1
+        transportNonce.reset()
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
@@ -855,6 +962,12 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                     self.encryptionMode = "aead_aes256_gcm_rtpsize"
                 }
 
+                // Gửi Op 12 VIDEO ban đầu (tắt) giống BaseMediaConnection.ts rồi mới mở sau Op 4
+                await sendJSON([
+                    "op": 12,
+                    "d": ["audio_ssrc": audioSsrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []]
+                ])
+
                 log("Stream Ready! AudioSSRC=\(audioSsrc), VideoSSRC=\(videoSsrc), UDP=\(ip):\(port)")
                 startUDPHandshake(ip: ip, port: port)
             }
@@ -863,6 +976,8 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                 if let mode = d["mode"] as? String, !mode.isEmpty {
                     self.encryptionMode = mode
                 }
+                let vCodec = d["video_codec"] as? String ?? "?"
+                let aCodec = d["audio_codec"] as? String ?? "?"
                 if let keyArr = d["secret_key"] as? [Int] {
                     self.secretKey = Data(keyArr.map { UInt8($0 & 0xFF) })
                 } else if let keyArr = d["secret_key"] as? [UInt8] {
@@ -873,7 +988,6 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                     ?? (d["dave_protocol_version"] as? NSNumber)?.intValue
                     ?? 0
                 let uid64 = UInt64(self.userId) ?? 0
-                // QUAN TRỌNG (StreamConnection.ts): DAVE channelId của Go-Live = rtc_server_id - 1
                 let srv64 = UInt64(self.rtcServerId) ?? 0
                 let daveCid64 = (srv64 > 0) ? (srv64 &- 1) : 0
 
@@ -898,9 +1012,14 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                     maxBitrateKbps: targetMaxBitrateKbps
                 )
                 await setSpeaking(true)
-                log("✅ Go Live Stream sẵn sàng (\(encryptionMode) | DAVE v\(daveVer))!")
+                let silence = Data([0xF8, 0xFF, 0xFE])
+                for _ in 0..<5 { sendOpusPacket(silence) }
+                log("✅ Go Live sẵn sàng (\(encryptionMode) | A:\(aCodec) V:\(vCodec) | DAVE v\(daveVer))!")
                 onReady?()
+                onRequestKeyFrame?()
             }
+        case 15: // MEDIA_SINK_WANTS (có người bấm xem stream -> ép gửi IDR KeyFrame ngay lập tức!)
+            onRequestKeyFrame?()
         case 21: // DAVE Prepare Transition
             if let d = json["d"] as? [String: Any],
                let tid = (d["transition_id"] as? Int) ?? (d["transition_id"] as? NSNumber)?.intValue,
@@ -914,10 +1033,12 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
             if let d = json["d"] as? [String: Any],
                let tid = (d["transition_id"] as? Int) ?? (d["transition_id"] as? NSNumber)?.intValue,
                let dave = self.daveSession {
-                if dave.executeTransition(transitionId: UInt16(tid)), dave.canEncrypt, !self.hasLoggedDaveReady {
-                    self.hasLoggedDaveReady = true
-                    log("🔐 Stream DAVE E2EE đã kích hoạt (Transition #\(tid))!")
-                    self.onReady?()
+                if dave.executeTransition(transitionId: UInt16(tid)) {
+                    if dave.canEncrypt && !self.hasLoggedDaveReady {
+                        self.hasLoggedDaveReady = true
+                        log("🔐 Stream DAVE E2EE đã kích hoạt (Transition #\(tid))!")
+                    }
+                    self.onRequestKeyFrame?()
                 }
             }
         case 24: // DAVE Prepare Epoch
@@ -955,9 +1076,12 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
             if res.result == 1 {
                 if res.transitionId != 0 {
                     await sendJSON(["op": 23, "d": ["transition_id": Int(res.transitionId)]])
-                } else if dave.canEncrypt && !self.hasLoggedDaveReady {
-                    self.hasLoggedDaveReady = true
-                    log("🔐 Stream DAVE E2EE đã kích hoạt (Commit #0)!")
+                } else {
+                    if dave.canEncrypt && !self.hasLoggedDaveReady {
+                        self.hasLoggedDaveReady = true
+                        log("🔐 Stream DAVE E2EE đã kích hoạt (Commit #0)!")
+                    }
+                    self.onRequestKeyFrame?()
                 }
             } else if res.result == -1 {
                 await sendJSON(["op": 31, "d": ["transition_id": Int(res.transitionId)]])
@@ -970,9 +1094,12 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
             if res.ok {
                 if res.transitionId != 0 {
                     await sendJSON(["op": 23, "d": ["transition_id": Int(res.transitionId)]])
-                } else if dave.canEncrypt && !self.hasLoggedDaveReady {
-                    self.hasLoggedDaveReady = true
-                    log("🔐 Stream DAVE E2EE đã kích hoạt (Welcome #0)!")
+                } else {
+                    if dave.canEncrypt && !self.hasLoggedDaveReady {
+                        self.hasLoggedDaveReady = true
+                        log("🔐 Stream DAVE E2EE đã kích hoạt (Welcome #0)!")
+                    }
+                    self.onRequestKeyFrame?()
                 }
             } else {
                 await sendJSON(["op": 31, "d": ["transition_id": Int(res.transitionId)]])
@@ -1129,7 +1256,6 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     func setSpeaking(_ speaking: Bool) async {
-        // Go-Live Stream dùng speaking = 2 (Soundshare)
         await sendJSON([
             "op": 5,
             "d": [
@@ -1145,24 +1271,37 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 
         let frameToSend: Data
         if let dave = self.daveSession, dave.isEncryptionRequired {
-            guard let encrypted = dave.encryptVideoH264(annexBFrame) else { return }
-            frameToSend = encrypted
+            if let encrypted = dave.encryptVideoH264(annexBFrame) {
+                frameToSend = encrypted
+            } else {
+                if dave.canEncrypt {
+                    if !hasLoggedDaveVidErr {
+                        hasLoggedDaveVidErr = true
+                        log("⚠️ Lỗi DAVE mã hóa khung H.264 (\(annexBFrame.count)B)")
+                    }
+                } else if !hasLoggedWaitingDave {
+                    hasLoggedWaitingDave = true
+                    log("⏳ Đang chờ Stream DAVE MLS sẵn sàng để mã hóa hình H.264...")
+                }
+                return
+            }
         } else {
             frameToSend = annexBFrame
         }
 
-        if !hasLoggedVideoStart {
-            hasLoggedVideoStart = true
-            log("📺 Đang phát hình ảnh H.264 Go Live (\(targetWidth)x\(targetHeight)@\(targetFps)fps)!")
-        }
-
-        videoPacketizer.sendFrame(
+        let pkts = videoPacketizer.sendFrame(
             annexBFrame: frameToSend,
             frametimeMs: frametimeMs,
             secretKey: key,
             encryptionMode: encryptionMode,
+            nonceBox: transportNonce,
             udpClient: udpClient
         )
+
+        if !hasLoggedVideoStart && pkts > 0 {
+            hasLoggedVideoStart = true
+            log("📺 Đang phát hình H.264 Go Live (\(targetWidth)x\(targetHeight)@\(targetFps)fps | \(frameToSend.count)B → \(pkts) gói RTP)!")
+        }
     }
 
     func sendOpusPacket(_ opusPayload: Data) {
@@ -1183,11 +1322,11 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         packetLock.lock()
         let seq = rtpAudioSeq
         let ts = rtpAudioTs
-        rtpAudioNonce = rtpAudioNonce &+ 1
-        let nonceVal = rtpAudioNonce
         rtpAudioSeq = rtpAudioSeq &+ 1
         rtpAudioTs = rtpAudioTs &+ 960
         packetLock.unlock()
+
+        let nonceVal = transportNonce.next()
 
         var header = [UInt8](repeating: 0, count: 12)
         header[0] = 0x80
@@ -1302,6 +1441,19 @@ final class TreoMediaBroadcastEngine {
         audioTask = nil
     }
 
+    /// Tính kích thước chẵn vừa trong profile mà vẫn giữ đúng tỷ lệ gốc (không làm méo video hoặc lệch kích thước encoder)
+    private static func computeTargetSize(naturalSize: CGSize, maxWidth: Int, maxHeight: Int) -> (Int, Int) {
+        let nw = Double(abs(naturalSize.width))
+        let nh = Double(abs(naturalSize.height))
+        guard nw > 16, nh > 16 else { return (maxWidth, maxHeight) }
+        let scale = min(Double(maxWidth) / nw, Double(maxHeight) / nh, 1.0)
+        var w = Int((nw * scale).rounded())
+        var h = Int((nh * scale).rounded())
+        w = max(160, (w / 2) * 2)
+        h = max(120, (h / 2) * 2)
+        return (w, h)
+    }
+
     /// Phát lặp vô hạn (Loop ∞) file Video (.mp4/.mov), Audio (.mp3/.m4a/.wav -> màn hình đen), hoặc mẫu ảo
     func start(
         source: TreoMediaSource,
@@ -1319,7 +1471,6 @@ final class TreoMediaBroadcastEngine {
             guard let self = self else { return }
 
             if source.isVirtualPattern || source.isAudioOnly || source.url == nil {
-                // Màn hình đen (cho file nhạc MP3/M4A giống room.js) hoặc Video Mẫu Ảo
                 let encFps = source.isAudioOnly ? min(profile.fps, 15) : min(profile.fps, 30)
                 let encW = source.isAudioOnly ? 1280 : profile.width
                 let encH = source.isAudioOnly ? 720 : profile.height
@@ -1333,7 +1484,7 @@ final class TreoMediaBroadcastEngine {
                     bitrateKbps: encBitrate,
                     maxBitrateKbps: encMaxBitrate
                 ) else {
-                    onLog?("❌ Không thể khởi tạo Hardware H.264 Encoder")
+                    onLog?("❌ Không thể khởi tạo Hardware H.264 Encoder (\(encW)x\(encH))")
                     return
                 }
                 defer { encoder.invalidate() }
@@ -1343,8 +1494,8 @@ final class TreoMediaBroadcastEngine {
                 let cmDuration = CMTime(value: 1, timescale: CMTimeScale(encFps))
                 var frameIndex: Int64 = 0
                 var nextTick = DispatchTime.now().uptimeNanoseconds
+                var loggedFirst = false
 
-                // Tái sử dụng 1 pixelBuffer đen cho chế độ Audio -> Black Video để tiết kiệm CPU
                 let staticBlackPB = source.isAudioOnly
                     ? HardwareH264Encoder.makeSyntheticPixelBuffer(width: encW, height: encH, frameIndex: 0, blackOnly: true)
                     : nil
@@ -1360,7 +1511,17 @@ final class TreoMediaBroadcastEngine {
                     if let pixelBuffer = pb {
                         let forceKey = (frameIndex % Int64(encFps * 2) == 0) || self.consumeKeyFrameRequest()
                         let pts = CMTime(value: frameIndex, timescale: CMTimeScale(encFps))
-                        encoder.encode(pixelBuffer: pixelBuffer, pts: pts, duration: cmDuration, forceKeyFrame: forceKey) { annexB, _ in
+                        encoder.encode(
+                            pixelBuffer: pixelBuffer,
+                            pts: pts,
+                            duration: cmDuration,
+                            forceKeyFrame: forceKey,
+                            onError: { st in onLog?("❌ Lỗi VideoToolbox H.264 (OSStatus \(st))") }
+                        ) { annexB, isKey in
+                            if !loggedFirst {
+                                loggedFirst = true
+                                onLog?("🎬 H.264 Encoder OK (\(encW)x\(encH)@\(encFps)fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
+                            }
                             onVideoFrame(annexB, frameDurationMs)
                         }
                     }
@@ -1374,15 +1535,26 @@ final class TreoMediaBroadcastEngine {
                     }
                 }
             } else if let url = source.url {
-                // File Video thật (.mp4, .mov, .m4v) -> AVAssetReader (HW Decode) -> VideoToolbox (HW H.264 Encode)
+                // File Video thật (.mp4, .mov, .m4v): Khớp đúng kích thước AVAssetReaderTrackOutput == VTCompressionSession
+                let probeAsset = AVURLAsset(url: url)
+                guard let probeTrack = probeAsset.tracks(withMediaType: .video).first else {
+                    onLog?("⚠️ File \(source.title) không có track video")
+                    return
+                }
+                let (encW, encH) = TreoMediaBroadcastEngine.computeTargetSize(
+                    naturalSize: probeTrack.naturalSize,
+                    maxWidth: profile.width,
+                    maxHeight: profile.height
+                )
+
                 guard let encoder = HardwareH264Encoder(
-                    width: profile.width,
-                    height: profile.height,
+                    width: encW,
+                    height: encH,
                     fps: profile.fps,
                     bitrateKbps: profile.bitrateKbps,
                     maxBitrateKbps: profile.maxBitrateKbps
                 ) else {
-                    onLog?("❌ Không thể khởi tạo Hardware H.264 Encoder cho \(source.title)")
+                    onLog?("❌ Không thể khởi tạo Hardware H.264 Encoder (\(encW)x\(encH)) cho \(source.title)")
                     return
                 }
                 defer { encoder.invalidate() }
@@ -1391,28 +1563,29 @@ final class TreoMediaBroadcastEngine {
                 let minFrameMs = 1000.0 / targetFps
                 let minFrameNs = UInt64(minFrameMs * 1_000_000.0)
                 var globalFrameIndex: Int64 = 0
+                var loggedFirst = false
 
                 while !Task.isCancelled {
                     let asset = AVURLAsset(url: url)
-                    guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-                        onLog?("⚠️ File \(source.title) không có track video — chuyển sang màn hình đen")
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        break
-                    }
-
-                    guard let reader = try? AVAssetReader(asset: asset) else {
+                    guard let videoTrack = asset.tracks(withMediaType: .video).first,
+                          let reader = try? AVAssetReader(asset: asset) else {
                         try? await Task.sleep(nanoseconds: 500_000_000)
                         continue
                     }
 
+                    // Ép AVAssetReader xuất NV12 đúng kích thước encW x encH để khớp 100% với HardwareH264Encoder
                     let outputSettings: [String: Any] = [
-                        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+                        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                        kCVPixelBufferWidthKey as String: encW,
+                        kCVPixelBufferHeightKey as String: encH,
+                        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
                     ]
                     let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
                     trackOutput.alwaysCopiesSampleData = false
                     guard reader.canAdd(trackOutput) else { break }
                     reader.add(trackOutput)
                     guard reader.startReading() else {
+                        onLog?("❌ AVAssetReader lỗi mở video: \(reader.error?.localizedDescription ?? "unknown")")
                         try? await Task.sleep(nanoseconds: 500_000_000)
                         continue
                     }
@@ -1432,7 +1605,6 @@ final class TreoMediaBroadcastEngine {
 
                         let srcPts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
                         if lastEmittedPtsSec >= 0 && srcPts >= lastEmittedPtsSec && (srcPts - lastEmittedPtsSec) < (minFrameMs / 1000.0) * 0.75 {
-                            // Bỏ khung thừa nếu video gốc FPS cao hơn profile mục tiêu
                             continue
                         }
                         lastEmittedPtsSec = srcPts
@@ -1440,7 +1612,17 @@ final class TreoMediaBroadcastEngine {
 
                         let forceKey = (globalFrameIndex % Int64(max(15, Int(effFps * 2))) == 0) || self.consumeKeyFrameRequest()
                         let outPts = CMTime(value: globalFrameIndex * Int64(90_000.0 / effFps), timescale: 90_000)
-                        encoder.encode(pixelBuffer: pb, pts: outPts, duration: cmDur, forceKeyFrame: forceKey) { annexB, _ in
+                        encoder.encode(
+                            pixelBuffer: pb,
+                            pts: outPts,
+                            duration: cmDur,
+                            forceKeyFrame: forceKey,
+                            onError: { st in onLog?("❌ Lỗi VideoToolbox H.264 (OSStatus \(st))") }
+                        ) { annexB, isKey in
+                            if !loggedFirst {
+                                loggedFirst = true
+                                onLog?("🎬 H.264 Encoder OK (\(encW)x\(encH)@\(Int(effFps))fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
+                            }
                             onVideoFrame(annexB, stepMs)
                         }
                         globalFrameIndex += 1

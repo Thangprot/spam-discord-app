@@ -4178,6 +4178,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var hasLoggedAudioStart = false
     private var hasLoggedDaveReady = false
     private var hasLoggedCamVideoStart = false
+    private var hasLoggedCamDaveErr = false
     private var hasSentVoiceIdentify = false
     private var hasSentSelectProtocol = false
     private let packetLock = NSLock()
@@ -4197,14 +4198,16 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var activeVoiceSessionId: String?
 
     private let udpClient = DiscordVoiceUDPClient()
+    private let transportNonce = TransportNonceBox()
     private var rtpSequence: UInt16 = UInt16.random(in: 0...65535)
     private var rtpTimestamp: UInt32 = UInt32.random(in: 0...4000000)
-    private var rtpNonceCounter: UInt32 = 0
     private var udpKeepAliveCounter: UInt32 = 0
 
     var onLog: ((String) -> Void)?
     var onVoiceUDPReady: (() -> Void)?
     var onGoLiveReady: (() -> Void)?
+    var onRequestCamKeyFrame: (() -> Void)?
+    var onRequestGoLiveKeyFrame: (() -> Void)?
 
     init(tokenInfo: TokenInfo) {
         self.id = tokenInfo.id
@@ -4510,8 +4513,11 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         activeVoiceToken = vtok
         activeVoiceSessionId = sid
         voiceSeq = -1
+        transportNonce.reset()
         hasLoggedAudioStart = false
         hasLoggedDaveReady = false
+        hasLoggedCamVideoStart = false
+        hasLoggedCamDaveErr = false
         hasSentVoiceIdentify = false
         hasSentSelectProtocol = false
         daveSession?.destroy()
@@ -4618,6 +4624,10 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                         self.rtxSsrc = self.ssrc + 2
                     }
                     self.camVideoPacketizer.configure(ssrc: UInt32(truncatingIfNeeded: self.videoSsrc))
+                    await sendVoiceJSON([
+                        "op": 12,
+                        "d": ["audio_ssrc": self.ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []]
+                    ])
                 }
                 let ip = d["ip"] as? String ?? ""
                 let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
@@ -4667,7 +4677,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     self.isVoiceUDPReady = true
                     self.isJoined = true
                 }
-                log("✅ Kênh thoại sẵn sàng (\(mode) | DAVE v\(daveVer))!")
+                let vCodec = d["video_codec"] as? String ?? "-"
+                log("✅ Kênh thoại sẵn sàng (\(mode) | V:\(vCodec) | DAVE v\(daveVer))!")
                 if self.isSpeaking {
                     sendSpeaking(true)
                 }
@@ -4678,6 +4689,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     self.startGoLive(profile: streamProf)
                 }
                 self.onVoiceUDPReady?()
+                self.onRequestCamKeyFrame?()
             }
         case 6: // Heartbeat ACK
             break
@@ -4685,6 +4697,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             log("Voice Gateway đã hồi phục phiên (Resumed).")
         case 11, 13: // Clients Connect / Client Disconnect
             break
+        case 15: // MEDIA_SINK_WANTS (người khác xem Cam -> ép gửi KeyFrame ngay!)
+            self.onRequestCamKeyFrame?()
         case 21: // DAVE Prepare Transition
             if let d = json["d"] as? [String: Any],
                let tid = (d["transition_id"] as? Int) ?? (d["transition_id"] as? NSNumber)?.intValue,
@@ -4708,6 +4722,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                         }
                         self.onVoiceUDPReady?()
                     }
+                    self.onRequestCamKeyFrame?()
                 }
             }
         case 24: // DAVE Prepare Epoch
@@ -4756,12 +4771,15 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             if res.result == 1 {
                 if res.transitionId != 0 {
                     await sendVoiceJSON(["op": 23, "d": ["transition_id": Int(res.transitionId)]])
-                } else if dave.canEncrypt && !self.hasLoggedDaveReady {
-                    self.hasLoggedDaveReady = true
-                    log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Commit #0)!")
-                    if self.isSpeaking {
-                        self.sendSpeaking(true)
+                } else {
+                    if dave.canEncrypt && !self.hasLoggedDaveReady {
+                        self.hasLoggedDaveReady = true
+                        log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Commit #0)!")
+                        if self.isSpeaking {
+                            self.sendSpeaking(true)
+                        }
                     }
+                    self.onRequestCamKeyFrame?()
                 }
             } else if res.result == -1 {
                 await sendVoiceJSON(["op": 31, "d": ["transition_id": Int(res.transitionId)]])
@@ -4774,12 +4792,15 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             if res.ok {
                 if res.transitionId != 0 {
                     await sendVoiceJSON(["op": 23, "d": ["transition_id": Int(res.transitionId)]])
-                } else if dave.canEncrypt && !self.hasLoggedDaveReady {
-                    self.hasLoggedDaveReady = true
-                    log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Welcome #0)!")
-                    if self.isSpeaking {
-                        self.sendSpeaking(true)
+                } else {
+                    if dave.canEncrypt && !self.hasLoggedDaveReady {
+                        self.hasLoggedDaveReady = true
+                        log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Welcome #0)!")
+                        if self.isSpeaking {
+                            self.sendSpeaking(true)
+                        }
                     }
+                    self.onRequestCamKeyFrame?()
                 }
             } else {
                 await sendVoiceJSON(["op": 31, "d": ["transition_id": Int(res.transitionId)]])
@@ -4943,6 +4964,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             self.desiredFakeCamProfile = prof
             self.selfVideo = true
             self.hasLoggedCamVideoStart = false
+            self.hasLoggedCamDaveErr = false
             sendVoiceStateUpdate()
             if isVoiceUDPReady {
                 Task { [weak self] in
@@ -4984,6 +5006,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             ]
             await sendVoiceJSON(["op": 12, "d": d])
             DispatchQueue.main.async { self.isFakeCamActive = true }
+            self.onRequestCamKeyFrame?()
             log("🎥 Đã bật Fake Cam (\(prof.width)x\(prof.height)@\(prof.fps)fps)")
         } else {
             let d: [String: Any] = [
@@ -5003,24 +5026,32 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
 
         let frameToSend: Data
         if let dave = self.daveSession, dave.isEncryptionRequired {
-            guard let encrypted = dave.encryptVideoH264(annexBFrame) else { return }
-            frameToSend = encrypted
+            if let encrypted = dave.encryptVideoH264(annexBFrame) {
+                frameToSend = encrypted
+            } else {
+                if dave.canEncrypt && !hasLoggedCamDaveErr {
+                    hasLoggedCamDaveErr = true
+                    log("⚠️ Lỗi DAVE mã hóa khung Fake Cam H.264 (\(annexBFrame.count)B)")
+                }
+                return
+            }
         } else {
             frameToSend = annexBFrame
         }
 
-        if !hasLoggedCamVideoStart {
-            hasLoggedCamVideoStart = true
-            log("🎥 Đang phát luồng hình ảnh Fake Cam H.264 vào phòng thoại!")
-        }
-
-        camVideoPacketizer.sendFrame(
+        let pkts = camVideoPacketizer.sendFrame(
             annexBFrame: frameToSend,
             frametimeMs: frametimeMs,
             secretKey: key,
             encryptionMode: encryptionMode,
+            nonceBox: transportNonce,
             udpClient: udpClient
         )
+
+        if !hasLoggedCamVideoStart && pkts > 0 {
+            hasLoggedCamVideoStart = true
+            log("🎥 Đang phát hình Fake Cam H.264 (\(frameToSend.count)B → \(pkts) gói RTP)!")
+        }
     }
 
     // MARK: - GO LIVE STREAM (OP 18 STREAM_CREATE / OP 22 PAUSE / OP 19 DELETE)
@@ -5138,6 +5169,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             }
             self?.onGoLiveReady?()
         }
+        ss.onRequestKeyFrame = { [weak self] in
+            self?.onRequestGoLiveKeyFrame?()
+        }
         self.streamSession = ss
         ss.connect()
     }
@@ -5199,11 +5233,11 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         packetLock.lock()
         let seq = rtpSequence
         let ts = rtpTimestamp
-        rtpNonceCounter = rtpNonceCounter &+ 1
-        let nonceVal = rtpNonceCounter
         rtpSequence = rtpSequence &+ 1
         rtpTimestamp = rtpTimestamp &+ 960
         packetLock.unlock()
+
+        let nonceVal = transportNonce.next()
 
         // 12-byte RTP Header
         var header = [UInt8](repeating: 0, count: 12)
@@ -5645,6 +5679,12 @@ final class VoiceRoomManager: ObservableObject {
                     guard let self = self, self.isRunning else { return }
                     self.goLiveEngine.requestKeyFrame()
                 }
+            }
+            session.onRequestCamKeyFrame = { [weak self] in
+                self?.fakeCamEngine.requestKeyFrame()
+            }
+            session.onRequestGoLiveKeyFrame = { [weak self] in
+                self?.goLiveEngine.requestKeyFrame()
             }
             newSessions.append(session)
         }

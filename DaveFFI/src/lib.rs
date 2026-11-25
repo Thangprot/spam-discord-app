@@ -429,6 +429,434 @@ pub unsafe extern "C" fn dave_session_encrypt_video_h264(
     .unwrap_or_else(|_| DaveByteBuffer::empty())
 }
 
+// ============================================================================
+// H.264 SPS VUI Rewriter (port of WebRTC sps_vui_rewriter / Discord-video-stream)
+// Ensures max_num_reorder_frames = 0 and strips video_signal_type so Chrome /
+// Discord Desktop WebRTC H.264 decoder never stalls on a loading spinner.
+// ============================================================================
+
+struct AnnexBReader<'a> {
+    buf: &'a [u8],
+    byte_off: usize,
+    bit_off: u8,
+}
+
+impl<'a> AnnexBReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self {
+            buf,
+            byte_off: 0,
+            bit_off: 0,
+        }
+    }
+
+    fn read_bits(&mut self, mut count: u8) -> Option<u32> {
+        if count == 0 {
+            return Some(0);
+        }
+        let mut result: u32 = 0;
+        while count > 0 {
+            if self.byte_off >= self.buf.len() {
+                return None;
+            }
+            if self.bit_off == 0
+                && self.byte_off >= 2
+                && self.buf[self.byte_off - 2] == 0
+                && self.buf[self.byte_off - 1] == 0
+                && self.buf[self.byte_off] == 3
+            {
+                self.byte_off += 1;
+                if self.byte_off >= self.buf.len() {
+                    return None;
+                }
+            }
+            if self.bit_off == 0 && count >= 8 {
+                result = (result << 8) | (self.buf[self.byte_off] as u32);
+                self.byte_off += 1;
+                count -= 8;
+            } else {
+                let n = count.min(8 - self.bit_off);
+                let mask = (1u32 << n) - 1;
+                let shift = 8 - self.bit_off - n;
+                let bits = ((self.buf[self.byte_off] as u32) >> shift) & mask;
+                result = (result << n) | bits;
+                count -= n;
+                self.bit_off += n;
+                if self.bit_off == 8 {
+                    self.bit_off = 0;
+                    self.byte_off += 1;
+                }
+            }
+        }
+        Some(result)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeros: u8 = 0;
+        while self.read_bits(1)? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None;
+            }
+        }
+        if leading_zeros == 0 {
+            return Some(0);
+        }
+        let rest = self.read_bits(leading_zeros)?;
+        Some((1u32 << leading_zeros).wrapping_sub(1).wrapping_add(rest))
+    }
+
+    fn read_se(&mut self) -> Option<i32> {
+        let u = self.read_ue()?;
+        if u % 2 == 0 {
+            Some(-((u / 2) as i32))
+        } else {
+            Some(((u + 1) / 2) as i32)
+        }
+    }
+}
+
+struct AnnexBWriter {
+    out: Vec<u8>,
+    pending: u8,
+    bit_off: u8,
+}
+
+impl AnnexBWriter {
+    fn new(cap: usize) -> Self {
+        Self {
+            out: Vec::with_capacity(cap),
+            pending: 0,
+            bit_off: 0,
+        }
+    }
+
+    fn flush_byte(&mut self) {
+        let len = self.out.len();
+        if self.pending <= 3 && len >= 2 && self.out[len - 1] == 0 && self.out[len - 2] == 0 {
+            self.out.push(3);
+        }
+        self.out.push(self.pending);
+        self.pending = 0;
+        self.bit_off = 0;
+    }
+
+    fn write_bits(&mut self, bits: u32, mut count: u8) {
+        while count > 0 {
+            if self.bit_off == 0 {
+                if count >= 8 {
+                    self.pending = ((bits >> (count - 8)) & 0xFF) as u8;
+                    count -= 8;
+                    self.flush_byte();
+                } else {
+                    let mask = (1u32 << count) - 1;
+                    self.pending |= ((bits & mask) << (8 - count)) as u8;
+                    self.bit_off = count;
+                    count = 0;
+                }
+            } else {
+                let n = count.min(8 - self.bit_off);
+                let mask = (1u32 << n) - 1;
+                let part = (bits >> (count - n)) & mask;
+                self.pending |= (part << (8 - self.bit_off - n)) as u8;
+                count -= n;
+                self.bit_off += n;
+                if self.bit_off == 8 {
+                    self.flush_byte();
+                }
+            }
+        }
+    }
+
+    fn write_ue(&mut self, val: u32) {
+        let v = val.saturating_add(1);
+        let bit_count = (32 - v.leading_zeros()) as u8;
+        if bit_count > 1 {
+            self.write_bits(0, bit_count - 1);
+        }
+        self.write_bits(v, bit_count);
+    }
+
+    fn write_se(&mut self, val: i32) {
+        if val <= 0 {
+            self.write_ue((-2 * val) as u32);
+        } else {
+            self.write_ue((2 * val - 1) as u32);
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.write_bits(1, 1); // rbsp_stop_one_bit
+        if self.bit_off > 0 {
+            self.flush_byte();
+        }
+        self.out
+    }
+}
+
+fn rewrite_sps_vui_internal(sps: &[u8]) -> Option<Vec<u8>> {
+    if sps.len() < 4 || (sps[0] & 0x1F) != 7 {
+        return None;
+    }
+    let mut r = AnnexBReader::new(&sps[1..]);
+    let mut w = AnnexBWriter::new(sps.len() + 16);
+
+    w.write_bits(sps[0] as u32, 8);
+    let profile_idc = r.read_bits(8)?;
+    w.write_bits(profile_idc, 8);
+    let constraint_flags = r.read_bits(8)?;
+    w.write_bits(constraint_flags, 8);
+    let level_idc = r.read_bits(8)?;
+    w.write_bits(level_idc, 8);
+
+    let sps_id = r.read_ue()?;
+    w.write_ue(sps_id);
+
+    if matches!(
+        profile_idc,
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 144
+    ) {
+        let chroma_format_idc = r.read_ue()?;
+        w.write_ue(chroma_format_idc);
+        if chroma_format_idc == 3 {
+            let sep = r.read_bits(1)?;
+            w.write_bits(sep, 1);
+        }
+        let bd_luma = r.read_ue()?;
+        w.write_ue(bd_luma);
+        let bd_chroma = r.read_ue()?;
+        w.write_ue(bd_chroma);
+        let qpprime = r.read_bits(1)?;
+        w.write_bits(qpprime, 1);
+        let scaling_present = r.read_bits(1)?;
+        w.write_bits(scaling_present, 1);
+        if scaling_present != 0 {
+            let scaling_count = if chroma_format_idc != 3 { 8 } else { 12 };
+            for i in 0..scaling_count {
+                let list_present = r.read_bits(1)?;
+                w.write_bits(list_present, 1);
+                if list_present != 0 {
+                    let size = if i < 6 { 16 } else { 64 };
+                    let mut last_scale: i32 = 8;
+                    let mut next_scale: i32 = 8;
+                    for _ in 0..size {
+                        if next_scale != 0 {
+                            let delta = r.read_se()?;
+                            w.write_se(delta);
+                            next_scale = (last_scale + delta + 256) % 256;
+                        }
+                        if next_scale != 0 {
+                            last_scale = next_scale;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let log2_max_frame_num_minus4 = r.read_ue()?;
+    w.write_ue(log2_max_frame_num_minus4);
+
+    let poc_type = r.read_ue()?;
+    w.write_ue(poc_type);
+    if poc_type == 0 {
+        let v = r.read_ue()?;
+        w.write_ue(v);
+    } else if poc_type == 1 {
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1);
+        let v2 = r.read_se()?;
+        w.write_se(v2);
+        let v3 = r.read_se()?;
+        w.write_se(v3);
+        let n_ref = r.read_ue()?;
+        w.write_ue(n_ref);
+        for _ in 0..n_ref {
+            let off = r.read_se()?;
+            w.write_se(off);
+        }
+    }
+
+    let max_num_ref_frames = r.read_ue()?;
+    w.write_ue(max_num_ref_frames);
+    let gaps = r.read_bits(1)?;
+    w.write_bits(gaps, 1);
+    let pic_w = r.read_ue()?;
+    w.write_ue(pic_w);
+    let pic_h = r.read_ue()?;
+    w.write_ue(pic_h);
+
+    let frame_mbs_only = r.read_bits(1)?;
+    w.write_bits(frame_mbs_only, 1);
+    if frame_mbs_only == 0 {
+        let mb_aff = r.read_bits(1)?;
+        w.write_bits(mb_aff, 1);
+    }
+    let direct_8x8 = r.read_bits(1)?;
+    w.write_bits(direct_8x8, 1);
+
+    let cropping = r.read_bits(1)?;
+    w.write_bits(cropping, 1);
+    if cropping != 0 {
+        for _ in 0..4 {
+            let c = r.read_ue()?;
+            w.write_ue(c);
+        }
+    }
+
+    let write_restriction = |w: &mut AnnexBWriter| {
+        w.write_bits(1, 1); // motion_vectors_over_pic_boundaries_flag
+        w.write_ue(2); // max_bytes_per_pic_denom
+        w.write_ue(1); // max_bits_per_mb_denom
+        w.write_ue(16); // log2_max_mv_length_horizontal
+        w.write_ue(16); // log2_max_mv_length_vertical
+        w.write_ue(0); // max_num_reorder_frames = 0 (CRITICAL for WebRTC/Chrome!)
+        w.write_ue(max_num_ref_frames.max(1)); // max_dec_frame_buffering
+    };
+
+    let copy_hrd = |r: &mut AnnexBReader, w: &mut AnnexBWriter| -> Option<()> {
+        let cpb_cnt_minus1 = r.read_ue()?;
+        w.write_ue(cpb_cnt_minus1);
+        let br_scale = r.read_bits(4)?;
+        w.write_bits(br_scale, 4);
+        let cpb_scale = r.read_bits(4)?;
+        w.write_bits(cpb_scale, 4);
+        for _ in 0..=cpb_cnt_minus1 {
+            let br_val = r.read_ue()?;
+            w.write_ue(br_val);
+            let cpb_val = r.read_ue()?;
+            w.write_ue(cpb_val);
+            let cbr = r.read_bits(1)?;
+            w.write_bits(cbr, 1);
+        }
+        let a = r.read_bits(5)?;
+        w.write_bits(a, 5);
+        let b = r.read_bits(5)?;
+        w.write_bits(b, 5);
+        let c = r.read_bits(5)?;
+        w.write_bits(c, 5);
+        let d = r.read_bits(5)?;
+        w.write_bits(d, 5);
+        Some(())
+    };
+
+    let vui_present = r.read_bits(1)?;
+    w.write_bits(1, 1);
+    if vui_present == 0 {
+        w.write_bits(0, 2); // aspect_ratio, overscan
+        w.write_bits(0, 1); // video_signal_type
+        w.write_bits(0, 5); // chroma_loc, timing_info, nal_hrd, vcl_hrd, pic_struct
+        w.write_bits(1, 1); // bitstream_restriction_flag
+        write_restriction(&mut w);
+    } else {
+        let ar = r.read_bits(1)?;
+        w.write_bits(ar, 1);
+        if ar != 0 {
+            let idc = r.read_bits(8)?;
+            w.write_bits(idc, 8);
+            if idc == 255 {
+                let sw = r.read_bits(16)?;
+                w.write_bits(sw, 16);
+                let sh = r.read_bits(16)?;
+                w.write_bits(sh, 16);
+            }
+        }
+        let overscan = r.read_bits(1)?;
+        w.write_bits(overscan, 1);
+        if overscan != 0 {
+            let oa = r.read_bits(1)?;
+            w.write_bits(oa, 1);
+        }
+        // Strip video_signal_type_present_flag (just like SPSVUIRewriter.ts)
+        let vst = r.read_bits(1)?;
+        w.write_bits(0, 1);
+        if vst != 0 {
+            let _ = r.read_bits(3)?;
+            let _ = r.read_bits(1)?;
+            let cd = r.read_bits(1)?;
+            if cd != 0 {
+                let _ = r.read_bits(8)?;
+                let _ = r.read_bits(8)?;
+                let _ = r.read_bits(8)?;
+            }
+        }
+        let cloc = r.read_bits(1)?;
+        w.write_bits(cloc, 1);
+        if cloc != 0 {
+            let t = r.read_ue()?;
+            w.write_ue(t);
+            let b = r.read_ue()?;
+            w.write_ue(b);
+        }
+        let timing = r.read_bits(1)?;
+        w.write_bits(timing, 1);
+        if timing != 0 {
+            let num = r.read_bits(32)?;
+            w.write_bits(num, 32);
+            let ts = r.read_bits(32)?;
+            w.write_bits(ts, 32);
+            let ffr = r.read_bits(1)?;
+            w.write_bits(ffr, 1);
+        }
+        let nal_hrd = r.read_bits(1)?;
+        w.write_bits(nal_hrd, 1);
+        if nal_hrd != 0 {
+            copy_hrd(&mut r, &mut w)?;
+        }
+        let vcl_hrd = r.read_bits(1)?;
+        w.write_bits(vcl_hrd, 1);
+        if vcl_hrd != 0 {
+            copy_hrd(&mut r, &mut w)?;
+        }
+        if nal_hrd != 0 || vcl_hrd != 0 {
+            let ld = r.read_bits(1)?;
+            w.write_bits(ld, 1);
+        }
+        let ps = r.read_bits(1)?;
+        w.write_bits(ps, 1);
+        let br = r.read_bits(1)?;
+        w.write_bits(1, 1);
+        if br == 0 {
+            write_restriction(&mut w);
+        } else {
+            let mv = r.read_bits(1)?;
+            w.write_bits(mv, 1);
+            let mbp = r.read_ue()?;
+            w.write_ue(mbp);
+            let mbm = r.read_ue()?;
+            w.write_ue(mbm);
+            let lh = r.read_ue()?;
+            w.write_ue(lh);
+            let lv = r.read_ue()?;
+            w.write_ue(lv);
+            let _old_reorder = r.read_ue()?;
+            w.write_ue(0); // max_num_reorder_frames = 0
+            let _old_dpb = r.read_ue()?;
+            w.write_ue(max_num_ref_frames.max(1));
+        }
+    }
+
+    Some(w.finish())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_h264_rewrite_sps_vui(
+    sps_nalu: *const u8,
+    sps_len: usize,
+) -> DaveByteBuffer {
+    catch_unwind(AssertUnwindSafe(|| {
+        if sps_nalu.is_null() || sps_len < 4 {
+            return DaveByteBuffer::empty();
+        }
+        let bytes = unsafe { slice::from_raw_parts(sps_nalu, sps_len) };
+        match rewrite_sps_vui_internal(bytes) {
+            Some(out) => DaveByteBuffer::from_vec(out),
+            None => DaveByteBuffer::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| DaveByteBuffer::empty())
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dave_xchacha20_poly1305_encrypt(
     key: *const u8,
@@ -641,6 +1069,123 @@ mod tests {
             }
             assert!(max_amp > 5000, "Decoded audio amplitude too low: {max_amp}");
             dave_opus_encoder_free(enc);
+        }
+    }
+
+    #[test]
+    fn test_h264_sps_vui_rewriter() {
+        // Helper to build a valid H.264 Baseline 1280x720 SPS with or without VUI
+        fn build_baseline_sps(with_vui_and_color: bool) -> Vec<u8> {
+            let mut w = AnnexBWriter::new(32);
+            w.write_bits(0x67, 8); // NAL header (SPS)
+            w.write_bits(66, 8);   // profile_idc = Baseline (0x42)
+            w.write_bits(0xC0, 8); // constraint_set0 + constraint_set1
+            w.write_bits(31, 8);   // level_idc = 3.1
+            w.write_ue(0);         // sps_id
+            w.write_ue(0);         // log2_max_frame_num_minus4
+            w.write_ue(2);         // poc_type = 2
+            w.write_ue(1);         // max_num_ref_frames = 1
+            w.write_bits(0, 1);    // gaps_in_frame_num_value_allowed_flag
+            w.write_ue(79);        // pic_width_in_mbs_minus1 (1280)
+            w.write_ue(44);        // pic_height_in_map_units_minus1 (720)
+            w.write_bits(1, 1);    // frame_mbs_only_flag
+            w.write_bits(1, 1);    // direct_8x8_inference_flag
+            w.write_bits(0, 1);    // frame_cropping_flag
+            if !with_vui_and_color {
+                w.write_bits(0, 1); // vui_parameters_present_flag = 0
+            } else {
+                w.write_bits(1, 1); // vui_parameters_present_flag = 1
+                w.write_bits(0, 1); // aspect_ratio = 0
+                w.write_bits(0, 1); // overscan = 0
+                // Apple VideoToolbox style video_signal_type + colour_description
+                w.write_bits(1, 1); // video_signal_type_present_flag = 1
+                w.write_bits(5, 3); // video_format
+                w.write_bits(0, 1); // video_full_range_flag
+                w.write_bits(1, 1); // colour_description_present_flag = 1
+                w.write_bits(1, 8); // colour_primaries (BT.709)
+                w.write_bits(1, 8); // transfer_characteristics
+                w.write_bits(1, 8); // matrix_coeffs
+                w.write_bits(0, 1); // chroma_loc_info = 0
+                w.write_bits(1, 1); // timing_info_present_flag = 1
+                w.write_bits(1, 32);  // num_units_in_tick
+                w.write_bits(60, 32); // time_scale
+                w.write_bits(1, 1);   // fixed_frame_rate_flag
+                w.write_bits(0, 1); // nal_hrd = 0
+                w.write_bits(0, 1); // vcl_hrd = 0
+                w.write_bits(0, 1); // pic_struct = 0
+                w.write_bits(1, 1); // bitstream_restriction = 1
+                w.write_bits(1, 1); // motion_vectors_over_pic_boundaries
+                w.write_ue(2);
+                w.write_ue(1);
+                w.write_ue(16);
+                w.write_ue(16);
+                w.write_ue(2); // old max_num_reorder_frames = 2 (causes Chrome stall!)
+                w.write_ue(4); // old max_dec_frame_buffering = 4
+            }
+            w.finish()
+        }
+
+        // Parse rewritten Baseline SPS and verify VUI fields
+        fn verify_rewritten_baseline(out: &[u8], expect_timing: bool) {
+            assert_eq!(out[0], 0x67);
+            let mut r = AnnexBReader::new(&out[1..]);
+            assert_eq!(r.read_bits(8), Some(66));
+            assert_eq!(r.read_bits(8), Some(0xC0));
+            assert_eq!(r.read_bits(8), Some(31));
+            assert_eq!(r.read_ue(), Some(0));
+            assert_eq!(r.read_ue(), Some(0));
+            assert_eq!(r.read_ue(), Some(2));
+            assert_eq!(r.read_ue(), Some(1));
+            assert_eq!(r.read_bits(1), Some(0));
+            assert_eq!(r.read_ue(), Some(79));
+            assert_eq!(r.read_ue(), Some(44));
+            assert_eq!(r.read_bits(1), Some(1));
+            assert_eq!(r.read_bits(1), Some(1));
+            assert_eq!(r.read_bits(1), Some(0));
+            // VUI must be present
+            assert_eq!(r.read_bits(1), Some(1));
+            assert_eq!(r.read_bits(1), Some(0)); // aspect_ratio
+            assert_eq!(r.read_bits(1), Some(0)); // overscan
+            assert_eq!(r.read_bits(1), Some(0)); // video_signal_type MUST be stripped (0)!
+            assert_eq!(r.read_bits(1), Some(0)); // chroma_loc
+            let timing = r.read_bits(1).unwrap();
+            assert_eq!(timing, if expect_timing { 1 } else { 0 });
+            if timing != 0 {
+                assert_eq!(r.read_bits(32), Some(1));
+                assert_eq!(r.read_bits(32), Some(60));
+                assert_eq!(r.read_bits(1), Some(1));
+            }
+            assert_eq!(r.read_bits(1), Some(0)); // nal_hrd
+            assert_eq!(r.read_bits(1), Some(0)); // vcl_hrd
+            assert_eq!(r.read_bits(1), Some(0)); // pic_struct
+            assert_eq!(r.read_bits(1), Some(1)); // bitstream_restriction MUST be 1
+            assert_eq!(r.read_bits(1), Some(1)); // mv_over_pic_boundaries
+            assert_eq!(r.read_ue(), Some(2));
+            assert_eq!(r.read_ue(), Some(1));
+            assert_eq!(r.read_ue(), Some(16));
+            assert_eq!(r.read_ue(), Some(16));
+            assert_eq!(r.read_ue(), Some(0)); // max_num_reorder_frames MUST be 0!
+            assert_eq!(r.read_ue(), Some(1)); // max_dec_frame_buffering
+        }
+
+        // Case 1: Baseline SPS without VUI
+        let sps_no_vui = build_baseline_sps(false);
+        unsafe {
+            let rewritten = dave_h264_rewrite_sps_vui(sps_no_vui.as_ptr(), sps_no_vui.len());
+            assert!(!rewritten.ptr.is_null());
+            let out = slice::from_raw_parts(rewritten.ptr, rewritten.len);
+            verify_rewritten_baseline(out, false);
+            dave_buffer_free(rewritten);
+        }
+
+        // Case 2: Apple VideoToolbox-style SPS with video_signal_type + reorder_frames=2
+        let sps_vt = build_baseline_sps(true);
+        unsafe {
+            let rewritten = dave_h264_rewrite_sps_vui(sps_vt.as_ptr(), sps_vt.len());
+            assert!(!rewritten.ptr.is_null());
+            let out = slice::from_raw_parts(rewritten.ptr, rewritten.len);
+            verify_rewritten_baseline(out, true);
+            dave_buffer_free(rewritten);
         }
     }
 }
