@@ -5211,7 +5211,7 @@ struct VoiceRoomTabView: View {
                 Text("TIÊN NGHỊCH [XẢ CHA - ĐỘC TÔN]")
                     .font(.caption.bold())
                     .foregroundColor(.red)
-                Text("HỆ THỐNG XẢ NHẠC ĐA PHÂN THÂN BẤT TỬ")
+                Text("HỆ THỐNG XẢ NHẠC ĐA PHÂN THÂN BẤT TỬ • ĐIỀU KHIỂN CẢM ỨNG 100%")
                     .font(.system(size: 9, weight: .bold))
                     .foregroundColor(.secondary)
             }
@@ -5303,7 +5303,7 @@ struct VoiceRoomTabView: View {
                     }
                 }
 
-                // Thanh Sát Chiêu Thực Địa: !cam, !sua, !next, !loop, !exit
+                // Thanh Thanh Điều Khiển Trực Tiếp Trên Màn Hình
                 HStack(spacing: 12) {
                     // Câm Mồm (!cam) / Sủa Tiếp (!sua)
                     if musicStream.isPlaying {
@@ -5337,7 +5337,7 @@ struct VoiceRoomTabView: View {
                     }
                     .disabled(musicStream.playlist.isEmpty)
 
-                    // Bài Sau (!next / !skip)
+                    // Bài Sau (Next)
                     Button {
                         musicStream.playNext()
                     } label: {
@@ -5354,7 +5354,7 @@ struct VoiceRoomTabView: View {
 
                     Spacer()
 
-                    // Vòng Lặp Vô Hạn (!loop)
+                    // Chế Độ Lặp Danh Sách
                     Button {
                         switch musicStream.loopMode {
                         case .loopAll: musicStream.loopMode = .loopOne
@@ -5624,12 +5624,12 @@ struct VoiceRoomTabView: View {
                     Text("Sát Chiêu Chiến Đấu Thực Địa").font(.headline)
                 }
 
-                // Sát chiêu 1: 🔴 CHIẾN ĐẤU V9 TỐI THƯỢNG (!max)
+                // Sát chiêu 1: 🔴 CHIẾN ĐẤU V9 TỐI THƯỢNG (MAX GAIN)
                 Toggle(isOn: $musicStream.isMaxMode) {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 4) {
                             Text("🔴")
-                            Text("CHIẾN ĐẤU V9 TỐI THƯỢNG (!max)").font(.subheadline.bold()).foregroundColor(.red)
+                            Text("CHIẾN ĐẤU V9 TỐI THƯỢNG (MAX GAIN)").font(.subheadline.bold()).foregroundColor(.red)
                         }
                         Text("Khai mở cực hạn hỏa lực: EQ 80Hz + 3500Hz + Volume 2.5x vượt bậc!")
                             .font(.caption2).foregroundStyle(.secondary)
@@ -5638,12 +5638,12 @@ struct VoiceRoomTabView: View {
 
                 Divider()
 
-                // Sát chiêu 2: 🧹 LỌC ỒN CHỦ ĐỘNG (!xoatapam)
+                // Sát chiêu 2: 🧹 LỌC ỒN CHỦ ĐỘNG (LỌC TẠP ÂM)
                 Toggle(isOn: $musicStream.isCleanMode) {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 4) {
                             Text("🧹")
-                            Text("LỌC ỒN CHỦ ĐỘNG (!xoatapam)").font(.subheadline.bold()).foregroundColor(.teal)
+                            Text("LỌC ỒN CHỦ ĐỘNG (LỌC TẠP ÂM)").font(.subheadline.bold()).foregroundColor(.teal)
                         }
                         Text("Lọc tạp âm, chống rè nhiễu dải tần Highpass 150Hz & Lowpass 10kHz.")
                             .font(.caption2).foregroundStyle(.secondary)
@@ -5655,7 +5655,7 @@ struct VoiceRoomTabView: View {
                 // Chân hỏa: Volume (!volume)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("🔊 Chân Hỏa (Volume):").font(.subheadline.bold())
+                        Text("🔊 Âm Lượng (Volume):").font(.subheadline.bold())
                         Spacer()
                         Text("\(Int(musicStream.volume * 100))%")
                             .font(.subheadline.bold())
@@ -5685,7 +5685,7 @@ struct VoiceRoomTabView: View {
                 // Ép xung: Boost (!boost)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("🚀 Ép Xung Hỏa Lực (Boost):").font(.subheadline.bold())
+                        Text("🚀 Ép Xung Khuếch Đại (Boost):").font(.subheadline.bold())
                         Spacer()
                         Text("\(Int(musicStream.boostMultiplier * 100))%")
                             .font(.subheadline.bold())
@@ -5715,7 +5715,7 @@ struct VoiceRoomTabView: View {
                 // Trọng lực: Bass (!bass)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("💣 Trọng Lực Bass (!bass):").font(.subheadline.bold())
+                        Text("💣 Tăng Cường Âm Trầm (Bass):").font(.subheadline.bold())
                         Spacer()
                         Text("+\(Int(musicStream.bassAmount))")
                             .font(.subheadline.bold())
