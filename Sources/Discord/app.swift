@@ -16,22 +16,28 @@ import Network
 // ==========================================
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
+    var allowsMultipleSelection: Bool = false
     let onPick: (URL) -> Void
+    var onPickMultiple: (([URL]) -> Void)? = nil
     let onCancel: (() -> Void)?
-    init(contentTypes: [UTType] = [.item], onPick: @escaping (URL) -> Void, onCancel: (() -> Void)? = nil) {
-        self.contentTypes = contentTypes; self.onPick = onPick; self.onCancel = onCancel
+    init(contentTypes: [UTType] = [.item], allowsMultipleSelection: Bool = false, onPick: @escaping (URL) -> Void = { _ in }, onPickMultiple: (([URL]) -> Void)? = nil, onCancel: (() -> Void)? = nil) {
+        self.contentTypes = contentTypes; self.allowsMultipleSelection = allowsMultipleSelection; self.onPick = onPick; self.onPickMultiple = onPickMultiple; self.onCancel = onCancel
     }
     func makeCoordinator() -> Coordinator { Coordinator(self) }
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let p = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
-        p.allowsMultipleSelection = false; p.delegate = context.coordinator; return p
+        p.allowsMultipleSelection = allowsMultipleSelection; p.delegate = context.coordinator; return p
     }
     func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let parent: DocumentPicker
         init(_ p: DocumentPicker) { parent = p }
         func documentPicker(_ c: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let u = urls.first { parent.onPick(u) }
+            if parent.allowsMultipleSelection, let onPickMultiple = parent.onPickMultiple {
+                onPickMultiple(urls)
+            } else if let u = urls.first {
+                parent.onPick(u)
+            }
         }
         func documentPickerWasCancelled(_ c: UIDocumentPickerViewController) { parent.onCancel?() }
     }
@@ -3439,8 +3445,46 @@ struct StatCard: View {
 }
 
 // ==============================================================================
-// MARK: - DISCORD VOICE GATEWAY & TREO ROOM 24/7 (MAKE SUPER VIP)
+// MARK: - DISCORD VOICE GATEWAY & XẢ MIC VIP & TREO ROOM 24/7 (MAKE SUPER VIP)
 // ==============================================================================
+
+// MARK: - HELPER: DNS HOST RESOLUTION & GUILD ID FETCH
+func resolveHostToIPv4(_ host: String) -> String? {
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_DGRAM
+    hints.ai_protocol = IPPROTO_UDP
+
+    var res: UnsafeMutablePointer<addrinfo>?
+    if getaddrinfo(host, nil, &hints, &res) == 0, let first = res {
+        defer { freeaddrinfo(res) }
+        let sockaddrIn = first.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var addrCopy = sockaddrIn.sin_addr
+        var ipBuf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        if inet_ntop(AF_INET, &addrCopy, &ipBuf, socklen_t(INET_ADDRSTRLEN)) != nil {
+            return String(cString: ipBuf)
+        }
+    }
+    return nil
+}
+
+func fetchGuildIdForChannel(token: String, channelId: String) async -> String? {
+    guard let url = URL(string: "https://discord.com/api/v9/channels/\(channelId)") else { return nil }
+    var req = URLRequest(url: url)
+    req.addValue(token, forHTTPHeaderField: "Authorization")
+    req.addValue("application/json", forHTTPHeaderField: "Content-Type")
+    do {
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return json["guild_id"] as? String
+            }
+        }
+    } catch {
+        return nil
+    }
+    return nil
+}
 
 // MARK: - DISCORD VOICE UDP CLIENT & PROTOCOL HANDSHAKE
 final class DiscordVoiceUDPClient {
@@ -3459,13 +3503,23 @@ final class DiscordVoiceUDPClient {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian
-        inet_pton(AF_INET, ip, &addr.sin_addr)
+
+        // Dùng inet_pton hoặc DNS resolve nếu server trả về domain name
+        if inet_pton(AF_INET, ip, &addr.sin_addr) <= 0 {
+            if let resolved = resolveHostToIPv4(ip) {
+                inet_pton(AF_INET, resolved, &addr.sin_addr)
+            } else {
+                close()
+                return false
+            }
+        }
+
         self.serverAddr = addr
         self.isConnected = true
         return true
     }
 
-    /// IP Discovery (RFC / Discord Protocol)
+    /// IP Discovery (Discord Voice UDP Protocol RFC)
     func discoverIP(ssrc: UInt32) -> (ip: String, port: UInt16)? {
         guard sockfd >= 0, var addr = serverAddr else { return nil }
 
@@ -3536,127 +3590,97 @@ final class DiscordVoiceUDPClient {
     }
 }
 
-// MARK: - OPUS AUDIO ENCODER (NATIVE COREAUDIO)
-final class OpusAudioEncoder {
-    private var converter: AudioConverterRef?
-    private let sampleRate: Double = 48000.0
-    private let channels: UInt32 = 2
-    private let framesPerPacket: UInt32 = 960
+// MARK: - NATIVE OPUS AUDIO ENCODER (AVFOUNDATION & COREAUDIO)
+final class NativeOpusEncoder {
+    private var converter: AVAudioConverter?
+    private let inputFormat: AVAudioFormat
+    private let outputFormat: AVAudioFormat
 
     init?() {
-        var inDesc = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
-            mFormatID: kAudioFormatLinearPCM,
-            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 4,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 4,
-            mChannelsPerFrame: channels,
-            mBitsPerChannel: 16,
-            mReserved: 0
-        )
+        // Định dạng PCM đầu vào: 48kHz Stereo Float32
+        guard let inFmt = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48000.0,
+            channels: 2,
+            interleaved: false
+        ) else { return nil }
+        self.inputFormat = inFmt
 
-        var outDesc = AudioStreamBasicDescription(
-            mSampleRate: sampleRate,
+        var opusDesc = AudioStreamBasicDescription(
+            mSampleRate: 48000.0,
             mFormatID: kAudioFormatOpus,
             mFormatFlags: 0,
             mBytesPerPacket: 0,
-            mFramesPerPacket: framesPerPacket,
+            mFramesPerPacket: 960, // 20ms ở 48000Hz = 960 samples
             mBytesPerFrame: 0,
-            mChannelsPerFrame: channels,
+            mChannelsPerFrame: 2,
             mBitsPerChannel: 0,
             mReserved: 0
         )
 
-        let status = AudioConverterNew(&inDesc, &outDesc, &converter)
-        if status != noErr || converter == nil {
+        guard let outFmt = AVAudioFormat(streamDescription: &opusDesc) else {
             return nil
         }
+        self.outputFormat = outFmt
 
-        var bitRate: UInt32 = 64000
-        AudioConverterSetProperty(converter!, kAudioConverterEncodeBitRate, UInt32(MemoryLayout<UInt32>.size), &bitRate)
+        guard let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
+            return nil
+        }
+        conv.bitRate = 64000
+        self.converter = conv
     }
 
-    deinit {
-        if let conv = converter {
-            AudioConverterDispose(conv)
-        }
-    }
+    /// Mã hóa 960 frame Float32 Stereo (20ms) thành 1 gói tin Opus chuẩn RFC 6716
+    func encode(leftChannel: [Float], rightChannel: [Float]) -> Data? {
+        guard let converter = converter else { return nil }
+        guard leftChannel.count >= 960, rightChannel.count >= 960 else { return nil }
 
-    func encode(pcmData: Data) -> Data? {
-        guard let conv = converter else { return nil }
+        guard let pcmBuf = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 960) else { return nil }
+        pcmBuf.frameLength = 960
 
-        final class InputState {
-            var data: Data
-            var bytesConsumed: Int
-            init(data: Data, bytesConsumed: Int) {
-                self.data = data
-                self.bytesConsumed = bytesConsumed
+        if let chData = pcmBuf.floatChannelData {
+            leftChannel.withUnsafeBufferPointer { ptr in
+                chData[0].initialize(from: ptr.baseAddress!, count: 960)
+            }
+            rightChannel.withUnsafeBufferPointer { ptr in
+                chData[1].initialize(from: ptr.baseAddress!, count: 960)
             }
         }
-        let state = InputState(data: pcmData, bytesConsumed: 0)
 
-        var outputBuffer = [UInt8](repeating: 0, count: 1275)
-        var ioOutputDataPacketSize: UInt32 = 1
-        var outBufferList = AudioBufferList(
-            mNumberBuffers: 1,
-            mBuffers: AudioBuffer(
-                mNumberChannels: channels,
-                mDataByteSize: UInt32(outputBuffer.count),
-                mData: &outputBuffer
-            )
-        )
-        var packetDesc = AudioStreamPacketDescription()
+        guard let compBuf = AVAudioCompressedBuffer(
+            format: outputFormat,
+            packetCapacity: 1,
+            maximumPacketSize: 1275
+        ) else { return nil }
 
-        let proc: AudioConverterComplexInputDataProc = { _, ioNumberDataPackets, ioData, _, inUserData in
-            guard let userData = inUserData else { return noErr }
-            let stateObj = Unmanaged<InputState>.fromOpaque(userData).takeUnretainedValue()
-            let remaining = stateObj.data.count - stateObj.bytesConsumed
-            if remaining <= 0 {
-                ioNumberDataPackets.pointee = 0
-                return noErr
+        var error: NSError?
+        var hasSupplied = false
+
+        let status = converter.convert(to: compBuf, error: &error) { _, outStatus in
+            if hasSupplied {
+                outStatus.pointee = .noDataNow
+                return nil
             }
-
-            let toConsume = min(remaining, Int(ioNumberDataPackets.pointee) * 4)
-            ioNumberDataPackets.pointee = UInt32(toConsume / 4)
-
-            stateObj.data.withUnsafeBytes { rawBuf in
-                let base = rawBuf.baseAddress!.advanced(by: stateObj.bytesConsumed)
-                ioData.pointee.mBuffers.mData = UnsafeMutableRawPointer(mutating: base)
-                ioData.pointee.mBuffers.mDataByteSize = UInt32(toConsume)
-                ioData.pointee.mBuffers.mNumberChannels = 2
-            }
-            stateObj.bytesConsumed += toConsume
-            return noErr
+            hasSupplied = true
+            outStatus.pointee = .haveData
+            return pcmBuf
         }
 
-        let retainedState = Unmanaged.passRetained(state)
-        defer { retainedState.release() }
-
-        let status = AudioConverterFillComplexBuffer(
-            conv,
-            proc,
-            retainedState.toOpaque(),
-            &ioOutputDataPacketSize,
-            &outBufferList,
-            &packetDesc
-        )
-
-        if status == noErr && ioOutputDataPacketSize > 0 {
-            let count = Int(outBufferList.mBuffers.mDataByteSize)
-            if count > 0 {
-                return Data(outputBuffer.prefix(count))
-            }
+        if (status == .haveData || status == .inputRanDry || compBuf.byteLength > 0) && compBuf.byteLength > 0 {
+            return Data(bytes: compBuf.data, count: Int(compBuf.byteLength))
         }
         return nil
     }
 }
 
-// MARK: - AUDIO TRACK DECODER (Decodes any audio file into 48kHz stereo PCM)
+// MARK: - AUDIO TRACK DECODER (Giải mã mp3, wav, m4a, flac sang 48kHz Float32 Stereo)
 final class AudioTrackDecoder {
-    var pcmData: Data = Data()
-    var totalFrames: Int = 0
+    var leftSamples: [Float] = []
+    var rightSamples: [Float] = []
     var durationSeconds: Double = 0
+    var totalFrames: Int {
+        return leftSamples.count / 960
+    }
 
     init?(url: URL) {
         guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
@@ -3665,10 +3689,10 @@ final class AudioTrackDecoder {
         durationSeconds = Double(fileLength) / processingFormat.sampleRate
 
         guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatInt16,
-            sampleRate: 48000,
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48000.0,
             channels: 2,
-            interleaved: true
+            interleaved: false
         ) else { return nil }
 
         guard let converter = AVAudioConverter(from: processingFormat, to: targetFormat) else { return nil }
@@ -3677,8 +3701,11 @@ final class AudioTrackDecoder {
         guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: readCapacity),
               let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: readCapacity) else { return nil }
 
-        var allData = Data()
         audioFile.framePosition = 0
+        var allL: [Float] = []
+        var allR: [Float] = []
+        allL.reserveCapacity(Int(fileLength))
+        allR.reserveCapacity(Int(fileLength))
 
         while audioFile.framePosition < fileLength {
             do {
@@ -3701,23 +3728,113 @@ final class AudioTrackDecoder {
                 converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
                 if error != nil { break }
 
-                let bytes = Int(outputBuffer.frameLength) * 4
-                if bytes > 0, let pcmPtr = outputBuffer.int16ChannelData?[0] {
-                    allData.append(Data(bytes: pcmPtr, count: bytes))
+                let count = Int(outputBuffer.frameLength)
+                if count > 0, let ch = outputBuffer.floatChannelData {
+                    allL.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: count))
+                    allR.append(contentsOf: UnsafeBufferPointer(start: ch[1], count: count))
                 }
             } catch {
                 break
             }
         }
 
-        self.pcmData = allData
-        self.totalFrames = allData.count / 3840
+        guard !allL.isEmpty else { return nil }
+        self.leftSamples = allL
+        self.rightSamples = allR
+        self.durationSeconds = Double(allL.count) / 48000.0
     }
 
-    init(pcmData: Data, durationSeconds: Double) {
-        self.pcmData = pcmData
+    init(left: [Float], right: [Float], durationSeconds: Double) {
+        self.leftSamples = left
+        self.rightSamples = right
         self.durationSeconds = durationSeconds
-        self.totalFrames = pcmData.count / 3840
+    }
+}
+
+// MARK: - SPAM AUDIO MODES & PRESETS
+enum SpamAudioFX: String, CaseIterable, Identifiable {
+    case normal = "Bình Thường"
+    case bassBoost = "Bass Boosted"
+    case nightcore = "Nightcore (1.25x)"
+    case slowed = "Slowed Reverb (0.85x)"
+    case earrape = "Earrape Cực Đại"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .normal: return "music.note"
+        case .bassBoost: return "speaker.wave.3.fill"
+        case .nightcore: return "hare.fill"
+        case .slowed: return "tortoise.fill"
+        case .earrape: return "flame.fill"
+        }
+    }
+}
+
+enum MusicPreset: String, CaseIterable, Identifiable {
+    case djVinahouse = "DJ Vinahouse Remix"
+    case bassBoost = "Bass Boosted Trap"
+    case loFi = "Lo-Fi Beats Chill"
+    case trollSiren = "Còi Báo Động Troll"
+    case whiteNoise = "Âm Thanh Ảo / Noise"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .djVinahouse: return "bolt.fill"
+        case .bassBoost: return "speaker.wave.3.fill"
+        case .loFi: return "headphones"
+        case .trollSiren: return "exclamationmark.triangle.fill"
+        case .whiteNoise: return "waveform"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .djVinahouse: return .purple
+        case .bassBoost: return .red
+        case .loFi: return .blue
+        case .trollSiren: return .orange
+        case .whiteNoise: return .teal
+        }
+    }
+}
+
+// MARK: - PLAYLIST ITEM & LOOP MODE
+struct PlaylistItem: Identifiable, Equatable {
+    let id: UUID
+    var title: String
+    var url: URL?
+    var durationSeconds: Double
+    var isPreset: Bool
+    var preset: MusicPreset?
+
+    var durationFormatted: String {
+        guard durationSeconds > 0 else { return "--:--" }
+        let s = Int(durationSeconds)
+        return String(format: "%02d:%02d", s / 60, s % 60)
+    }
+
+    static func == (lhs: PlaylistItem, rhs: PlaylistItem) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
+enum PlaylistLoopMode: String, CaseIterable, Identifiable {
+    case loopAll = "Lặp Danh Sách"
+    case loopOne = "Lặp 1 Bài"
+    case shuffle = "Ngẫu Nhiên"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .loopAll: return "repeat"
+        case .loopOne: return "repeat.1"
+        case .shuffle: return "shuffle"
+        }
     }
 }
 
@@ -3725,7 +3842,7 @@ final class AudioTrackDecoder {
 final class VoiceGatewaySession: Identifiable, ObservableObject {
     let id: UUID
     let token: String
-    let userId: String
+    var userId: String
     let username: String
     let avatarURL: URL?
 
@@ -3796,7 +3913,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
         let session = URLSession(configuration: .default)
         let ws = session.webSocketTask(with: url)
-        // Cố định kích thước tối đa 64MB để tránh lỗi "Message too long" khi tài khoản có nhiều server
+        // 64MB buffer để tránh lỗi "Message too long" khi tài khoản có nhiều server
         ws.maximumMessageSize = 64 * 1024 * 1024
         self.wsTask = ws
         ws.resume()
@@ -3847,24 +3964,30 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         case 0: // Dispatch
             let event = json["t"] as? String
             if event == "READY" {
+                if let d = json["d"] as? [String: Any], let user = d["user"] as? [String: Any], let uid = user["id"] as? String, self.userId.isEmpty {
+                    self.userId = uid
+                }
                 DispatchQueue.main.async { self.isConnected = true }
                 log("Đã kết nối Gateway! Đang vào Voice Channel...")
                 sendVoiceStateUpdate()
             } else if event == "VOICE_STATE_UPDATE" {
                 if let d = json["d"] as? [String: Any],
-                   let uid = d["user_id"] as? String, uid == userId {
+                   let uid = d["user_id"] as? String {
+                    if self.userId.isEmpty { self.userId = uid }
+                    if uid == self.userId {
                     if let sid = d["session_id"] as? String {
                         self.sessionId = sid
                     }
                     if let cid = d["channel_id"] as? String, cid == currentChannelId {
                         DispatchQueue.main.async { self.isJoined = true }
-                        log("Đã tham gia phòng Voice! Đang kết nối máy chủ âm thanh...")
+                        log("Đã vào phòng Voice! Đang kết nối máy chủ âm thanh...")
                         tryConnectVoiceGateway()
                     } else if d["channel_id"] == nil || d["channel_id"] is NSNull {
                         DispatchQueue.main.async {
                             self.isJoined = false
                             self.isVoiceUDPReady = false
                         }
+                    }
                     }
                 }
             } else if event == "VOICE_SERVER_UPDATE" {
@@ -3985,7 +4108,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                     }
                 }
             } catch {
-                // Voice WS kết thúc
+                // Voice WS ended
             }
         }
     }
@@ -4009,10 +4132,10 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                 }
                 let ip = d["ip"] as? String ?? ""
                 let port = d["port"] as? Int ?? 0
-                log("Voice Gateway Ready! SSRC: \(self.ssrc). Đang thiết lập UDP...")
+                log("Voice Gateway Ready! SSRC: \(self.ssrc). Đang kết nối UDP...")
                 startVoiceUDP(ip: ip, port: port)
             }
-        case 4: // Session Description (nhận khóa mã hóa secret_key)
+        case 4: // Session Description
             if let d = json["d"] as? [String: Any] {
                 let mode = d["mode"] as? String ?? ""
                 if let keyArr = d["secret_key"] as? [Int] {
@@ -4050,6 +4173,10 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                 extPort = Int(disc.port)
                 self.log("Phát hiện UDP IP ngoại vi: \(extIP):\(extPort)")
             } else {
+                // Nếu discovery timeout, giải mã hostname sang dotted IPv4
+                if let resolved = resolveHostToIPv4(ip) {
+                    extIP = resolved
+                }
                 self.log("Dùng IP trực tiếp: \(extIP):\(extPort)")
             }
 
@@ -4171,7 +4298,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
             rtpTimestamp = rtpTimestamp &+ 960
             rtpNonceCounter = rtpNonceCounter &+ 1
         } catch {
-            // Lỗi mã hóa
+            // Error
         }
     }
 
@@ -4220,12 +4347,15 @@ struct VoiceLogEntry: Identifiable {
     let message: String
 }
 
-// MARK: - VOICE ROOM MANAGER
+// ==============================================================================
+// MARK: - VOICE ROOM MANAGER (TREO ROOM 24/7)
+// ==============================================================================
 @MainActor
 final class VoiceRoomManager: ObservableObject {
     static let shared = VoiceRoomManager()
 
     @Published var isRunning = false
+    @Published var targetChannelId = ""
     @Published var selectedGuild: Guild? = nil
     @Published var selectedChannel: Channel? = nil
     @Published var voiceChannels: [Channel] = []
@@ -4255,6 +4385,7 @@ final class VoiceRoomManager: ObservableObject {
             self.voiceChannels = vcs
             if let first = vcs.first {
                 self.selectedChannel = first
+                self.targetChannelId = first.id
             }
         } catch {
             addLog("Lỗi lấy danh sách Voice: \(error.localizedDescription)")
@@ -4262,7 +4393,7 @@ final class VoiceRoomManager: ObservableObject {
         isLoadingChannels = false
     }
 
-    func startTreo(guild: Guild, channel: Channel, tokens: [TokenInfo]) {
+    func startTreo(guildId: String, channelId: String, channelName: String, tokens: [TokenInfo]) {
         guard !tokens.isEmpty else {
             addLog("Không có token nào được chọn")
             return
@@ -4271,16 +4402,14 @@ final class VoiceRoomManager: ObservableObject {
         stopTreo()
 
         isRunning = true
-        selectedGuild = guild
-        selectedChannel = channel
         elapsedSeconds = 0
         logs = []
 
-        addLog("Bắt đầu treo room [\(channel.displayName)] - Server [\(guild.name)]")
+        addLog("Bắt đầu treo room [\(channelName)] (\(tokens.count) tài khoản)")
 
         BackgroundManager.shared.start()
         NowPlayingHelper.shared.update(
-            title: "Treo Voice: \(channel.displayName)",
+            title: "Treo Voice: \(channelName)",
             detail: "\(tokens.count) tài khoản đang online"
         )
 
@@ -4291,8 +4420,8 @@ final class VoiceRoomManager: ObservableObject {
                 self?.addLog(msg)
             }
             session.start(
-                guildId: guild.id,
-                channelId: channel.id,
+                guildId: guildId,
+                channelId: channelId,
                 mute: selfMute,
                 deaf: selfDeaf,
                 video: selfVideo
@@ -4308,7 +4437,7 @@ final class VoiceRoomManager: ObservableObject {
             if self.elapsedSeconds % 10 == 0 {
                 let joinedCount = self.sessions.filter { $0.isJoined }.count
                 NowPlayingHelper.shared.update(
-                    title: "Treo Voice: \(channel.displayName)",
+                    title: "Treo Voice: \(channelName)",
                     detail: "\(joinedCount)/\(tokens.count) token | \(self.formatDuration(self.elapsedSeconds))"
                 )
             }
@@ -4342,7 +4471,6 @@ final class VoiceRoomManager: ObservableObject {
         }
     }
 
-    /// Phát trực tiếp gói tin Opus âm thanh vào tất cả tài khoản đang trong kênh Voice
     func broadcastOpusPacket(_ opusData: Data) {
         for s in sessions {
             s.sendOpusPacket(opusData)
@@ -4367,120 +4495,231 @@ final class VoiceRoomManager: ObservableObject {
 }
 
 // ==============================================================================
-// MARK: - MUSIC STREAM & XẢ NHẠC VIP (RTP UDP VOICE STREAMING)
+// MARK: - MUSIC STREAM MANAGER (XẢ MIC / XẢ ROOM VIP - HOẠT ĐỘNG ĐỘC LẬP)
 // ==============================================================================
-
-enum MusicPreset: String, CaseIterable, Identifiable {
-    case djVinahouse = "DJ Vinahouse Remix"
-    case bassBoost = "Bass Boosted 8D Trap"
-    case loFi = "Lo-Fi Beats Chill"
-    case trollSiren = "Còi Báo Động Troll"
-    case whiteNoise = "Âm Thanh Ảo / Noise"
-
-    var id: String { rawValue }
-
-    var icon: String {
-        switch self {
-        case .djVinahouse: return "bolt.fill"
-        case .bassBoost: return "speaker.wave.3.fill"
-        case .loFi: return "headphones"
-        case .trollSiren: return "exclamationmark.triangle.fill"
-        case .whiteNoise: return "waveform"
-        }
-    }
-
-    var color: Color {
-        switch self {
-        case .djVinahouse: return .purple
-        case .bassBoost: return .red
-        case .loFi: return .blue
-        case .trollSiren: return .orange
-        case .whiteNoise: return .teal
-        }
-    }
-}
-
 @MainActor
 final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
     static let shared = MusicStreamManager()
 
     @Published var isPlaying = false
+    @Published var statusText = "Chưa hoạt động"
+    @Published var logs: [VoiceRoomLog] = []
+
+    // Target Selection (Độc lập: chọn token chạy và chọn phòng xả)
+    @Published var selectedToken: TokenInfo? = nil
+    @Published var customToken: String = ""
+    @Published var targetChannelId: String = ""
+    @Published var selectedGuild: Guild? = nil
+    @Published var selectedChannel: Channel? = nil
+
+    // Multi-track Playlist (Nhiều bài nhạc, có thể bấm chọn bài)
+    @Published var playlist: [PlaylistItem] = []
+    @Published var currentTrackIndex: Int = 0
+
+    // Currently playing info
     @Published var currentSongTitle = "Chưa chọn file nhạc"
-    @Published var isLooping = true
-    @Published var volume: Float = 1.0 {
-        didSet {
-            audioPlayer?.volume = volume
-        }
-    }
+    @Published var audioFileURL: URL? = nil
     @Published var currentTime: Double = 0
     @Published var duration: Double = 0
     @Published var visualizerLevels: [CGFloat] = [0.2, 0.4, 0.7, 0.3, 0.9, 0.5, 0.8, 0.4]
-    @Published var speakingSyncEnabled = true
-    @Published var playLocalSpeaker = true // Phát kèm loa ngoài điện thoại để nghe thử
 
-    private var audioPlayer: AVAudioPlayer?
+    // Cấu hình âm thanh & Chế độ nhạc VIP
+    @Published var volume: Float = 1.0 { // 0.0 to 2.0 (0% -> 200%)
+        didSet {
+            localPlayer?.volume = min(1.0, volume)
+        }
+    }
+    @Published var playbackSpeed: Float = 1.0 // 0.75, 1.0, 1.25, 1.5, 2.0
+    @Published var bassBoost: Bool = false
+    @Published var audioFX: SpamAudioFX = .normal
+    @Published var loopMode: PlaylistLoopMode = .loopAll
+    @Published var playLocalSpeaker: Bool = false // Mặc định TẮT: Âm thanh xả thẳng vào Discord Voice
+
+    // Engine & Streaming
+    private var activeVoiceSession: VoiceGatewaySession?
     private var streamTask: Task<Void, Never>?
-    private var currentDecoder: AudioTrackDecoder?
-    private let opusEncoder = OpusAudioEncoder()
+    var currentDecoder: AudioTrackDecoder?
+    private let opusEncoder = NativeOpusEncoder()
     private var streamFrameIndex = 0
+    private var localPlayer: AVAudioPlayer?
+
+    // DSP State for Bass Boost
+    private var bassStateL: Float = 0
+    private var bassStateR: Float = 0
 
     private override init() {
         super.init()
     }
 
-    func loadAudio(url: URL) {
-        stop()
+    var currentTrack: PlaylistItem? {
+        guard currentTrackIndex >= 0 && currentTrackIndex < playlist.count else { return nil }
+        return playlist[currentTrackIndex]
+    }
 
-        currentSongTitle = "Đang nạp file: \(url.deletingPathExtension().lastPathComponent)..."
+    func addLog(_ msg: String) {
+        let log = VoiceRoomLog(id: UUID(), timestamp: Date(), message: msg)
+        logs.append(log)
+        if logs.count > 100 { logs.removeFirst(logs.count - 100) }
+    }
 
+    // MARK: - PLAYLIST MANAGEMENT
+    func addFiles(urls: [URL]) {
+        for url in urls {
+            let title = url.deletingPathExtension().lastPathComponent
+            let asset = AVURLAsset(url: url)
+            let dur = CMTimeGetSeconds(asset.duration)
+            let durationSeconds = (dur.isNaN || dur.isInfinite) ? 0 : dur
+            let item = PlaylistItem(
+                id: UUID(),
+                title: title,
+                url: url,
+                durationSeconds: durationSeconds,
+                isPreset: false,
+                preset: nil
+            )
+            if !playlist.contains(where: { $0.url?.path == url.path }) {
+                playlist.append(item)
+            }
+        }
+        addLog("Đã thêm \(urls.count) bài nhạc vào danh sách")
+        statusText = "Đã có \(playlist.count) bài trong danh sách"
+
+        if currentDecoder == nil && !playlist.isEmpty {
+            selectTrack(index: 0)
+        }
+    }
+
+    func addPreset(_ preset: MusicPreset) {
+        let item = PlaylistItem(
+            id: UUID(),
+            title: preset.rawValue,
+            url: nil,
+            durationSeconds: 6.0,
+            isPreset: true,
+            preset: preset
+        )
+        playlist.append(item)
+        addLog("Đã thêm nhạc mẫu: \(preset.rawValue)")
+        if currentDecoder == nil {
+            selectTrack(index: playlist.count - 1)
+        }
+    }
+
+    func addAllPresets() {
+        for p in MusicPreset.allCases {
+            addPreset(p)
+        }
+    }
+
+    func removeTrack(id: UUID) {
+        if let idx = playlist.firstIndex(where: { $0.id == id }) {
+            playlist.remove(at: idx)
+            if playlist.isEmpty {
+                stopSpam()
+                currentDecoder = nil
+                currentSongTitle = "Chưa chọn file nhạc"
+                audioFileURL = nil
+                duration = 0
+                currentTime = 0
+                statusText = "Danh sách nhạc trống"
+            } else if currentTrackIndex >= playlist.count {
+                selectTrack(index: playlist.count - 1)
+            } else if currentTrackIndex == idx {
+                selectTrack(index: currentTrackIndex)
+            }
+        }
+    }
+
+    func clearPlaylist() {
+        stopSpam()
+        playlist.removeAll()
+        currentDecoder = nil
+        currentSongTitle = "Chưa chọn file nhạc"
+        audioFileURL = nil
+        duration = 0
+        currentTime = 0
+        statusText = "Đã xóa toàn bộ danh sách nhạc"
+        addLog("Đã xóa sạch danh sách bài hát")
+    }
+
+    func selectTrack(index: Int) {
+        guard index >= 0 && index < playlist.count else { return }
+        currentTrackIndex = index
+        let item = playlist[index]
+        currentSongTitle = item.title
+        audioFileURL = item.url
+        streamFrameIndex = 0
+        currentTime = 0
+
+        if item.isPreset, let preset = item.preset {
+            generatePresetSamples(preset)
+        } else if let url = item.url {
+            loadDecoder(url: url)
+        }
+    }
+
+    func playNext() {
+        guard !playlist.isEmpty else { return }
+        switch loopMode {
+        case .loopOne:
+            streamFrameIndex = 0
+            currentTime = 0
+            localPlayer?.currentTime = 0
+        case .loopAll:
+            let next = (currentTrackIndex + 1) % playlist.count
+            selectTrack(index: next)
+        case .shuffle:
+            if playlist.count > 1 {
+                var r = Int.random(in: 0..<playlist.count)
+                if r == currentTrackIndex { r = (r + 1) % playlist.count }
+                selectTrack(index: r)
+            } else {
+                streamFrameIndex = 0
+                currentTime = 0
+            }
+        }
+    }
+
+    func playPrevious() {
+        guard !playlist.isEmpty else { return }
+        let prev = (currentTrackIndex - 1 + playlist.count) % playlist.count
+        selectTrack(index: prev)
+    }
+
+    // MARK: - AUDIO DECODING
+    private func loadDecoder(url: URL) {
+        statusText = "Đang nạp: \(url.deletingPathExtension().lastPathComponent)..."
         Task.detached { [weak self] in
             guard let self = self else { return }
             if let decoder = AudioTrackDecoder(url: url) {
                 await MainActor.run {
                     self.currentDecoder = decoder
-                    self.currentSongTitle = url.deletingPathExtension().lastPathComponent
                     self.duration = decoder.durationSeconds
                     self.currentTime = 0
-
+                    self.statusText = self.isPlaying ? "🔊 Đang xả: \(self.currentSongTitle)" : "Đã sẵn sàng: \(self.currentSongTitle)"
                     if self.playLocalSpeaker {
                         self.setupLocalPlayer(url: url)
+                        if self.isPlaying {
+                            self.localPlayer?.play()
+                        }
                     }
-
-                    self.play()
                 }
             } else {
                 await MainActor.run {
-                    self.currentSongTitle = "Lỗi định dạng nhạc không hỗ trợ"
+                    self.statusText = "❌ Lỗi định dạng file nhạc không hỗ trợ"
                 }
             }
         }
     }
 
-    private func setupLocalPlayer(url: URL) {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true)
-
-            audioPlayer = try AVAudioPlayer(contentsOf: url)
-            audioPlayer?.delegate = self
-            audioPlayer?.numberOfLoops = isLooping ? -1 : 0
-            audioPlayer?.volume = volume
-            audioPlayer?.prepareToPlay()
-        } catch {
-            print("Local player error: \(error)")
-        }
-    }
-
-    func playPreset(_ preset: MusicPreset) {
-        stop()
-        currentSongTitle = preset.rawValue
-
+    private func generatePresetSamples(_ preset: MusicPreset) {
         let sampleRate: Double = 48000.0
         let toneDuration: Double = 6.0
         let frameCount = Int(sampleRate * toneDuration)
-        var pcmData = Data()
-        pcmData.reserveCapacity(frameCount * 4)
+        var left = [Float]()
+        var right = [Float]()
+        left.reserveCapacity(frameCount)
+        right.reserveCapacity(frameCount)
 
         for i in 0..<frameCount {
             let t = Double(i) / sampleRate
@@ -4501,80 +4740,180 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             case .whiteNoise:
                 sample = Float.random(in: -0.2...0.2)
             }
-
-            // Convert Float (-1.0 to 1.0) to Int16 stereo
             let clamped = max(-1.0, min(1.0, sample))
-            let int16Val = Int16(clamped * 32767.0)
-            let u16Val = UInt16(bitPattern: int16Val)
-            let b0 = UInt8(u16Val & 0xFF)
-            let b1 = UInt8((u16Val >> 8) & 0xFF)
-            // Left channel
-            pcmData.append(b0); pcmData.append(b1)
-            // Right channel
-            pcmData.append(b0); pcmData.append(b1)
+            left.append(clamped)
+            right.append(clamped)
         }
 
-        let decoder = AudioTrackDecoder(pcmData: pcmData, durationSeconds: toneDuration)
+        let decoder = AudioTrackDecoder(left: left, right: right, durationSeconds: toneDuration)
         self.currentDecoder = decoder
         self.duration = toneDuration
         self.currentTime = 0
-
-        play()
+        self.statusText = self.isPlaying ? "🔊 Đang xả: \(preset.rawValue)" : "Đã chọn: \(preset.rawValue)"
     }
 
-    func play() {
-        guard let decoder = currentDecoder, !decoder.pcmData.isEmpty else { return }
+    private func setupLocalPlayer(url: URL) {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true)
+
+            localPlayer = try AVAudioPlayer(contentsOf: url)
+            localPlayer?.delegate = self
+            localPlayer?.numberOfLoops = (loopMode == .loopOne) ? -1 : 0
+            localPlayer?.volume = min(1.0, volume)
+            localPlayer?.prepareToPlay()
+        } catch {
+            // Local player optional
+        }
+    }
+
+    // MARK: - BẮT ĐẦU XẢ ROOM (ĐỘC LẬP HOÀN TOÀN)
+    func startSpam(app: AppState) {
+        guard let decoder = currentDecoder, !decoder.leftSamples.isEmpty else {
+            statusText = "❌ Chưa có nhạc trong danh sách (Bấm 'Thêm nhiều file')"
+            return
+        }
+
+        let tokenToUse: TokenInfo?
+        if let st = selectedToken {
+            tokenToUse = st
+        } else if !customToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let t = customToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            tokenToUse = TokenInfo(id: UUID(), token: t, userId: "", username: "Custom Token", avatar: nil)
+        } else if let at = app.activeToken {
+            tokenToUse = at
+        } else if let f = app.tokens.first {
+            tokenToUse = f
+        } else {
+            tokenToUse = nil
+        }
+
+        guard let token = tokenToUse else {
+            statusText = "❌ Chưa chọn Token nào để xả mic"
+            return
+        }
+
+        let inputCID = targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let channelId = !inputCID.isEmpty ? inputCID : (selectedChannel?.id ?? "")
+        guard !channelId.isEmpty else {
+            statusText = "❌ Vui lòng nhập Channel ID hoặc chọn kênh voice"
+            return
+        }
+
+        stopSpam()
 
         isPlaying = true
-        BackgroundManager.shared.start()
-
-        if speakingSyncEnabled {
-            VoiceRoomManager.shared.setSpeaking(true)
-        }
-
-        if playLocalSpeaker {
-            audioPlayer?.numberOfLoops = isLooping ? -1 : 0
-            audioPlayer?.play()
-        }
-
-        NowPlayingHelper.shared.update(
-            title: "Xả Nhạc: \(currentSongTitle)",
-            detail: "Đang xả vào Voice Discord"
-        )
-
-        startStreamingTask()
-    }
-
-    func pause() {
-        isPlaying = false
-        streamTask?.cancel()
-        streamTask = nil
-        audioPlayer?.pause()
-
-        if speakingSyncEnabled {
-            VoiceRoomManager.shared.setSpeaking(false)
-        }
-    }
-
-    func stop() {
-        isPlaying = false
-        streamTask?.cancel()
-        streamTask = nil
+        statusText = "Đang đăng nhập Gateway..."
         streamFrameIndex = 0
         currentTime = 0
+        addLog("Khởi động xả room với token [\(token.username)] vào phòng [\(channelId)]")
 
-        audioPlayer?.stop()
-        audioPlayer = nil
+        BackgroundManager.shared.start()
+        NowPlayingHelper.shared.update(
+            title: "Xả Mic: \(currentSongTitle)",
+            detail: "Đang phát vào kênh [\(channelId)]"
+        )
 
-        // Gửi 5 gói tin tĩnh lặng để ngắt sạch âm thanh phía Discord Voice
-        let silencePacket = Data([0xF8, 0xFF, 0xFE])
-        for _ in 0..<5 {
-            VoiceRoomManager.shared.broadcastOpusPacket(silencePacket)
+        Task { [weak self] in
+            guard let self = self else { return }
+
+            var guildId = self.selectedGuild?.id
+            if guildId == nil || guildId!.isEmpty {
+                await MainActor.run { self.statusText = "Đang tìm Server của kênh \(channelId)..." }
+                guildId = await fetchGuildIdForChannel(token: token.token, channelId: channelId)
+            }
+
+            guard let gid = guildId, !gid.isEmpty else {
+                await MainActor.run {
+                    self.statusText = "❌ Không tìm thấy Server (Kiểm tra Channel ID hoặc quyền token)"
+                    self.addLog("❌ Không tìm thấy Guild ID cho kênh \(channelId)")
+                    self.isPlaying = false
+                }
+                return
+            }
+
+            await MainActor.run {
+                self.statusText = "Đang vào Voice Channel & kết nối UDP..."
+            }
+
+            let session = VoiceGatewaySession(tokenInfo: token)
+            await MainActor.run {
+                self.activeVoiceSession = session
+            }
+
+            session.onLog = { [weak self] msg in
+                DispatchQueue.main.async {
+                    self?.addLog(msg)
+                    if self?.isPlaying == true {
+                        self?.statusText = msg
+                    }
+                }
+            }
+
+            session.start(
+                guildId: gid,
+                channelId: channelId,
+                mute: false,
+                deaf: false,
+                video: false
+            )
+
+            // Đợi kết nối Voice UDP hoàn tất
+            var waited = 0
+            while !session.isVoiceUDPReady && waited < 50 && self.isPlaying {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                waited += 1
+            }
+
+            guard session.isVoiceUDPReady && self.isPlaying else {
+                await MainActor.run {
+                    if self.isPlaying {
+                        self.statusText = "❌ Kết nối Voice thất bại (Hết thời gian chờ UDP)"
+                        self.addLog("❌ Hết thời gian chờ kết nối UDP Voice")
+                        self.stopSpam()
+                    }
+                }
+                return
+            }
+
+            await MainActor.run {
+                self.statusText = "🔊 Đang xả: \(self.currentSongTitle)"
+                self.addLog("🔊 Kênh UDP sẵn sàng! Đang phát nhạc trực tiếp vào Discord.")
+                session.setSpeaking(true)
+
+                if self.playLocalSpeaker, let url = self.audioFileURL {
+                    self.setupLocalPlayer(url: url)
+                    self.localPlayer?.play()
+                }
+
+                self.startStreamingTask(session: session)
+            }
         }
+    }
 
-        if speakingSyncEnabled {
-            VoiceRoomManager.shared.setSpeaking(false)
+    func stopSpam() {
+        isPlaying = false
+        streamTask?.cancel()
+        streamTask = nil
+
+        if let session = activeVoiceSession {
+            let silence = Data([0xF8, 0xFF, 0xFE])
+            for _ in 0..<5 {
+                session.sendOpusPacket(silence)
+            }
+            session.setSpeaking(false)
+            session.stop()
         }
+        activeVoiceSession = nil
+
+        localPlayer?.stop()
+        localPlayer = nil
+
+        statusText = "Đã dừng xả room"
+        addLog("Đã ngắt kết nối và dừng xả room")
+        currentTime = 0
+        streamFrameIndex = 0
     }
 
     func seek(to seconds: Double) {
@@ -4582,70 +4921,119 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         let fraction = min(1.0, max(0.0, seconds / decoder.durationSeconds))
         streamFrameIndex = Int(Double(decoder.totalFrames) * fraction)
         currentTime = seconds
-        audioPlayer?.currentTime = seconds
+        localPlayer?.currentTime = seconds
     }
 
-    func toggleLoop() {
-        isLooping.toggle()
-        audioPlayer?.numberOfLoops = isLooping ? -1 : 0
-    }
-
-    /// Vòng lặp truyền âm thanh UDP RTP 20ms trực tiếp vào Voice Channel Discord
-    private func startStreamingTask() {
+    // MARK: - STREAMING ENGINE 20MS OPUS UDP
+    private func startStreamingTask(session: VoiceGatewaySession) {
         streamTask?.cancel()
-        guard let decoder = currentDecoder, !decoder.pcmData.isEmpty else { return }
-
-        let pcm = decoder.pcmData
-        let total = decoder.totalFrames
-        let bytesPerChunk = 3840 // 960 samples * 2 channels * 2 bytes = 20ms
 
         streamTask = Task.detached { [weak self] in
             guard let self = self else { return }
+            var speedAccumulator: Float = 0
 
             while !Task.isCancelled {
                 let start = DispatchTime.now()
 
                 var curIdx = 0
+                var currentVol: Float = 1.0
+                var currentFX: SpamAudioFX = .normal
+                var isBass: Bool = false
+                var currentSpeed: Float = 1.0
+                var decoderRef: AudioTrackDecoder?
+
                 await MainActor.run {
                     curIdx = self.streamFrameIndex
+                    currentVol = self.volume
+                    currentFX = self.audioFX
+                    isBass = self.bassBoost
+                    currentSpeed = self.playbackSpeed
+                    decoderRef = self.currentDecoder
                 }
 
-                let offset = curIdx * bytesPerChunk
-                if offset + bytesPerChunk > pcm.count {
-                    var shouldLoop = false
+                guard let decoder = decoderRef, !decoder.leftSamples.isEmpty else {
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    continue
+                }
+
+                let leftSamples = decoder.leftSamples
+                let rightSamples = decoder.rightSamples
+                let totalSamples = leftSamples.count
+
+                let startSample = curIdx * 960
+                let endSample = startSample + 960
+
+                if endSample > totalSamples {
                     await MainActor.run {
-                        shouldLoop = self.isLooping
+                        self.playNext()
                     }
-                    if shouldLoop {
+                    try? await Task.sleep(nanoseconds: 20_000_000)
+                    continue
+                }
+
+                var chunkL = Array(leftSamples[startSample..<endSample])
+                var chunkR = Array(rightSamples[startSample..<endSample])
+
+                // 1. Áp dụng âm lượng (0% -> 200% với soft clamping)
+                if currentVol != 1.0 {
+                    for i in 0..<960 {
+                        chunkL[i] = max(-1.0, min(1.0, chunkL[i] * currentVol))
+                        chunkR[i] = max(-1.0, min(1.0, chunkR[i] * currentVol))
+                    }
+                }
+
+                // 2. Áp dụng Bass Boost
+                if isBass || currentFX == .bassBoost {
+                    for i in 0..<960 {
                         await MainActor.run {
-                            self.streamFrameIndex = 0
-                            self.audioPlayer?.currentTime = 0
+                            self.bassStateL += 0.28 * (chunkL[i] - self.bassStateL)
+                            chunkL[i] = max(-1.0, min(1.0, chunkL[i] + self.bassStateL * 1.8))
+                            self.bassStateR += 0.28 * (chunkR[i] - self.bassStateR)
+                            chunkR[i] = max(-1.0, min(1.0, chunkR[i] + self.bassStateR * 1.8))
                         }
-                        continue
-                    } else {
-                        await MainActor.run { self.stop() }
-                        break
                     }
                 }
 
-                let chunk = pcm.subdata(in: offset..<(offset + bytesPerChunk))
-                if let opus = self.opusEncoder?.encode(pcmData: chunk) {
-                    await MainActor.run {
-                        VoiceRoomManager.shared.broadcastOpusPacket(opus)
+                // 3. Áp dụng hiệu ứng âm thanh (SpamAudioFX)
+                switch currentFX {
+                case .normal, .bassBoost:
+                    break
+                case .earrape:
+                    for i in 0..<960 {
+                        chunkL[i] = tanh(chunkL[i] * 4.0)
+                        chunkR[i] = tanh(chunkR[i] * 4.0)
                     }
+                case .nightcore:
+                    break
+                case .slowed:
+                    break
                 }
 
+                // 4. Mã hóa Opus và truyền UDP RTP vào phòng Voice Discord
+                if let opus = self.opusEncoder?.encode(leftChannel: chunkL, rightChannel: chunkR) {
+                    session.sendOpusPacket(opus)
+                }
+
+                // 5. Cập nhật tiến độ & tốc độ phát
                 await MainActor.run {
-                    self.streamFrameIndex += 1
+                    var effSpeed = currentSpeed
+                    if currentFX == .nightcore { effSpeed = 1.25 }
+                    else if currentFX == .slowed { effSpeed = 0.85 }
+
+                    speedAccumulator += effSpeed
+                    let advance = max(1, Int(speedAccumulator))
+                    speedAccumulator -= Float(advance)
+                    self.streamFrameIndex += advance
+
                     if self.streamFrameIndex % 5 == 0 {
                         self.currentTime = Double(self.streamFrameIndex * 960) / 48000.0
-                        self.visualizerLevels = (0..<8).map { _ in CGFloat.random(in: 0.15...0.95) }
+                        self.visualizerLevels = (0..<8).map { _ in CGFloat.random(in: 0.2...0.95) }
                     }
                 }
 
-                // Căn chuẩn chu kỳ 20ms cho mỗi gói tin Voice
+                // Chu kỳ 20ms cho mỗi gói tin Opus
                 let elapsedNanos = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
-                let targetNanos: UInt64 = 20_000_000 // 20ms
+                let targetNanos: UInt64 = 20_000_000
                 if targetNanos > elapsedNanos {
                     try? await Task.sleep(nanoseconds: targetNanos - elapsedNanos)
                 }
@@ -4656,39 +5044,35 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor [weak self] in
             guard let self = self else { return }
-            if !self.isLooping {
-                self.stop()
-            }
+            self.playNext()
         }
     }
 }
 
 // ==============================================================================
-// MARK: - VOICE ROOM & MUSIC TAB VIEW (UI)
+// MARK: - VOICE ROOM & XẢ MIC TAB VIEW (GIAO DIỆN CHÍNH)
 // ==============================================================================
-
 struct VoiceRoomTabView: View {
     @EnvironmentObject var app: AppState
     @EnvironmentObject var voiceRoom: VoiceRoomManager
     @EnvironmentObject var musicStream: MusicStreamManager
 
-    @State private var mode: TabMode = .treoRoom
+    @State private var mode: TabMode = .xaMic
     enum TabMode: String, CaseIterable, Identifiable {
+        case xaMic = "Xả Nhạc (Spam Voice)"
         case treoRoom = "Treo Room 24/7"
-        case xaNhac = "Xả Nhạc Voice"
         var id: String { rawValue }
     }
 
     @State private var showGuildPicker = false
     @State private var showDocumentPicker = false
-    @State private var diskRotation: Double = 0
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 Picker("Chế độ", selection: $mode) {
-                    Label("Treo Room", systemImage: "waveform").tag(TabMode.treoRoom)
-                    Label("Xả Nhạc Voice", systemImage: "music.note").tag(TabMode.xaNhac)
+                    Label("Xả Nhạc (Spam Voice)", systemImage: "music.mic").tag(TabMode.xaMic)
+                    Label("Treo Room 24/7", systemImage: "waveform").tag(TabMode.treoRoom)
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
@@ -4696,32 +5080,571 @@ struct VoiceRoomTabView: View {
 
                 ScrollView {
                     VStack(spacing: 16) {
-                        if mode == .treoRoom {
-                            treoRoomSection
+                        if mode == .xaMic {
+                            xaMicSection
                         } else {
-                            xaNhacSection
+                            treoRoomSection
                         }
                     }
                     .padding()
                 }
             }
-            .navigationTitle(mode == .treoRoom ? "Treo Voice 24/7" : "Xả Nhạc Vào Voice VIP")
+            .navigationTitle(mode == .xaMic ? "Xả Nhạc Vào Voice VIP" : "Treo Voice 24/7")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showGuildPicker) {
-                VoiceGuildPickerSheet()
+                VoiceGuildPickerSheet(isForSpam: mode == .xaMic)
             }
             .sheet(isPresented: $showDocumentPicker) {
-                DocumentPicker(contentTypes: [.audio]) { url in
-                    musicStream.loadAudio(url: url)
+                DocumentPicker(contentTypes: [.audio], allowsMultipleSelection: true) { _ in } onPickMultiple: { urls in
+                    musicStream.addFiles(urls: urls)
                 }
             }
         }
     }
 
-    // MARK: - TREO ROOM SECTION
+    // MARK: - XẢ NHẠC SECTION (HOÀN TOÀN ĐỘC LẬP Y HỆT BẢN PC)
+    private var xaMicSection: some View {
+        VStack(spacing: 14) {
+            // Card 1: Trạng Thái Hoạt Động & Now Playing Controller
+            VStack(spacing: 12) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(musicStream.isPlaying ? Color.green : (musicStream.statusText.contains("Đang") ? Color.yellow : Color.secondary))
+                        .frame(width: 10, height: 10)
+                    Text(musicStream.statusText)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(musicStream.isPlaying ? .green : .primary)
+                        .lineLimit(1)
+                    Spacer()
+                    if musicStream.isPlaying {
+                        Text("Trực tiếp Opus")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.15))
+                            .foregroundStyle(.green)
+                            .cornerRadius(4)
+                    }
+                }
+
+                // Waveform Visualizer
+                if musicStream.isPlaying {
+                    HStack(spacing: 6) {
+                        ForEach(0..<8, id: \.self) { i in
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(LinearGradient(colors: [.indigo, .purple, .pink], startPoint: .bottom, endPoint: .top))
+                                .frame(width: 8, height: max(10, musicStream.visualizerLevels[i] * 38))
+                                .animation(.spring(response: 0.15, dampingFraction: 0.5), value: musicStream.visualizerLevels[i])
+                        }
+                    }
+                    .frame(height: 40)
+                }
+
+                // Tên bài hát đang phát
+                HStack(spacing: 8) {
+                    Image(systemName: "music.note")
+                        .foregroundStyle(.indigo)
+                    Text(musicStream.currentSongTitle)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Spacer()
+                }
+
+                // Progress Bar
+                if musicStream.duration > 0 {
+                    VStack(spacing: 2) {
+                        Slider(
+                            value: Binding(
+                                get: { musicStream.currentTime },
+                                set: { val in musicStream.seek(to: val) }
+                            ),
+                            in: 0...max(musicStream.duration, 1.0)
+                        )
+                        .tint(.indigo)
+
+                        HStack {
+                            Text(formatSeconds(musicStream.currentTime)).font(.caption2).foregroundStyle(.secondary)
+                            Spacer()
+                            Text(formatSeconds(musicStream.duration)).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                // Playback Control Buttons (Previous, Play/Stop, Next, Loop)
+                HStack(spacing: 16) {
+                    Button {
+                        musicStream.playPrevious()
+                    } label: {
+                        Image(systemName: "backward.fill")
+                            .font(.title3)
+                            .foregroundColor(.primary)
+                    }
+                    .disabled(musicStream.playlist.isEmpty)
+
+                    Button {
+                        if musicStream.isPlaying {
+                            musicStream.stopSpam()
+                        } else {
+                            musicStream.startSpam(app: app)
+                        }
+                    } label: {
+                        Image(systemName: musicStream.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 42))
+                            .foregroundColor(musicStream.isPlaying ? .red : .green)
+                    }
+                    .disabled(musicStream.playlist.isEmpty && musicStream.currentDecoder == nil)
+
+                    Button {
+                        musicStream.playNext()
+                    } label: {
+                        Image(systemName: "forward.fill")
+                            .font(.title3)
+                            .foregroundColor(.primary)
+                    }
+                    .disabled(musicStream.playlist.isEmpty)
+
+                    Spacer()
+
+                    // Loop mode badge button
+                    Button {
+                        switch musicStream.loopMode {
+                        case .loopAll: musicStream.loopMode = .loopOne
+                        case .loopOne: musicStream.loopMode = .shuffle
+                        case .shuffle: musicStream.loopMode = .loopAll
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: musicStream.loopMode.icon)
+                            Text(musicStream.loopMode.rawValue).font(.caption2.bold())
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.indigo.opacity(0.15))
+                        .foregroundColor(.indigo)
+                        .cornerRadius(8)
+                    }
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Card 2: Chọn Token & Kênh Voice Xả Nhạc (ĐỘC LẬP)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "person.crop.circle.badge.checkmark").foregroundStyle(.indigo)
+                    Text("Tài Khoản & Kênh Xả Room").font(.headline)
+                    Spacer()
+                    Text("Độc lập").font(.caption2.bold()).foregroundStyle(.secondary)
+                }
+
+                // Chọn Token chạy
+                HStack {
+                    Text("Token chạy:").font(.subheadline.bold())
+                    Spacer()
+                    Menu {
+                        ForEach(app.tokens) { t in
+                            Button {
+                                musicStream.selectedToken = t
+                            } label: {
+                                HStack {
+                                    Text(t.username)
+                                    if (musicStream.selectedToken?.id ?? app.activeToken?.id) == t.id {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            let currentTok = musicStream.selectedToken ?? app.activeToken ?? app.tokens.first
+                            if let t = currentTok {
+                                if let url = t.avatarURL {
+                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                    placeholder: { Circle().fill(.gray) }
+                                    .frame(width: 22, height: 22).clipShape(Circle())
+                                }
+                                Text(t.username).font(.subheadline.bold())
+                            } else {
+                                Text("Chưa có token").font(.subheadline).foregroundStyle(.secondary)
+                            }
+                            Image(systemName: "chevron.up.chevron.down").font(.caption)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                    }
+                }
+
+                Divider()
+
+                // Chọn / Nhập Channel ID
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Kênh Thoại (Channel ID):").font(.subheadline.bold())
+                    HStack(spacing: 8) {
+                        TextField("Dán Channel ID vào đây...", text: $musicStream.targetChannelId)
+                            .textFieldStyle(.plain)
+                            .padding(10)
+                            .background(Color(UIColor.tertiarySystemBackground))
+                            .cornerRadius(8)
+                            .keyboardType(.numberPad)
+
+                        Button {
+                            showGuildPicker = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "speaker.wave.2.fill")
+                                Text("Chọn Kênh")
+                            }
+                            .font(.caption.bold())
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(Color.indigo)
+                            .cornerRadius(8)
+                        }
+                    }
+
+                    if let g = musicStream.selectedGuild, let c = musicStream.selectedChannel {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption2)
+                            Text("\(g.name) > \(c.displayName)").font(.caption.bold()).foregroundStyle(.green)
+                        }
+                    }
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Card 3: Danh Sách Nhạc (Playlist) - Nhập nhiều nhạc & Bấm chọn bài
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Image(systemName: "music.note.list").foregroundStyle(.indigo)
+                    Text("Danh Sách Phát (\(musicStream.playlist.count) bài)").font(.headline)
+                    Spacer()
+
+                    Button {
+                        showDocumentPicker = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder.badge.plus")
+                            Text("➕ Thêm file")
+                        }
+                        .font(.caption.bold())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.indigo.opacity(0.15))
+                        .cornerRadius(8)
+                    }
+                }
+
+                // Actions row: Add presets, Clear
+                HStack(spacing: 8) {
+                    Button {
+                        musicStream.addAllPresets()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "star.fill").font(.caption2)
+                            Text("Thêm Mẫu VIP").font(.caption.bold())
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.orange.opacity(0.15))
+                        .foregroundColor(.orange)
+                        .cornerRadius(6)
+                    }
+
+                    if !musicStream.playlist.isEmpty {
+                        Button {
+                            musicStream.clearPlaylist()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash").font(.caption2)
+                                Text("Xóa Hết").font(.caption.bold())
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(Color.red.opacity(0.15))
+                            .foregroundColor(.red)
+                            .cornerRadius(6)
+                        }
+                    }
+                }
+
+                // Playlist Items
+                if musicStream.playlist.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "music.note")
+                            .font(.system(size: 32))
+                            .foregroundStyle(.secondary)
+                        Text("Chưa có bài hát nào trong danh sách.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("Bấm '➕ Thêm file' để chọn nhiều file .mp3, .m4a, .wav cùng lúc hoặc 'Thêm Mẫu VIP'.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .background(Color(UIColor.tertiarySystemBackground))
+                    .cornerRadius(10)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 6) {
+                            ForEach(Array(musicStream.playlist.enumerated()), id: \.element.id) { index, item in
+                                let isCurrent = (musicStream.currentTrackIndex == index)
+                                Button {
+                                    musicStream.selectTrack(index: index)
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        // Playing indicator or index
+                                        if isCurrent && musicStream.isPlaying {
+                                            Image(systemName: "speaker.wave.3.fill")
+                                                .font(.caption.bold())
+                                                .foregroundColor(.green)
+                                        } else {
+                                            Text("#\(index + 1)")
+                                                .font(.caption.bold())
+                                                .foregroundColor(isCurrent ? .indigo : .secondary)
+                                                .frame(width: 24, alignment: .leading)
+                                        }
+
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(item.title)
+                                                .font(.subheadline.bold())
+                                                .foregroundColor(isCurrent ? .indigo : .primary)
+                                                .lineLimit(1)
+                                            HStack(spacing: 6) {
+                                                if item.isPreset {
+                                                    Text("Nhạc VIP")
+                                                        .font(.caption2.bold())
+                                                        .foregroundColor(.orange)
+                                                }
+                                                Text(item.durationFormatted)
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                        }
+
+                                        Spacer()
+
+                                        if isCurrent {
+                                            Text("Đang chọn")
+                                                .font(.caption2.bold())
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.indigo.opacity(0.15))
+                                                .foregroundColor(.indigo)
+                                                .cornerRadius(4)
+                                        }
+
+                                        Button {
+                                            musicStream.removeTrack(id: item.id)
+                                        } label: {
+                                            Image(systemName: "trash")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                                .padding(6)
+                                        }
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 8)
+                                    .background(isCurrent ? Color.indigo.opacity(0.1) : Color(UIColor.tertiarySystemBackground))
+                                    .cornerRadius(8)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke(isCurrent ? Color.indigo.opacity(0.4) : Color.clear, lineWidth: 1)
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 220)
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Card 4: Cấu Hình Âm Lượng & Chế Độ Nhạc VIP
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Image(systemName: "slider.horizontal.3").foregroundStyle(.indigo)
+                    Text("Cấu Hình Âm Thanh").font(.headline)
+                    Spacer()
+                    Text("Âm lượng: \(Int(musicStream.volume * 100))%")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(musicStream.volume > 1.0 ? .pink : .indigo)
+                }
+
+                // Volume Slider (0% - 200%)
+                HStack(spacing: 10) {
+                    Image(systemName: "speaker.wave.1.fill").foregroundStyle(.secondary)
+                    Slider(value: $musicStream.volume, in: 0.0...2.0, step: 0.05)
+                        .tint(musicStream.volume > 1.0 ? .pink : .indigo)
+                    Image(systemName: "speaker.wave.3.fill").foregroundStyle(.indigo)
+                }
+
+                // Nút nhanh âm lượng
+                HStack(spacing: 8) {
+                    ForEach([0.5, 1.0, 1.5, 2.0], id: \.self) { v in
+                        Button {
+                            musicStream.volume = Float(v)
+                        } label: {
+                            Text(v == 2.0 ? "200% MAX" : "\(Int(v * 100))%")
+                                .font(.caption.bold())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(musicStream.volume == Float(v) ? Color.indigo : Color(UIColor.tertiarySystemBackground))
+                                .foregroundColor(musicStream.volume == Float(v) ? .white : .primary)
+                                .cornerRadius(6)
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Bass Boost Toggle Switch
+                Toggle(isOn: $musicStream.bassBoost) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Tăng Cường Bass (Bass Boost)", systemImage: "bolt.fill")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.orange)
+                        Text("Khuếch đại âm trầm đập cực mạnh trong phòng Discord Voice.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+
+                Divider()
+
+                // Chế độ hiệu ứng của nhạc
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Chế độ của nhạc:").font(.subheadline)
+                    Picker("Chế độ", selection: $musicStream.audioFX) {
+                        ForEach(SpamAudioFX.allCases) { fx in
+                            Text(fx.rawValue).tag(fx)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                // Tốc độ phát (Speed)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Tốc độ phát:").font(.subheadline)
+                    Picker("Tốc độ", selection: $musicStream.playbackSpeed) {
+                        Text("0.75x").tag(Float(0.75))
+                        Text("1.0x Chuẩn").tag(Float(1.0))
+                        Text("1.25x").tag(Float(1.25))
+                        Text("1.5x").tag(Float(1.5))
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                Divider()
+
+                // Chế độ lặp
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Chế độ lặp danh sách:").font(.subheadline)
+                    Picker("Chế độ lặp", selection: $musicStream.loopMode) {
+                        ForEach(PlaylistLoopMode.allCases) { lm in
+                            Label(lm.rawValue, systemImage: lm.icon).tag(lm)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                Divider()
+
+                // Nghe loa ngoài điện thoại (Monitor)
+                Toggle(isOn: $musicStream.playLocalSpeaker) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Nghe loa ngoài điện thoại (Monitor)", systemImage: "speaker.badge.waveform.fill")
+                            .font(.subheadline)
+                        Text("Mặc định TẮT: Âm thanh xả trực tiếp vào Discord Voice, không phát ra điện thoại.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding()
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(15)
+
+            // Nút Bắt Đầu / Dừng Xả Mic Lớn
+            if musicStream.isPlaying {
+                Button {
+                    musicStream.stopSpam()
+                } label: {
+                    HStack {
+                        Image(systemName: "stop.fill")
+                        Text("■  DỪNG XẢ ROOM")
+                    }
+                    .font(.headline.bold())
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.red)
+                    .cornerRadius(12)
+                }
+            } else {
+                Button {
+                    musicStream.startSpam(app: app)
+                } label: {
+                    HStack {
+                        Image(systemName: "play.fill")
+                        Text("▶  BẮT ĐẦU XẢ ROOM")
+                    }
+                    .font(.headline.bold())
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(
+                        (musicStream.currentDecoder != nil)
+                        ? LinearGradient(colors: [.green, Color(red: 0.1, green: 0.7, blue: 0.3)], startPoint: .leading, endPoint: .trailing)
+                        : LinearGradient(colors: [.gray], startPoint: .leading, endPoint: .trailing)
+                    )
+                    .cornerRadius(12)
+                    .shadow(color: .green.opacity(0.3), radius: 8, y: 4)
+                }
+                .disabled(musicStream.currentDecoder == nil)
+            }
+
+            // Nhật Ký Xả Room
+            if !musicStream.logs.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: "terminal.fill").foregroundStyle(.indigo)
+                        Text("Nhật Ký Xả Room").font(.headline)
+                        Spacer()
+                        Button("Xóa") { musicStream.logs.removeAll() }
+                            .font(.caption)
+                    }
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            ForEach(musicStream.logs) { log in
+                                Text("[\(formatTime(log.timestamp))] \(log.message)")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(height: 100)
+                }
+                .padding()
+                .background(Color(UIColor.secondarySystemBackground))
+                .cornerRadius(15)
+            }
+        }
+    }
+
+    // MARK: - TREO ROOM SECTION (HANG VOICE 24/7)
     private var treoRoomSection: some View {
         VStack(spacing: 14) {
-            // Server & Channel Card
+            // Card: Server & Channel
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Image(systemName: "server.rack").foregroundStyle(.indigo)
@@ -4730,7 +5653,7 @@ struct VoiceRoomTabView: View {
                     Button {
                         showGuildPicker = true
                     } label: {
-                        Text(voiceRoom.selectedGuild == nil ? "Chọn Server" : "Đổi Server")
+                        Text(voiceRoom.selectedGuild == nil ? "Chọn Kênh" : "Đổi Kênh")
                             .font(.caption.bold())
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
@@ -4739,68 +5662,32 @@ struct VoiceRoomTabView: View {
                     }
                 }
 
-                if let g = voiceRoom.selectedGuild {
-                    HStack(spacing: 12) {
-                        if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
-                           let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
-                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                            placeholder: { Circle().fill(.gray) }
-                            .frame(width: 40, height: 40).clipShape(Circle())
-                        } else {
-                            Circle().fill(.gray.opacity(0.3)).frame(width: 40, height: 40)
-                                .overlay(Text(String(g.name.prefix(1))).font(.headline))
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(g.name).font(.subheadline.bold())
-                            if voiceRoom.isLoadingChannels {
-                                Text("Đang tải danh sách Voice...").font(.caption).foregroundStyle(.secondary)
-                            } else if let c = voiceRoom.selectedChannel {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundStyle(.green)
-                                    Text(c.displayName).font(.caption.bold()).foregroundStyle(.green)
-                                }
-                            } else {
-                                Text("Chưa có kênh Voice nào").font(.caption).foregroundStyle(.orange)
-                            }
-                        }
+                // Channel ID manual entry
+                HStack(spacing: 8) {
+                    TextField("Dán Channel ID treo...", text: $voiceRoom.targetChannelId)
+                        .textFieldStyle(.plain)
+                        .padding(10)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                        .keyboardType(.numberPad)
+                }
+
+                if let g = voiceRoom.selectedGuild, let c = voiceRoom.selectedChannel {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text("\(g.name) > \(c.displayName)").font(.subheadline.bold()).foregroundStyle(.green)
                     }
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(UIColor.tertiarySystemBackground))
-                    .cornerRadius(10)
-
-                    if !voiceRoom.voiceChannels.isEmpty {
-                        Menu {
-                            ForEach(voiceRoom.voiceChannels) { ch in
-                                Button {
-                                    voiceRoom.selectedChannel = ch
-                                } label: {
-                                    Label(ch.displayName, systemImage: "speaker.wave.2")
-                                }
-                            }
-                        } label: {
-                            HStack {
-                                Image(systemName: "chevron.up.chevron.down").font(.caption)
-                                Text("Chọn Voice: \(voiceRoom.selectedChannel?.displayName ?? "Chọn...")")
-                                    .font(.subheadline.bold())
-                                Spacer()
-                                Image(systemName: "speaker.wave.2.circle.fill").foregroundStyle(.indigo)
-                            }
-                            .padding(10)
-                            .background(Color(UIColor.secondarySystemBackground))
-                            .cornerRadius(8)
-                        }
-                    }
-                } else {
-                    Text("Vui lòng chọn Server và Voice Channel để bắt đầu treo.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    .cornerRadius(8)
                 }
             }
             .padding()
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
 
-            // Mode & Toggles Card
+            // Card: Cấu hình treo
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Image(systemName: "slider.horizontal.3").foregroundStyle(.indigo)
@@ -4808,7 +5695,7 @@ struct VoiceRoomTabView: View {
                 }
 
                 Picker("Chế độ Token", selection: $voiceRoom.multiTokenMode) {
-                    Text("Treo Cả Dàn Token (\(activeTokens.count))").tag(true)
+                    Text("Treo Cả Dàn (\(activeTokens.count))").tag(true)
                     Text("Chỉ 1 Token Chính").tag(false)
                 }
                 .pickerStyle(.segmented)
@@ -4853,7 +5740,7 @@ struct VoiceRoomTabView: View {
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
 
-            // Main Action Button
+            // Nút Bắt Đầu / Dừng Treo
             if voiceRoom.isRunning {
                 VStack(spacing: 12) {
                     HStack {
@@ -4900,9 +5787,23 @@ struct VoiceRoomTabView: View {
                 .cornerRadius(15)
             } else {
                 Button {
-                    guard let g = voiceRoom.selectedGuild, let c = voiceRoom.selectedChannel else { return }
+                    let channelId = !voiceRoom.targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? voiceRoom.targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines)
+                        : (voiceRoom.selectedChannel?.id ?? "")
+                    guard !channelId.isEmpty else { return }
+
                     let tokensToUse = voiceRoom.multiTokenMode ? activeTokens : singleTokenList
-                    voiceRoom.startTreo(guild: g, channel: c, tokens: tokensToUse)
+                    guard !tokensToUse.isEmpty else { return }
+
+                    Task {
+                        var gid = voiceRoom.selectedGuild?.id
+                        if gid == nil, let tok = tokensToUse.first?.token {
+                            gid = await fetchGuildIdForChannel(token: tok, channelId: channelId)
+                        }
+                        guard let finalGid = gid else { return }
+                        let cName = voiceRoom.selectedChannel?.displayName ?? channelId
+                        voiceRoom.startTreo(guildId: finalGid, channelId: channelId, channelName: cName, tokens: tokensToUse)
+                    }
                 } label: {
                     HStack {
                         Image(systemName: "play.fill")
@@ -4913,17 +5814,17 @@ struct VoiceRoomTabView: View {
                     .frame(maxWidth: .infinity)
                     .padding()
                     .background(
-                        (voiceRoom.selectedGuild != nil && voiceRoom.selectedChannel != nil && !activeTokens.isEmpty)
+                        (!voiceRoom.targetChannelId.isEmpty || voiceRoom.selectedChannel != nil) && !activeTokens.isEmpty
                         ? LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing)
                         : LinearGradient(colors: [.gray], startPoint: .leading, endPoint: .trailing)
                     )
                     .cornerRadius(12)
                     .shadow(color: .indigo.opacity(0.3), radius: 8, y: 4)
                 }
-                .disabled(voiceRoom.selectedGuild == nil || voiceRoom.selectedChannel == nil || activeTokens.isEmpty)
+                .disabled((voiceRoom.targetChannelId.isEmpty && voiceRoom.selectedChannel == nil) || activeTokens.isEmpty)
             }
 
-            // Sessions List Card
+            // Tài khoản trong Voice
             if !voiceRoom.sessions.isEmpty {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -4949,12 +5850,6 @@ struct VoiceRoomTabView: View {
 
                             Spacer()
 
-                            if s.isSpeaking {
-                                Text("SPEAKING").font(.caption2.bold()).foregroundStyle(.green)
-                                    .padding(.horizontal, 6).padding(.vertical, 2)
-                                    .background(Color.green.opacity(0.15)).cornerRadius(4)
-                            }
-
                             Circle()
                                 .fill(s.isVoiceUDPReady ? Color.green : (s.isJoined ? Color.green.opacity(0.7) : (s.isConnected ? Color.yellow : Color.red)))
                                 .frame(width: 10, height: 10)
@@ -4969,7 +5864,7 @@ struct VoiceRoomTabView: View {
                 .cornerRadius(15)
             }
 
-            // Logs Card
+            // Nhật Ký Kết Nối
             if !voiceRoom.logs.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -4995,215 +5890,6 @@ struct VoiceRoomTabView: View {
                 .background(Color(UIColor.secondarySystemBackground))
                 .cornerRadius(15)
             }
-        }
-    }
-
-    // MARK: - XẢ NHẠC SECTION
-    private var xaNhacSection: some View {
-        VStack(spacing: 16) {
-            // Voice Connection Status Banner
-            HStack(spacing: 10) {
-                Circle()
-                    .fill(voiceRoom.isRunning ? Color.green : Color.orange)
-                    .frame(width: 10, height: 10)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(voiceRoom.isRunning ? "ĐÃ KẾT NỐI KÊNH THOẠI DISCORD" : "CHƯA VÀO KÊNH THOẠI")
-                        .font(.caption.bold())
-                        .foregroundStyle(voiceRoom.isRunning ? .green : .orange)
-                    Text(voiceRoom.isRunning ? "Âm thanh sẽ được truyền trực tiếp (RTP UDP) vào Voice" : "Vui lòng bấm 'Treo Room' vào kênh trước khi xả nhạc")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(10)
-            .background(Color(UIColor.secondarySystemBackground))
-            .cornerRadius(10)
-
-            // Player Card
-            VStack(spacing: 16) {
-                // Vinyl / Album Artwork with Equalizer
-                ZStack {
-                    Circle()
-                        .fill(LinearGradient(colors: [.black, Color(UIColor.darkGray)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                        .frame(width: 140, height: 140)
-                        .shadow(color: .black.opacity(0.3), radius: 10)
-                        .rotationEffect(.degrees(diskRotation))
-
-                    Circle()
-                        .stroke(Color.gray.opacity(0.3), lineWidth: 2)
-                        .frame(width: 110, height: 110)
-
-                    Circle()
-                        .fill(Color.indigo)
-                        .frame(width: 44, height: 44)
-                        .overlay(Image(systemName: "music.note").foregroundColor(.white))
-                }
-                .padding(.top, 8)
-                .onChange(of: musicStream.isPlaying) { playing in
-                    if playing {
-                        withAnimation(.linear(duration: 4.0).repeatForever(autoreverses: false)) {
-                            diskRotation = 360
-                        }
-                    } else {
-                        withAnimation(.default) { diskRotation = 0 }
-                    }
-                }
-
-                // Song Title & Duration
-                VStack(spacing: 4) {
-                    Text(musicStream.currentSongTitle)
-                        .font(.headline.bold())
-                        .lineLimit(1)
-                        .multilineTextAlignment(.center)
-                    Text(musicStream.isPlaying ? "🔊 ĐANG XẢ VÀO KÊNH THOẠI DISCORD" : "Tạm dừng")
-                        .font(.caption.bold())
-                        .foregroundStyle(musicStream.isPlaying ? .green : .secondary)
-                }
-
-                // Visualizer Equalizer
-                HStack(spacing: 6) {
-                    ForEach(0..<8, id: \.self) { i in
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .bottom, endPoint: .top))
-                            .frame(width: 8, height: musicStream.isPlaying ? max(10, musicStream.visualizerLevels[i] * 40) : 6)
-                            .animation(.spring(response: 0.15, dampingFraction: 0.5), value: musicStream.visualizerLevels[i])
-                    }
-                }
-                .frame(height: 45)
-
-                // Timeline Scrubber
-                if musicStream.duration > 0 {
-                    VStack(spacing: 4) {
-                        Slider(
-                            value: Binding(
-                                get: { musicStream.currentTime },
-                                set: { val in musicStream.seek(to: val) }
-                            ),
-                            in: 0...max(musicStream.duration, 1.0)
-                        )
-                        .tint(.indigo)
-
-                        HStack {
-                            Text(formatSeconds(musicStream.currentTime)).font(.caption2).foregroundStyle(.secondary)
-                            Spacer()
-                            Text(formatSeconds(musicStream.duration)).font(.caption2).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                // Controls: Loop, Play/Pause, Stop
-                HStack(spacing: 30) {
-                    Button {
-                        musicStream.toggleLoop()
-                    } label: {
-                        Image(systemName: musicStream.isLooping ? "repeat.1" : "repeat")
-                            .font(.title3)
-                            .foregroundStyle(musicStream.isLooping ? .indigo : .secondary)
-                    }
-
-                    Button {
-                        if musicStream.isPlaying {
-                            musicStream.pause()
-                        } else {
-                            musicStream.play()
-                        }
-                    } label: {
-                        Circle()
-                            .fill(LinearGradient(colors: [.indigo, .purple], startPoint: .topLeading, endPoint: .bottomTrailing))
-                            .frame(width: 60, height: 60)
-                            .overlay(
-                                Image(systemName: musicStream.isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.title2.bold())
-                                    .foregroundColor(.white)
-                            )
-                            .shadow(color: .indigo.opacity(0.3), radius: 6)
-                    }
-
-                    Button {
-                        musicStream.stop()
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.title3)
-                            .foregroundStyle(.red)
-                    }
-                }
-
-                Divider()
-
-                // Settings: Monitor on phone & Speaking Ring Sync
-                VStack(spacing: 10) {
-                    Toggle(isOn: $musicStream.playLocalSpeaker) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Phát loa ngoài điện thoại (Monitor)").font(.subheadline.bold())
-                            Text("Bật để nghe cùng lúc trên máy, tắt để chỉ phát ngầm vào Discord")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-                    }
-                    .tint(.indigo)
-
-                    Toggle(isOn: $musicStream.speakingSyncEnabled) {
-                        Text("Vòng xanh Discord (Speaking State)").font(.subheadline)
-                    }
-                    .tint(.green)
-                }
-            }
-            .padding()
-            .background(Color(UIColor.secondarySystemBackground))
-            .cornerRadius(15)
-
-            // Pick Custom Audio File
-            Button {
-                showDocumentPicker = true
-            } label: {
-                HStack {
-                    Image(systemName: "folder.badge.plus")
-                    Text("CHỌN FILE NHẠC TỪ IPHONE (FILES)")
-                }
-                .font(.subheadline.bold())
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding()
-                .background(Color.indigo)
-                .cornerRadius(12)
-            }
-
-            // Presets Soundboard Card
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Image(systemName: "sparkles").foregroundStyle(.indigo)
-                    Text("Kho Nhạc Mẫu VIP (Xả Vào Voice)").font(.headline)
-                }
-
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                    ForEach(MusicPreset.allCases) { preset in
-                        Button {
-                            musicStream.playPreset(preset)
-                        } label: {
-                            VStack(spacing: 8) {
-                                Image(systemName: preset.icon)
-                                    .font(.title2)
-                                    .foregroundStyle(preset.color)
-                                Text(preset.rawValue)
-                                    .font(.caption.bold())
-                                    .foregroundStyle(.primary)
-                                    .multilineTextAlignment(.center)
-                                    .lineLimit(2)
-                            }
-                            .padding(12)
-                            .frame(maxWidth: .infinity)
-                            .background(preset.color.opacity(0.1))
-                            .cornerRadius(10)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(preset.color.opacity(0.2), lineWidth: 1)
-                            )
-                        }
-                    }
-                }
-            }
-            .padding()
-            .background(Color(UIColor.secondarySystemBackground))
-            .cornerRadius(15)
         }
     }
 
@@ -5236,13 +5922,18 @@ struct VoiceRoomTabView: View {
     }
 }
 
-// MARK: - VOICE GUILD PICKER SHEET
+// MARK: - VOICE GUILD & CHANNEL PICKER SHEET
 struct VoiceGuildPickerSheet: View {
+    var isForSpam: Bool = false
     @EnvironmentObject var app: AppState
     @EnvironmentObject var voiceRoom: VoiceRoomManager
+    @EnvironmentObject var musicStream: MusicStreamManager
     @Environment(\.dismiss) var dismiss
 
     @State private var search = ""
+    @State private var selectedGuild: Guild? = nil
+    @State private var channels: [Channel] = []
+    @State private var isLoading = false
 
     var filteredGuilds: [Guild] {
         if search.isEmpty { return app.multiGuilds }
@@ -5251,38 +5942,101 @@ struct VoiceGuildPickerSheet: View {
 
     var body: some View {
         NavigationStack {
-            List(filteredGuilds) { g in
-                Button {
-                    guard let tok = (app.activeToken ?? app.tokens.first)?.token else { return }
-                    Task {
-                        await voiceRoom.loadVoiceChannels(guild: g, token: tok)
-                        dismiss()
-                    }
-                } label: {
-                    HStack(spacing: 12) {
-                        if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
-                           let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
-                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                            placeholder: { Circle().fill(.gray) }
-                            .frame(width: 36, height: 36).clipShape(Circle())
+            Group {
+                if let g = selectedGuild {
+                    // Danh sách kênh Voice trong Server
+                    List {
+                        if isLoading {
+                            HStack {
+                                Spacer()
+                                ProgressView("Đang tải danh sách Voice...")
+                                Spacer()
+                            }
+                        } else if channels.isEmpty {
+                            Text("Không tìm thấy kênh Voice nào trong Server này")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
                         } else {
-                            Circle().fill(.gray.opacity(0.3)).frame(width: 36, height: 36)
-                                .overlay(Text(String(g.name.prefix(1))).font(.subheadline.bold()))
+                            ForEach(channels) { ch in
+                                Button {
+                                    if isForSpam {
+                                        musicStream.selectedGuild = g
+                                        musicStream.selectedChannel = ch
+                                        musicStream.targetChannelId = ch.id
+                                    } else {
+                                        voiceRoom.selectedGuild = g
+                                        voiceRoom.selectedChannel = ch
+                                        voiceRoom.targetChannelId = ch.id
+                                    }
+                                    dismiss()
+                                } label: {
+                                    HStack {
+                                        Image(systemName: "speaker.wave.2.fill").foregroundColor(.indigo)
+                                        Text(ch.displayName).font(.subheadline.bold()).foregroundColor(.primary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                                    }
+                                }
+                            }
                         }
-                        Text(g.name).font(.subheadline.bold()).foregroundStyle(.primary)
-                        Spacer()
-                        if voiceRoom.selectedGuild?.id == g.id {
-                            Image(systemName: "checkmark").foregroundColor(.indigo).bold()
+                    }
+                    .navigationTitle(g.name)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Đổi Server") { selectedGuild = nil; channels = [] }
+                        }
+                    }
+                } else {
+                    // Danh sách Server
+                    List(filteredGuilds) { g in
+                        Button {
+                            selectedGuild = g
+                            loadChannels(for: g)
+                        } label: {
+                            HStack(spacing: 12) {
+                                if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
+                                   let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
+                                    AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                    placeholder: { Circle().fill(.gray) }
+                                    .frame(width: 36, height: 36).clipShape(Circle())
+                                } else {
+                                    Circle().fill(.gray.opacity(0.3)).frame(width: 36, height: 36)
+                                        .overlay(Text(String(g.name.prefix(1))).font(.subheadline.bold()))
+                                }
+                                Text(g.name).font(.subheadline.bold()).foregroundStyle(.primary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .searchable(text: $search, prompt: "Tìm kiếm Server...")
+                    .navigationTitle("Chọn Server")
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Đóng") { dismiss() }
                         }
                     }
                 }
             }
-            .searchable(text: $search, prompt: "Tìm kiếm Server...")
-            .navigationTitle("Chọn Server Voice")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Đóng") { dismiss() }
+        }
+    }
+
+    private func loadChannels(for g: Guild) {
+        guard let tok = (musicStream.selectedToken ?? app.activeToken ?? app.tokens.first)?.token else { return }
+        isLoading = true
+        Task {
+            do {
+                let all = try await UserNukeClient(token: tok).getChannels(g.id)
+                let vcs = all.filter { $0.type == 2 || $0.type == 13 }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
+                await MainActor.run {
+                    self.channels = vcs
+                    self.isLoading = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.channels = []
+                    self.isLoading = false
                 }
             }
         }
