@@ -11,6 +11,7 @@ extern "C" {
 
 typedef struct DaveSessionHandle DaveSessionHandle;
 typedef struct DaveOpusEncoderHandle DaveOpusEncoderHandle;
+typedef struct DaveWebRtcHandle DaveWebRtcHandle;
 
 typedef struct {
     uint8_t *ptr;
@@ -85,6 +86,17 @@ DaveByteBuffer dave_opus_encoder_encode_float(
     const float *right,
     size_t frame_size
 );
+
+/* Pure-Rust WebRTC Transport (str0m + dimpl DTLS-SRTP + ICE + RTCP SR/NACK/RTX/PLI) */
+DaveWebRtcHandle *dave_webrtc_new(uint32_t audio_ssrc, uint32_t video_ssrc, uint32_t rtx_ssrc);
+void dave_webrtc_free(DaveWebRtcHandle *handle);
+DaveByteBuffer dave_webrtc_get_offer_sdp(const DaveWebRtcHandle *handle);
+bool dave_webrtc_set_discord_answer(DaveWebRtcHandle *handle, const uint8_t *sdp_utf8, size_t sdp_len);
+bool dave_webrtc_is_connected(const DaveWebRtcHandle *handle);
+bool dave_webrtc_take_keyframe_request(const DaveWebRtcHandle *handle);
+uint64_t dave_webrtc_tx_video_packets(const DaveWebRtcHandle *handle);
+bool dave_webrtc_send_opus(DaveWebRtcHandle *handle, const uint8_t *opus_data, size_t opus_len);
+bool dave_webrtc_send_h264(DaveWebRtcHandle *handle, const uint8_t *annexb_data, size_t annexb_len, double frametime_ms);
 
 #ifdef __cplusplus
 }

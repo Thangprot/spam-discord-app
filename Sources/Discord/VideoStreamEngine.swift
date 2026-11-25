@@ -775,7 +775,123 @@ final class HardwareH264Encoder {
 }
 
 // ==============================================================================
-// MARK: - DISCORD GO-LIVE STREAM MEDIA SESSION (STREAM CONNECTION + DAVE E2EE)
+// MARK: - NATIVE RUST WEBRTC TRANSPORT (str0m: ICE + DTLS-SRTP + RTCP NACK/RTX/PLI)
+// ==============================================================================
+
+final class DiscordWebRtcClient {
+    private let lock = NSLock()
+    private var handle: OpaquePointer?
+
+    static func discordWebRtcCodecs() -> [[String: Any]] {
+        [
+            [
+                "name": "opus",
+                "type": "audio",
+                "priority": 1000,
+                "payload_type": 120
+            ],
+            [
+                "name": "H264",
+                "type": "video",
+                "priority": 1000,
+                "payload_type": 101,
+                "rtx_payload_type": 102,
+                "encode": true,
+                "decode": true
+            ]
+        ]
+    }
+
+    init?(audioSsrc: UInt32, videoSsrc: UInt32, rtxSsrc: UInt32) {
+        guard let h = dave_webrtc_new(audioSsrc, videoSsrc, rtxSsrc) else {
+            return nil
+        }
+        self.handle = h
+    }
+
+    deinit {
+        close()
+    }
+
+    func close() {
+        lock.lock()
+        let h = handle
+        handle = nil
+        lock.unlock()
+        if let h = h {
+            dave_webrtc_free(h)
+        }
+    }
+
+    var offerSdp: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return nil }
+        let buf = dave_webrtc_get_offer_sdp(h)
+        defer { dave_buffer_free(buf) }
+        guard let ptr = buf.ptr, buf.len > 0 else { return nil }
+        return String(bytes: UnsafeBufferPointer(start: ptr, count: buf.len), encoding: .utf8)
+    }
+
+    func setDiscordAnswer(_ sdp: String) -> Bool {
+        guard let data = sdp.data(using: .utf8), !data.isEmpty else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return false }
+        return data.withUnsafeBytes { raw in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return dave_webrtc_set_discord_answer(h, ptr, data.count)
+        }
+    }
+
+    var isConnected: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return false }
+        return dave_webrtc_is_connected(h)
+    }
+
+    func takeKeyframeRequest() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return false }
+        return dave_webrtc_take_keyframe_request(h)
+    }
+
+    var txVideoPackets: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return 0 }
+        return dave_webrtc_tx_video_packets(h)
+    }
+
+    @discardableResult
+    func sendOpus(_ opusData: Data) -> Bool {
+        guard !opusData.isEmpty else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return false }
+        return opusData.withUnsafeBytes { raw in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return dave_webrtc_send_opus(h, ptr, opusData.count)
+        }
+    }
+
+    @discardableResult
+    func sendH264(_ annexB: Data, frametimeMs: Double) -> Bool {
+        guard !annexB.isEmpty else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle else { return false }
+        return annexB.withUnsafeBytes { raw in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return dave_webrtc_send_h264(h, ptr, annexB.count, frametimeMs)
+        }
+    }
+}
+
+// ==============================================================================
+// MARK: - DISCORD GO-LIVE STREAM MEDIA SESSION (WEBRTC DTLS-SRTP + DAVE E2EE)
 // ==============================================================================
 
 final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
@@ -791,24 +907,16 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
     private var urlSession: URLSession?
     private var listenTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
-    private var udpKeepAliveTask: Task<Void, Never>?
+    private var webrtcMonitorTask: Task<Void, Never>?
 
-    private let udpClient = DiscordVoiceUDPClient()
-    private let videoPacketizer = DiscordRtpVideoPacketizer()
-    private let transportNonce = TransportNonceBox()
-    private let packetLock = NSLock()
-
+    private var webrtcClient: DiscordWebRtcClient?
     private var audioSsrc: Int = 0
     private var videoSsrc: Int = 0
     private var rtxSsrc: Int = 0
-    private var secretKey: Data?
-    private var encryptionMode: String = "aead_aes256_gcm_rtpsize"
     private var voiceSeq: Int = -1
     private var daveSession: DaveE2EESession?
-
-    private var rtpAudioSeq: UInt16 = UInt16.random(in: 0...65535)
-    private var rtpAudioTs: UInt32 = UInt32.random(in: 0...4_000_000)
-    private var udpKeepAliveCounter: UInt32 = 0
+    private var negotiatedVideoCodec: String = "H264"
+    private var negotiatedDaveVer: Int = 0
 
     private var hasSentIdentify = false
     private var hasSentSelectProtocol = false
@@ -859,6 +967,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         }
 
         isStopped = false
+        isReady = false
         hasSentIdentify = false
         hasSentSelectProtocol = false
         hasLoggedDaveReady = false
@@ -866,7 +975,10 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         hasLoggedDaveVidErr = false
         hasLoggedWaitingDave = false
         voiceSeq = -1
-        transportNonce.reset()
+        webrtcMonitorTask?.cancel()
+        webrtcMonitorTask = nil
+        webrtcClient?.close()
+        webrtcClient = nil
 
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
@@ -878,7 +990,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         ws.maximumMessageSize = 32 * 1024 * 1024
         self.wsTask = ws
         ws.resume()
-        log("Bắt tay Stream Gateway v8: \(vUrl.absoluteString)")
+        log("Bắt tay Stream Gateway v8 (WebRTC): \(vUrl.absoluteString)")
 
         listenTask = Task { [weak self] in
             guard let self = self else { return }
@@ -949,44 +1061,24 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                     self.videoSsrc = self.audioSsrc + 1
                     self.rtxSsrc = self.audioSsrc + 2
                 }
-                self.videoPacketizer.configure(ssrc: UInt32(truncatingIfNeeded: self.videoSsrc))
 
-                let ip = d["ip"] as? String ?? ""
-                let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
-                let modes = d["modes"] as? [String] ?? []
-                if modes.contains("aead_aes256_gcm_rtpsize") {
-                    self.encryptionMode = "aead_aes256_gcm_rtpsize"
-                } else if modes.contains("aead_xchacha20_poly1305_rtpsize") {
-                    self.encryptionMode = "aead_xchacha20_poly1305_rtpsize"
-                } else {
-                    self.encryptionMode = "aead_aes256_gcm_rtpsize"
-                }
-
-                // Gửi Op 12 VIDEO ban đầu (tắt) giống BaseMediaConnection.ts rồi mới mở sau Op 4
+                // Gửi Op 12 VIDEO ban đầu (tắt) giống BaseMediaConnection.ts rồi mới mở sau WebRTC Connected
                 await sendJSON([
                     "op": 12,
                     "d": ["audio_ssrc": audioSsrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []]
                 ])
 
-                log("Stream Ready! AudioSSRC=\(audioSsrc), VideoSSRC=\(videoSsrc), UDP=\(ip):\(port)")
-                startUDPHandshake(ip: ip, port: port)
+                log("Stream Ready! AudioSSRC=\(audioSsrc), VideoSSRC=\(videoSsrc), RTX=\(rtxSsrc) -> Khởi tạo WebRTC Offer...")
+                await startWebRtcOffer()
             }
-        case 4: // Session Description
+        case 4: // Session Description (WebRTC SDP Answer)
             if let d = json["d"] as? [String: Any] {
-                if let mode = d["mode"] as? String, !mode.isEmpty {
-                    self.encryptionMode = mode
-                }
-                let vCodec = d["video_codec"] as? String ?? "?"
-                let aCodec = d["audio_codec"] as? String ?? "?"
-                if let keyArr = d["secret_key"] as? [Int] {
-                    self.secretKey = Data(keyArr.map { UInt8($0 & 0xFF) })
-                } else if let keyArr = d["secret_key"] as? [UInt8] {
-                    self.secretKey = Data(keyArr)
-                }
-
+                self.negotiatedVideoCodec = d["video_codec"] as? String ?? "H264"
                 let daveVer = (d["dave_protocol_version"] as? Int)
                     ?? (d["dave_protocol_version"] as? NSNumber)?.intValue
                     ?? 0
+                self.negotiatedDaveVer = daveVer
+
                 let uid64 = UInt64(self.userId) ?? 0
                 let srv64 = UInt64(self.rtcServerId) ?? 0
                 let daveCid64 = (srv64 > 0) ? (srv64 &- 1) : 0
@@ -1003,20 +1095,16 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                     self.daveSession = nil
                 }
 
-                self.isReady = true
-                await setVideoAttributes(
-                    enabled: true,
-                    width: targetWidth,
-                    height: targetHeight,
-                    fps: targetFps,
-                    maxBitrateKbps: targetMaxBitrateKbps
-                )
-                await setSpeaking(true)
-                let silence = Data([0xF8, 0xFF, 0xFE])
-                for _ in 0..<5 { sendOpusPacket(silence) }
-                log("✅ Go Live sẵn sàng (\(encryptionMode) | A:\(aCodec) V:\(vCodec) | DAVE v\(daveVer))!")
-                onReady?()
-                onRequestKeyFrame?()
+                if let answerSdp = d["sdp"] as? String, !answerSdp.isEmpty, let rtc = self.webrtcClient {
+                    if rtc.setDiscordAnswer(answerSdp) {
+                        log("🌐 Đã nhận WebRTC SDP Answer (V:\(negotiatedVideoCodec)) -> Đang bắt tay ICE + DTLS-SRTP...")
+                        startWebRtcMonitor()
+                    } else {
+                        log("❌ Không parse được WebRTC SDP Answer từ Discord")
+                    }
+                } else {
+                    log("❌ Discord Op 4 không trả về WebRTC SDP Answer")
+                }
             }
         case 15: // MEDIA_SINK_WANTS (có người bấm xem stream -> ép gửi IDR KeyFrame ngay lập tức!)
             onRequestKeyFrame?()
@@ -1143,76 +1231,73 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private func startUDPKeepAlive() {
-        udpKeepAliveTask?.cancel()
-        udpKeepAliveCounter = 0
-        udpKeepAliveTask = Task.detached { [weak self] in
-            while !Task.isCancelled {
-                guard let self = self, !self.isStopped else { break }
-                var buf = [UInt8](repeating: 0, count: 8)
-                let c = self.udpKeepAliveCounter
-                buf[0] = UInt8(c & 0xFF)
-                buf[1] = UInt8((c >> 8) & 0xFF)
-                buf[2] = UInt8((c >> 16) & 0xFF)
-                buf[3] = UInt8((c >> 24) & 0xFF)
-                self.udpKeepAliveCounter = c &+ 1
-                self.udpClient.sendPacket(Data(buf))
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-            }
-        }
-    }
-
-    private func startUDPHandshake(ip: String, port: Int) {
-        guard udpClient.connect(ip: ip, port: UInt16(port)) else {
-            log("Lỗi mở UDP socket cho Stream")
-            return
-        }
-        Task.detached { [weak self] in
-            guard let self = self, !self.isStopped else { return }
-            var extIP = ip
-            var extPort = port
-            if let disc = self.udpClient.discoverIP(ssrc: UInt32(truncatingIfNeeded: self.audioSsrc)) {
-                extIP = disc.ip
-                extPort = Int(disc.port)
-            }
-            self.startUDPKeepAlive()
-            await self.sendSelectProtocol(ip: extIP, port: extPort)
-        }
-    }
-
-    private func sendSelectProtocol(ip: String, port: Int) async {
+    private func startWebRtcOffer() async {
         guard !hasSentSelectProtocol else { return }
         hasSentSelectProtocol = true
-        let codecs: [[String: Any]] = [
-            [
-                "name": "opus",
-                "type": "audio",
-                "priority": 1000,
-                "payload_type": 120
-            ],
-            [
-                "name": "H264",
-                "type": "video",
-                "priority": 1000,
-                "payload_type": 101,
-                "rtx_payload_type": 102,
-                "encode": true,
-                "decode": true
-            ]
-        ]
+
+        webrtcClient?.close()
+        guard let rtc = DiscordWebRtcClient(
+            audioSsrc: UInt32(truncatingIfNeeded: audioSsrc),
+            videoSsrc: UInt32(truncatingIfNeeded: videoSsrc),
+            rtxSsrc: UInt32(truncatingIfNeeded: rtxSsrc)
+        ), let offerSdp = rtc.offerSdp else {
+            log("❌ Không thể khởi tạo WebRTC transport cho Go Live")
+            return
+        }
+        self.webrtcClient = rtc
+
+        let rtcConnId = UUID().uuidString.lowercased()
         let payload: [String: Any] = [
             "op": 1,
             "d": [
-                "protocol": "udp",
-                "codecs": codecs,
-                "data": [
-                    "address": ip,
-                    "port": port,
-                    "mode": self.encryptionMode
-                ]
+                "protocol": "webrtc",
+                "codecs": DiscordWebRtcClient.discordWebRtcCodecs(),
+                "data": offerSdp,
+                "sdp": offerSdp,
+                "rtc_connection_id": rtcConnId
             ]
         ]
         await sendJSON(payload)
+    }
+
+    private func startWebRtcMonitor() {
+        webrtcMonitorTask?.cancel()
+        webrtcMonitorTask = Task { [weak self] in
+            guard let self = self else { return }
+            var notifiedReady = false
+            var waitedTicks = 0
+            while !Task.isCancelled && !self.isStopped {
+                guard let rtc = self.webrtcClient else { break }
+                if !notifiedReady {
+                    if rtc.isConnected {
+                        notifiedReady = true
+                        self.isReady = true
+                        await self.setVideoAttributes(
+                            enabled: true,
+                            width: self.targetWidth,
+                            height: self.targetHeight,
+                            fps: self.targetFps,
+                            maxBitrateKbps: self.targetMaxBitrateKbps
+                        )
+                        await self.setSpeaking(true)
+                        let silence = Data([0xF8, 0xFF, 0xFE])
+                        for _ in 0..<5 { self.sendOpusPacket(silence) }
+                        self.log("✅ Go Live WebRTC DTLS-SRTP sẵn sàng (V:\(self.negotiatedVideoCodec) | DAVE v\(self.negotiatedDaveVer))!")
+                        self.onReady?()
+                        self.onRequestKeyFrame?()
+                    } else {
+                        waitedTicks += 1
+                        if waitedTicks == 125 { // ~10s
+                            self.log("⚠️ Go Live WebRTC ICE/DTLS chưa kết nối sau 10s (kiểm tra mạng/UDP)")
+                        }
+                    }
+                }
+                if notifiedReady && rtc.takeKeyframeRequest() {
+                    self.onRequestKeyFrame?()
+                }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+        }
     }
 
     func setVideoAttributes(enabled: Bool, width: Int, height: Int, fps: Int, maxBitrateKbps: Int) async {
@@ -1267,7 +1352,10 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     func sendVideoH264Frame(_ annexBFrame: Data, frametimeMs: Double) {
-        guard isReady, !isStopped, let key = secretKey, key.count == 32 else { return }
+        guard isReady, !isStopped, let rtc = webrtcClient, rtc.isConnected else { return }
+        if rtc.takeKeyframeRequest() {
+            onRequestKeyFrame?()
+        }
 
         let frameToSend: Data
         if let dave = self.daveSession, dave.isEncryptionRequired {
@@ -1289,23 +1377,15 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
             frameToSend = annexBFrame
         }
 
-        let pkts = videoPacketizer.sendFrame(
-            annexBFrame: frameToSend,
-            frametimeMs: frametimeMs,
-            secretKey: key,
-            encryptionMode: encryptionMode,
-            nonceBox: transportNonce,
-            udpClient: udpClient
-        )
-
-        if !hasLoggedVideoStart && pkts > 0 {
+        let sent = rtc.sendH264(frameToSend, frametimeMs: frametimeMs)
+        if !hasLoggedVideoStart && sent {
             hasLoggedVideoStart = true
-            log("📺 Đang phát hình H.264 Go Live (\(targetWidth)x\(targetHeight)@\(targetFps)fps | \(frameToSend.count)B → \(pkts) gói RTP)!")
+            log("📺 Go Live WebRTC đang phát hình H.264 (\(targetWidth)x\(targetHeight)@\(targetFps)fps | \(frameToSend.count)B)!")
         }
     }
 
     func sendOpusPacket(_ opusPayload: Data) {
-        guard isReady, !isStopped, let key = secretKey, key.count == 32 else { return }
+        guard isReady, !isStopped, let rtc = webrtcClient, rtc.isConnected else { return }
 
         let silenceFrame = Data([0xF8, 0xFF, 0xFE])
         let mediaPayload: Data
@@ -1319,77 +1399,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
             mediaPayload = opusPayload
         }
 
-        packetLock.lock()
-        let seq = rtpAudioSeq
-        let ts = rtpAudioTs
-        rtpAudioSeq = rtpAudioSeq &+ 1
-        rtpAudioTs = rtpAudioTs &+ 960
-        packetLock.unlock()
-
-        let nonceVal = transportNonce.next()
-
-        var header = [UInt8](repeating: 0, count: 12)
-        header[0] = 0x80
-        header[1] = 0x78
-        header[2] = UInt8((seq >> 8) & 0xFF)
-        header[3] = UInt8(seq & 0xFF)
-        header[4] = UInt8((ts >> 24) & 0xFF)
-        header[5] = UInt8((ts >> 16) & 0xFF)
-        header[6] = UInt8((ts >> 8) & 0xFF)
-        header[7] = UInt8(ts & 0xFF)
-        header[8] = UInt8((audioSsrc >> 24) & 0xFF)
-        header[9] = UInt8((audioSsrc >> 16) & 0xFF)
-        header[10] = UInt8((audioSsrc >> 8) & 0xFF)
-        header[11] = UInt8(audioSsrc & 0xFF)
-
-        let noncePrefix: [UInt8] = [
-            UInt8((nonceVal >> 24) & 0xFF),
-            UInt8((nonceVal >> 16) & 0xFF),
-            UInt8((nonceVal >> 8) & 0xFF),
-            UInt8(nonceVal & 0xFF)
-        ]
-
-        if encryptionMode == "aead_xchacha20_poly1305_rtpsize" {
-            var nonce24 = [UInt8](repeating: 0, count: 24)
-            nonce24[0] = noncePrefix[0]
-            nonce24[1] = noncePrefix[1]
-            nonce24[2] = noncePrefix[2]
-            nonce24[3] = noncePrefix[3]
-
-            let ct: Data? = key.withUnsafeBytes { keyRaw in
-                header.withUnsafeBufferPointer { aadBuf in
-                    mediaPayload.withUnsafeBytes { ptRaw in
-                        guard let kPtr = keyRaw.bindMemory(to: UInt8.self).baseAddress,
-                              let pPtr = ptRaw.bindMemory(to: UInt8.self).baseAddress else { return nil }
-                        let out = dave_xchacha20_poly1305_encrypt(kPtr, nonce24, aadBuf.baseAddress, header.count, pPtr, mediaPayload.count)
-                        defer { dave_buffer_free(out) }
-                        guard let ptr = out.ptr, out.len > 0 else { return nil }
-                        return Data(bytes: ptr, count: out.len)
-                    }
-                }
-            }
-            if let ctData = ct {
-                var packet = Data(header)
-                packet.append(ctData)
-                packet.append(contentsOf: noncePrefix)
-                udpClient.sendPacket(packet)
-            }
-        } else {
-            var nonce12 = [UInt8](repeating: 0, count: 12)
-            nonce12[0] = noncePrefix[0]
-            nonce12[1] = noncePrefix[1]
-            nonce12[2] = noncePrefix[2]
-            nonce12[3] = noncePrefix[3]
-
-            if let nonce = try? AES.GCM.Nonce(data: nonce12),
-               let sealed = try? AES.GCM.seal(mediaPayload, using: SymmetricKey(data: key), nonce: nonce, authenticating: Data(header)) {
-                var packet = Data(header)
-                packet.append(sealed.ciphertext)
-                packet.append(sealed.tag)
-                packet.append(contentsOf: noncePrefix)
-                udpClient.sendPacket(packet)
-            }
-        }
+        rtc.sendOpus(mediaPayload)
     }
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
@@ -1401,12 +1411,12 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
         isStopped = true
         isReady = false
         heartbeatTask?.cancel(); heartbeatTask = nil
-        udpKeepAliveTask?.cancel(); udpKeepAliveTask = nil
+        webrtcMonitorTask?.cancel(); webrtcMonitorTask = nil
         listenTask?.cancel(); listenTask = nil
         wsTask?.cancel(with: .goingAway, reason: nil); wsTask = nil
         urlSession?.invalidateAndCancel(); urlSession = nil
         daveSession?.destroy(); daveSession = nil
-        udpClient.close()
+        webrtcClient?.close(); webrtcClient = nil
     }
 }
 

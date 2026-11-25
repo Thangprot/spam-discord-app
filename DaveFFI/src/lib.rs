@@ -1,3 +1,5 @@
+mod webrtc_transport;
+
 use std::num::NonZeroU16;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
@@ -9,6 +11,7 @@ use chacha20poly1305::{
 };
 use davey::{Codec, DAVE_PROTOCOL_VERSION, DaveSession, MediaType, ProposalsOperationType};
 use ropus::{Application as OpusApplication, Bitrate as OpusBitrate, Channels as OpusChannels, Encoder as OpusEncoder};
+use webrtc_transport::DiscordWebRtcTransport;
 
 pub struct DaveSessionHandle {
     inner: Mutex<DaveSession>,
@@ -17,6 +20,10 @@ pub struct DaveSessionHandle {
 pub struct DaveOpusEncoderHandle {
     inner: Mutex<OpusEncoder>,
     channels: usize,
+}
+
+pub struct DaveWebRtcHandle {
+    inner: DiscordWebRtcTransport,
 }
 
 #[repr(C)]
@@ -982,6 +989,137 @@ pub unsafe extern "C" fn dave_opus_encoder_encode_float(
         }
     }))
     .unwrap_or_else(|_| DaveByteBuffer::empty())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dave_webrtc_new(
+    audio_ssrc: u32,
+    video_ssrc: u32,
+    rtx_ssrc: u32,
+) -> *mut DaveWebRtcHandle {
+    catch_unwind(|| match DiscordWebRtcTransport::new(audio_ssrc, video_ssrc, rtx_ssrc) {
+        Ok(inner) => Box::into_raw(Box::new(DaveWebRtcHandle { inner })),
+        Err(_) => std::ptr::null_mut(),
+    })
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_free(handle: *mut DaveWebRtcHandle) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !handle.is_null() {
+            unsafe {
+                drop(Box::from_raw(handle));
+            }
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_get_offer_sdp(
+    handle: *const DaveWebRtcHandle,
+) -> DaveByteBuffer {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return DaveByteBuffer::empty();
+        }
+        let h = unsafe { &*handle };
+        DaveByteBuffer::from_vec(h.inner.offer_sdp().as_bytes().to_vec())
+    }))
+    .unwrap_or_else(|_| DaveByteBuffer::empty())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_set_discord_answer(
+    handle: *mut DaveWebRtcHandle,
+    sdp_utf8: *const u8,
+    sdp_len: usize,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || sdp_utf8.is_null() || sdp_len == 0 {
+            return false;
+        }
+        let h = unsafe { &*handle };
+        let bytes = unsafe { slice::from_raw_parts(sdp_utf8, sdp_len) };
+        let Ok(sdp) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        h.inner.set_discord_answer(sdp.to_string()).is_ok()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_is_connected(handle: *const DaveWebRtcHandle) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return false;
+        }
+        let h = unsafe { &*handle };
+        h.inner.is_connected()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_take_keyframe_request(
+    handle: *const DaveWebRtcHandle,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return false;
+        }
+        let h = unsafe { &*handle };
+        h.inner.take_keyframe_request()
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_tx_video_packets(handle: *const DaveWebRtcHandle) -> u64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() {
+            return 0;
+        }
+        let h = unsafe { &*handle };
+        h.inner.tx_video_packets()
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_send_opus(
+    handle: *mut DaveWebRtcHandle,
+    opus_data: *const u8,
+    opus_len: usize,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || opus_data.is_null() || opus_len == 0 {
+            return false;
+        }
+        let h = unsafe { &*handle };
+        let bytes = unsafe { slice::from_raw_parts(opus_data, opus_len) };
+        h.inner.send_opus(bytes.to_vec())
+    }))
+    .unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_webrtc_send_h264(
+    handle: *mut DaveWebRtcHandle,
+    annexb_data: *const u8,
+    annexb_len: usize,
+    frametime_ms: f64,
+) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || annexb_data.is_null() || annexb_len == 0 {
+            return false;
+        }
+        let h = unsafe { &*handle };
+        let bytes = unsafe { slice::from_raw_parts(annexb_data, annexb_len) };
+        h.inner.send_h264(bytes.to_vec(), frametime_ms)
+    }))
+    .unwrap_or(false)
 }
 
 #[cfg(test)]

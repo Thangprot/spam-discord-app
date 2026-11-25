@@ -4185,6 +4185,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
 
     // Fake Cam + Go Live Stream state
     private let camVideoPacketizer = DiscordRtpVideoPacketizer()
+    private var webrtcClient: DiscordWebRtcClient?
+    private var webrtcMonitorTask: Task<Void, Never>?
     private var desiredFakeCamProfile: DiscordStreamProfile?
     private var desiredGoLiveProfile: DiscordStreamProfile?
     private var streamSession: DiscordStreamMediaSession?
@@ -4534,6 +4536,10 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         voiceListenTask?.cancel()
         voiceHeartbeatTask?.cancel()
         udpKeepAliveTask?.cancel()
+        webrtcMonitorTask?.cancel()
+        webrtcMonitorTask = nil
+        webrtcClient?.close()
+        webrtcClient = nil
         voiceGatewaySession?.invalidateAndCancel()
 
         let config = URLSessionConfiguration.default
@@ -4628,30 +4634,25 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                         "op": 12,
                         "d": ["audio_ssrc": self.ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []]
                     ])
-                }
-                let ip = d["ip"] as? String ?? ""
-                let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
-                let modes = d["modes"] as? [String] ?? []
-                if modes.contains("aead_aes256_gcm_rtpsize") {
-                    self.encryptionMode = "aead_aes256_gcm_rtpsize"
-                } else if modes.contains("aead_xchacha20_poly1305_rtpsize") {
-                    self.encryptionMode = "aead_xchacha20_poly1305_rtpsize"
+                    log("Voice Ready (WebRTC)! SSRC=\(self.ssrc), VideoSSRC=\(self.videoSsrc), RTX=\(self.rtxSsrc) -> Đang gửi SDP Offer...")
+                    await startVoiceWebRtcOffer()
                 } else {
-                    self.encryptionMode = "aead_aes256_gcm_rtpsize"
+                    let ip = d["ip"] as? String ?? ""
+                    let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
+                    let modes = d["modes"] as? [String] ?? []
+                    if modes.contains("aead_aes256_gcm_rtpsize") {
+                        self.encryptionMode = "aead_aes256_gcm_rtpsize"
+                    } else if modes.contains("aead_xchacha20_poly1305_rtpsize") {
+                        self.encryptionMode = "aead_xchacha20_poly1305_rtpsize"
+                    } else {
+                        self.encryptionMode = "aead_aes256_gcm_rtpsize"
+                    }
+                    log("Voice Ready! SSRC: \(self.ssrc), UDP: \(ip):\(port), Mode: \(self.encryptionMode)")
+                    startVoiceUDP(ip: ip, port: port)
                 }
-                log("Voice Ready! SSRC: \(self.ssrc)\(enableVideoCapabilities ? ", VideoSSRC: \(self.videoSsrc)" : ""), UDP: \(ip):\(port), Mode: \(self.encryptionMode)")
-                startVoiceUDP(ip: ip, port: port)
             }
         case 4: // Session Description
             if let d = json["d"] as? [String: Any] {
-                let mode = d["mode"] as? String ?? self.encryptionMode
-                self.encryptionMode = mode
-                if let keyArr = d["secret_key"] as? [Int] {
-                    self.secretKey = Data(keyArr.map { UInt8($0 & 0xFF) })
-                } else if let keyArr = d["secret_key"] as? [UInt8] {
-                    self.secretKey = Data(keyArr)
-                }
-
                 let daveVer = (d["dave_protocol_version"] as? Int)
                     ?? ((d["dave_protocol_version"] as? NSNumber)?.intValue)
                     ?? 0
@@ -4673,23 +4674,41 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     self.daveSession = nil
                 }
 
-                DispatchQueue.main.async {
-                    self.isVoiceUDPReady = true
-                    self.isJoined = true
-                }
                 let vCodec = d["video_codec"] as? String ?? "-"
-                log("✅ Kênh thoại sẵn sàng (\(mode) | V:\(vCodec) | DAVE v\(daveVer))!")
-                if self.isSpeaking {
-                    sendSpeaking(true)
+
+                if self.enableVideoCapabilities, let answerSdp = d["sdp"] as? String, !answerSdp.isEmpty, let rtc = self.webrtcClient {
+                    if rtc.setDiscordAnswer(answerSdp) {
+                        log("🌐 Nhận Voice WebRTC Answer (V:\(vCodec)) -> Đang bắt tay ICE + DTLS-SRTP...")
+                        startVoiceWebRtcMonitor(vCodec: vCodec, daveVer: daveVer)
+                    } else {
+                        log("❌ Không parse được Voice WebRTC SDP Answer")
+                    }
+                } else {
+                    let mode = d["mode"] as? String ?? self.encryptionMode
+                    self.encryptionMode = mode
+                    if let keyArr = d["secret_key"] as? [Int] {
+                        self.secretKey = Data(keyArr.map { UInt8($0 & 0xFF) })
+                    } else if let keyArr = d["secret_key"] as? [UInt8] {
+                        self.secretKey = Data(keyArr)
+                    }
+
+                    DispatchQueue.main.async {
+                        self.isVoiceUDPReady = true
+                        self.isJoined = true
+                    }
+                    log("✅ Kênh thoại sẵn sàng (\(mode) | V:\(vCodec) | DAVE v\(daveVer))!")
+                    if self.isSpeaking {
+                        sendSpeaking(true)
+                    }
+                    if let camProf = self.desiredFakeCamProfile {
+                        await self.applyFakeCamOnVoice(enabled: true, profile: camProf)
+                    }
+                    if let streamProf = self.desiredGoLiveProfile {
+                        self.startGoLive(profile: streamProf)
+                    }
+                    self.onVoiceUDPReady?()
+                    self.onRequestCamKeyFrame?()
                 }
-                if let camProf = self.desiredFakeCamProfile {
-                    await self.applyFakeCamOnVoice(enabled: true, profile: camProf)
-                }
-                if let streamProf = self.desiredGoLiveProfile {
-                    self.startGoLive(profile: streamProf)
-                }
-                self.onVoiceUDPReady?()
-                self.onRequestCamKeyFrame?()
             }
         case 6: // Heartbeat ACK
             break
@@ -4840,6 +4859,76 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 self.udpKeepAliveCounter = c &+ 1
                 self.udpClient.sendPacket(Data(buf))
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+    }
+
+    private func startVoiceWebRtcOffer() async {
+        guard !hasSentSelectProtocol else { return }
+        hasSentSelectProtocol = true
+
+        webrtcClient?.close()
+        guard let rtc = DiscordWebRtcClient(
+            audioSsrc: UInt32(truncatingIfNeeded: self.ssrc),
+            videoSsrc: UInt32(truncatingIfNeeded: self.videoSsrc),
+            rtxSsrc: UInt32(truncatingIfNeeded: self.rtxSsrc)
+        ), let offerSdp = rtc.offerSdp else {
+            log("❌ Không thể khởi tạo WebRTC transport cho Voice/Cam")
+            return
+        }
+        self.webrtcClient = rtc
+
+        let rtcConnId = UUID().uuidString.lowercased()
+        await sendVoiceJSON([
+            "op": 1,
+            "d": [
+                "protocol": "webrtc",
+                "codecs": DiscordWebRtcClient.discordWebRtcCodecs(),
+                "data": offerSdp,
+                "sdp": offerSdp,
+                "rtc_connection_id": rtcConnId
+            ]
+        ])
+    }
+
+    private func startVoiceWebRtcMonitor(vCodec: String, daveVer: Int) {
+        webrtcMonitorTask?.cancel()
+        webrtcMonitorTask = Task { [weak self] in
+            guard let self = self else { return }
+            var notifiedReady = false
+            var waitedTicks = 0
+            while !Task.isCancelled {
+                guard let rtc = self.webrtcClient else { break }
+                if !notifiedReady {
+                    if rtc.isConnected {
+                        notifiedReady = true
+                        DispatchQueue.main.async {
+                            self.isVoiceUDPReady = true
+                            self.isJoined = true
+                        }
+                        self.log("✅ Kênh thoại WebRTC DTLS-SRTP sẵn sàng (V:\(vCodec) | DAVE v\(daveVer))!")
+                        if self.isSpeaking {
+                            self.sendSpeaking(true)
+                        }
+                        if let camProf = self.desiredFakeCamProfile {
+                            await self.applyFakeCamOnVoice(enabled: true, profile: camProf)
+                        }
+                        if let streamProf = self.desiredGoLiveProfile {
+                            self.startGoLive(profile: streamProf)
+                        }
+                        self.onVoiceUDPReady?()
+                        self.onRequestCamKeyFrame?()
+                    } else {
+                        waitedTicks += 1
+                        if waitedTicks == 125 { // ~10s
+                            self.log("⚠️ Voice WebRTC ICE/DTLS chưa kết nối sau 10s (kiểm tra mạng/UDP)")
+                        }
+                    }
+                }
+                if notifiedReady && rtc.takeKeyframeRequest() {
+                    self.onRequestCamKeyFrame?()
+                }
+                try? await Task.sleep(nanoseconds: 80_000_000)
             }
         }
     }
@@ -5020,9 +5109,40 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         }
     }
 
-    /// Gửi khung hình H.264 Annex-B cho Fake Cam qua kết nối Voice UDP chính
+    /// Gửi khung hình H.264 Annex-B cho Fake Cam qua WebRTC DTLS-SRTP (hoặc UDP fallback)
     func sendCamVideoFrame(_ annexBFrame: Data, frametimeMs: Double) {
-        guard isVoiceUDPReady, isFakeCamActive, videoSsrc != 0, let key = secretKey, key.count == 32 else { return }
+        guard isVoiceUDPReady, isFakeCamActive, videoSsrc != 0 else { return }
+
+        if let rtc = self.webrtcClient {
+            guard rtc.isConnected else { return }
+            if rtc.takeKeyframeRequest() {
+                onRequestCamKeyFrame?()
+            }
+
+            let frameToSend: Data
+            if let dave = self.daveSession, dave.isEncryptionRequired {
+                if let encrypted = dave.encryptVideoH264(annexBFrame) {
+                    frameToSend = encrypted
+                } else {
+                    if dave.canEncrypt && !hasLoggedCamDaveErr {
+                        hasLoggedCamDaveErr = true
+                        log("⚠️ Lỗi DAVE mã hóa khung Fake Cam H.264 (\(annexBFrame.count)B)")
+                    }
+                    return
+                }
+            } else {
+                frameToSend = annexBFrame
+            }
+
+            let sent = rtc.sendH264(frameToSend, frametimeMs: frametimeMs)
+            if !hasLoggedCamVideoStart && sent {
+                hasLoggedCamVideoStart = true
+                log("🎥 Fake Cam WebRTC đang phát hình H.264 (\(frameToSend.count)B)!")
+            }
+            return
+        }
+
+        guard let key = secretKey, key.count == 32 else { return }
 
         let frameToSend: Data
         if let dave = self.daveSession, dave.isEncryptionRequired {
@@ -5205,9 +5325,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         }
     }
 
-    /// Truyền gói tin âm thanh Opus trực tiếp vào kênh thoại qua UDP RTP (DAVE E2EE + AES-256-GCM / XChaCha20-Poly1305)
+    /// Truyền gói tin âm thanh Opus trực tiếp vào kênh thoại qua WebRTC DTLS-SRTP hoặc UDP RTP (DAVE E2EE)
     func sendOpusPacket(_ opusPayload: Data) {
-        guard isVoiceUDPReady, let key = secretKey, key.count == 32 else { return }
+        guard isVoiceUDPReady else { return }
 
         let silenceFrame = Data([0xF8, 0xFF, 0xFE])
         let mediaPayload: Data
@@ -5219,7 +5339,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     log("🔊 Đang truyền âm thanh Opus + DAVE E2EE vào kênh thoại!")
                 }
             } else {
-                // DAVE đang chờ hoàn tất MLS transition -> gửi khung im lặng để giữ luồng UDP
+                // DAVE đang chờ hoàn tất MLS transition -> gửi khung im lặng để giữ luồng
                 mediaPayload = silenceFrame
             }
         } else {
@@ -5229,6 +5349,13 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 log("🔊 Đang truyền âm thanh Opus vào kênh thoại!")
             }
         }
+
+        if let rtc = self.webrtcClient, rtc.isConnected {
+            rtc.sendOpus(mediaPayload)
+            return
+        }
+
+        guard let key = secretKey, key.count == 32 else { return }
 
         packetLock.lock()
         let seq = rtpSequence
@@ -5356,6 +5483,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
 
         voiceHeartbeatTask?.cancel(); voiceHeartbeatTask = nil
         udpKeepAliveTask?.cancel(); udpKeepAliveTask = nil
+        webrtcMonitorTask?.cancel(); webrtcMonitorTask = nil
+        webrtcClient?.close(); webrtcClient = nil
         voiceListenTask?.cancel(); voiceListenTask = nil
         voiceWsTask?.cancel(with: .goingAway, reason: nil); voiceWsTask = nil
         voiceGatewaySession?.invalidateAndCancel(); voiceGatewaySession = nil
