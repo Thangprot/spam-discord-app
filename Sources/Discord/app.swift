@@ -3524,6 +3524,8 @@ final class DiscordVoiceUDPClient {
 
         var tv = timeval(tv_sec: 2, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var sndBuf: Int32 = 512 * 1024
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndBuf, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -3880,6 +3882,26 @@ final class DaveE2EESession {
         }
         return consumeDaveBuffer(buf)
     }
+
+    /// Mã hóa E2EE khung video H.264 Annex-B (dùng cho Fake Cam & Go Live Stream).
+    func encryptVideoH264(_ annexB: Data) -> Data? {
+        guard !annexB.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        if protocolVersion == 0 || downgraded {
+            return annexB
+        }
+        guard let h = handle, dave_session_can_encrypt(h) else {
+            return nil
+        }
+        let buf = annexB.withUnsafeBytes { raw -> DaveByteBuffer in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else {
+                return DaveByteBuffer(ptr: nil, len: 0, cap: 0)
+            }
+            return dave_session_encrypt_video_h264(h, ptr, annexB.count)
+        }
+        return consumeDaveBuffer(buf)
+    }
 }
 
 // MARK: - NATIVE OPUS AUDIO ENCODER (XIPH OPUS RUST CORE - 48kHz STEREO RFC 6716)
@@ -4118,6 +4140,10 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     @Published var isJoined = false
     @Published var isSpeaking = false
     @Published var isVoiceUDPReady = false
+    @Published var isFakeCamActive = false
+    @Published var isGoLiveActive = false
+    @Published var premiumType: Int = 0
+    @Published var streamProfile: DiscordStreamProfile = DiscordStreamProfile.forPremiumType(0)
     @Published var pingMs: Int = 0
     @Published var lastLog = ""
 
@@ -4136,21 +4162,35 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var selfMute = false
     private var selfDeaf = false
     private var selfVideo = false
+    var enableVideoCapabilities = false
 
     private var gatewaySeq: Int?
     private var voiceSessionId: String?
     private var voiceToken: String?
     private var voiceEndpoint: String?
     private var ssrc: Int = 0
+    private var videoSsrc: Int = 0
+    private var rtxSsrc: Int = 0
     private var secretKey: Data?
     private var encryptionMode: String = "aead_aes256_gcm_rtpsize"
     private var voiceSeq: Int = -1
     private var daveSession: DaveE2EESession?
     private var hasLoggedAudioStart = false
     private var hasLoggedDaveReady = false
+    private var hasLoggedCamVideoStart = false
     private var hasSentVoiceIdentify = false
     private var hasSentSelectProtocol = false
     private let packetLock = NSLock()
+
+    // Fake Cam + Go Live Stream state
+    private let camVideoPacketizer = DiscordRtpVideoPacketizer()
+    private var desiredFakeCamProfile: DiscordStreamProfile?
+    private var desiredGoLiveProfile: DiscordStreamProfile?
+    private var streamSession: DiscordStreamMediaSession?
+    private var pendingStreamServerId: String?
+    private var pendingStreamKey: String?
+    private var pendingStreamEndpoint: String?
+    private var pendingStreamToken: String?
 
     private var isVoiceConnecting = false
     private var activeVoiceToken: String?
@@ -4163,6 +4203,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var udpKeepAliveCounter: UInt32 = 0
 
     var onLog: ((String) -> Void)?
+    var onVoiceUDPReady: (() -> Void)?
+    var onGoLiveReady: (() -> Void)?
 
     init(tokenInfo: TokenInfo) {
         self.id = tokenInfo.id
@@ -4177,12 +4219,13 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         super.init()
     }
 
-    func start(guildId: String, channelId: String, mute: Bool, deaf: Bool, video: Bool) {
+    func start(guildId: String, channelId: String, mute: Bool, deaf: Bool, video: Bool, enableVideo: Bool = false) {
         self.currentGuildId = guildId
         self.currentChannelId = channelId
         self.selfMute = mute
         self.selfDeaf = deaf
         self.selfVideo = video
+        self.enableVideoCapabilities = enableVideo
         self.gatewaySeq = nil
         self.voiceSessionId = nil
         self.voiceToken = nil
@@ -4192,6 +4235,11 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         self.isVoiceConnecting = false
         self.hasSentVoiceIdentify = false
         self.hasSentSelectProtocol = false
+        self.hasLoggedCamVideoStart = false
+        self.pendingStreamServerId = nil
+        self.pendingStreamKey = nil
+        self.pendingStreamEndpoint = nil
+        self.pendingStreamToken = nil
 
         connectGateway()
     }
@@ -4278,8 +4326,21 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             let event = json["t"] as? String
             if event == "READY" {
                 if let d = json["d"] as? [String: Any] {
-                    if let user = d["user"] as? [String: Any], let uid = user["id"] as? String, !uid.isEmpty {
-                        self.userId = uid
+                    if let user = d["user"] as? [String: Any] {
+                        if let uid = user["id"] as? String, !uid.isEmpty {
+                            self.userId = uid
+                        }
+                        let pt = (user["premium_type"] as? Int)
+                            ?? (user["premium_type"] as? NSNumber)?.intValue
+                            ?? 0
+                        let prof = DiscordStreamProfile.forPremiumType(pt)
+                        DispatchQueue.main.async {
+                            self.premiumType = pt
+                            self.streamProfile = prof
+                        }
+                        if enableVideoCapabilities {
+                            log("💎 Premium=\(DiscordStreamProfile.premiumName(pt)) → \(prof.label)")
+                        }
                     }
                 }
                 DispatchQueue.main.async { self.isConnected = true }
@@ -4304,6 +4365,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                             DispatchQueue.main.async {
                                 self.isJoined = false
                                 self.isVoiceUDPReady = false
+                                self.isFakeCamActive = false
+                                self.isGoLiveActive = false
                             }
                         }
                     }
@@ -4323,6 +4386,32 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     }
                     log("Đã nhận Voice Server: \(endpoint)")
                     tryConnectVoiceGateway()
+                }
+            } else if event == "STREAM_CREATE" {
+                if let d = json["d"] as? [String: Any],
+                   let streamKey = d["stream_key"] as? String,
+                   let rtcServerId = d["rtc_server_id"] as? String {
+                    let expectedKey = makeStreamKey()
+                    if streamKey == expectedKey {
+                        self.pendingStreamKey = streamKey
+                        self.pendingStreamServerId = rtcServerId
+                        log("📺 Nhận STREAM_CREATE (RTC Server: \(rtcServerId))")
+                        tryConnectStreamMediaSession()
+                    }
+                }
+            } else if event == "STREAM_SERVER_UPDATE" {
+                if let d = json["d"] as? [String: Any],
+                   let streamKey = d["stream_key"] as? String,
+                   let token = d["token"] as? String,
+                   let endpoint = d["endpoint"] as? String, !endpoint.isEmpty {
+                    let expectedKey = makeStreamKey()
+                    if streamKey == expectedKey {
+                        self.pendingStreamKey = streamKey
+                        self.pendingStreamToken = token
+                        self.pendingStreamEndpoint = endpoint
+                        log("📺 Nhận STREAM_SERVER_UPDATE: \(endpoint)")
+                        tryConnectStreamMediaSession()
+                    }
                 }
             }
         default:
@@ -4520,6 +4609,16 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 if let ssrcVal = (d["ssrc"] as? Int) ?? (d["ssrc"] as? NSNumber)?.intValue {
                     self.ssrc = ssrcVal
                 }
+                if enableVideoCapabilities {
+                    if let streams = d["streams"] as? [[String: Any]], let first = streams.first {
+                        self.videoSsrc = (first["ssrc"] as? Int) ?? (first["ssrc"] as? NSNumber)?.intValue ?? (self.ssrc + 1)
+                        self.rtxSsrc = (first["rtx_ssrc"] as? Int) ?? (first["rtx_ssrc"] as? NSNumber)?.intValue ?? (self.ssrc + 2)
+                    } else {
+                        self.videoSsrc = self.ssrc + 1
+                        self.rtxSsrc = self.ssrc + 2
+                    }
+                    self.camVideoPacketizer.configure(ssrc: UInt32(truncatingIfNeeded: self.videoSsrc))
+                }
                 let ip = d["ip"] as? String ?? ""
                 let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
                 let modes = d["modes"] as? [String] ?? []
@@ -4530,7 +4629,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 } else {
                     self.encryptionMode = "aead_aes256_gcm_rtpsize"
                 }
-                log("Voice Ready! SSRC: \(self.ssrc), UDP: \(ip):\(port), Mode: \(self.encryptionMode)")
+                log("Voice Ready! SSRC: \(self.ssrc)\(enableVideoCapabilities ? ", VideoSSRC: \(self.videoSsrc)" : ""), UDP: \(ip):\(port), Mode: \(self.encryptionMode)")
                 startVoiceUDP(ip: ip, port: port)
             }
         case 4: // Session Description
@@ -4572,6 +4671,13 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 if self.isSpeaking {
                     sendSpeaking(true)
                 }
+                if let camProf = self.desiredFakeCamProfile {
+                    await self.applyFakeCamOnVoice(enabled: true, profile: camProf)
+                }
+                if let streamProf = self.desiredGoLiveProfile {
+                    self.startGoLive(profile: streamProf)
+                }
+                self.onVoiceUDPReady?()
             }
         case 6: // Heartbeat ACK
             break
@@ -4600,6 +4706,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                         if self.isSpeaking {
                             self.sendSpeaking(true)
                         }
+                        self.onVoiceUDPReady?()
                     }
                 }
             }
@@ -4753,18 +4860,34 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private func sendSelectProtocol(ip: String, port: Int) async {
         guard !hasSentSelectProtocol else { return }
         hasSentSelectProtocol = true
-        let payload: [String: Any] = [
-            "op": 1,
-            "d": [
-                "protocol": "udp",
-                "data": [
-                    "address": ip,
-                    "port": port,
-                    "mode": self.encryptionMode
-                ]
+        var d: [String: Any] = [
+            "protocol": "udp",
+            "data": [
+                "address": ip,
+                "port": port,
+                "mode": self.encryptionMode
             ]
         ]
-        await sendVoiceJSON(payload)
+        if enableVideoCapabilities {
+            d["codecs"] = [
+                [
+                    "name": "opus",
+                    "type": "audio",
+                    "priority": 1000,
+                    "payload_type": 120
+                ],
+                [
+                    "name": "H264",
+                    "type": "video",
+                    "priority": 1000,
+                    "payload_type": 101,
+                    "rtx_payload_type": 102,
+                    "encode": true,
+                    "decode": true
+                ]
+            ]
+        }
+        await sendVoiceJSON(["op": 1, "d": d])
     }
 
     private func startVoiceHeartbeat(intervalMs: Double) {
@@ -4793,18 +4916,238 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             self.userId = ext
         }
 
+        var d: [String: Any] = [
+            "server_id": guildId,
+            "user_id": uid,
+            "session_id": sessionId,
+            "token": token,
+            "max_dave_protocol_version": DaveE2EESession.maxProtocolVersion
+        ]
+        if enableVideoCapabilities {
+            d["video"] = true
+            d["streams"] = [
+                ["type": "screen", "rid": "100", "quality": 100]
+            ]
+        }
         let payload: [String: Any] = [
             "op": 0,
-            "d": [
-                "server_id": guildId,
-                "user_id": uid,
-                "session_id": sessionId,
-                "token": token,
-                "max_dave_protocol_version": DaveE2EESession.maxProtocolVersion
-            ]
+            "d": d
         ]
         log("Gửi Voice Identify v8: Server=\(guildId), User=\(uid), Session=\(sessionId.prefix(8))..., DAVE=\(DaveE2EESession.maxProtocolVersion)...")
         await sendVoiceJSON(payload)
+    }
+
+    // MARK: - FAKE CAM (CAMERA ẢO TRÊN KÊNH VOICE CHÍNH)
+    func setFakeCam(enabled: Bool, profile: DiscordStreamProfile?) {
+        if enabled, let prof = profile {
+            self.desiredFakeCamProfile = prof
+            self.selfVideo = true
+            self.hasLoggedCamVideoStart = false
+            sendVoiceStateUpdate()
+            if isVoiceUDPReady {
+                Task { [weak self] in
+                    await self?.applyFakeCamOnVoice(enabled: true, profile: prof)
+                }
+            }
+        } else {
+            self.desiredFakeCamProfile = nil
+            self.selfVideo = false
+            self.hasLoggedCamVideoStart = false
+            sendVoiceStateUpdate()
+            Task { [weak self] in
+                await self?.applyFakeCamOnVoice(enabled: false, profile: nil)
+            }
+        }
+    }
+
+    private func applyFakeCamOnVoice(enabled: Bool, profile: DiscordStreamProfile?) async {
+        if enabled, let prof = profile, videoSsrc != 0 {
+            let d: [String: Any] = [
+                "audio_ssrc": ssrc,
+                "video_ssrc": videoSsrc,
+                "rtx_ssrc": rtxSsrc,
+                "streams": [[
+                    "type": "video",
+                    "rid": "100",
+                    "ssrc": videoSsrc,
+                    "active": true,
+                    "quality": 100,
+                    "rtx_ssrc": rtxSsrc,
+                    "max_bitrate": prof.maxBitrateKbps * 1000,
+                    "max_framerate": prof.fps,
+                    "max_resolution": [
+                        "type": "fixed",
+                        "width": prof.width,
+                        "height": prof.height
+                    ]
+                ]]
+            ]
+            await sendVoiceJSON(["op": 12, "d": d])
+            DispatchQueue.main.async { self.isFakeCamActive = true }
+            log("🎥 Đã bật Fake Cam (\(prof.width)x\(prof.height)@\(prof.fps)fps)")
+        } else {
+            let d: [String: Any] = [
+                "audio_ssrc": ssrc,
+                "video_ssrc": 0,
+                "rtx_ssrc": 0,
+                "streams": []
+            ]
+            await sendVoiceJSON(["op": 12, "d": d])
+            DispatchQueue.main.async { self.isFakeCamActive = false }
+        }
+    }
+
+    /// Gửi khung hình H.264 Annex-B cho Fake Cam qua kết nối Voice UDP chính
+    func sendCamVideoFrame(_ annexBFrame: Data, frametimeMs: Double) {
+        guard isVoiceUDPReady, isFakeCamActive, videoSsrc != 0, let key = secretKey, key.count == 32 else { return }
+
+        let frameToSend: Data
+        if let dave = self.daveSession, dave.isEncryptionRequired {
+            guard let encrypted = dave.encryptVideoH264(annexBFrame) else { return }
+            frameToSend = encrypted
+        } else {
+            frameToSend = annexBFrame
+        }
+
+        if !hasLoggedCamVideoStart {
+            hasLoggedCamVideoStart = true
+            log("🎥 Đang phát luồng hình ảnh Fake Cam H.264 vào phòng thoại!")
+        }
+
+        camVideoPacketizer.sendFrame(
+            annexBFrame: frameToSend,
+            frametimeMs: frametimeMs,
+            secretKey: key,
+            encryptionMode: encryptionMode,
+            udpClient: udpClient
+        )
+    }
+
+    // MARK: - GO LIVE STREAM (OP 18 STREAM_CREATE / OP 22 PAUSE / OP 19 DELETE)
+    private func makeStreamKey() -> String {
+        let gid = currentGuildId ?? ""
+        let cid = currentChannelId ?? ""
+        var uid = self.userId
+        if (uid.isEmpty || uid == "0"), let ext = extractUserId(from: self.token) {
+            uid = ext
+            self.userId = ext
+        }
+        return "guild:\(gid):\(cid):\(uid)"
+    }
+
+    private func sendMainGatewayJSON(_ payload: [String: Any]) {
+        guard let ws = wsTask else { return }
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
+        }
+    }
+
+    func startGoLive(profile: DiscordStreamProfile) {
+        desiredGoLiveProfile = profile
+        guard let gid = currentGuildId, let cid = currentChannelId,
+              let sid = voiceSessionId, !sid.isEmpty else {
+            return
+        }
+
+        streamSession?.stop()
+        streamSession = nil
+        pendingStreamServerId = nil
+        pendingStreamEndpoint = nil
+        pendingStreamToken = nil
+
+        let streamKey = makeStreamKey()
+        pendingStreamKey = streamKey
+        log("📺 Đang khởi tạo Go Live Stream (\(profile.label))...")
+
+        // Op 18: STREAM_CREATE
+        sendMainGatewayJSON([
+            "op": 18,
+            "d": [
+                "type": "guild",
+                "guild_id": gid,
+                "channel_id": cid,
+                "preferred_region": NSNull()
+            ]
+        ])
+        // Op 22: STREAM_SET_PAUSED (paused: false)
+        sendMainGatewayJSON([
+            "op": 22,
+            "d": [
+                "stream_key": streamKey,
+                "paused": false
+            ]
+        ])
+    }
+
+    func stopGoLive() {
+        let hadStream = (streamSession != nil || desiredGoLiveProfile != nil || isGoLiveActive)
+        desiredGoLiveProfile = nil
+        streamSession?.stop()
+        streamSession = nil
+        pendingStreamServerId = nil
+        pendingStreamEndpoint = nil
+        pendingStreamToken = nil
+
+        if hadStream {
+            let streamKey = pendingStreamKey ?? makeStreamKey()
+            sendMainGatewayJSON([
+                "op": 19,
+                "d": ["stream_key": streamKey]
+            ])
+            log("⏹ Đã tắt Go Live Stream.")
+        }
+        pendingStreamKey = nil
+        DispatchQueue.main.async { self.isGoLiveActive = false }
+    }
+
+    private func tryConnectStreamMediaSession() {
+        guard let prof = desiredGoLiveProfile,
+              let rtcServerId = pendingStreamServerId, !rtcServerId.isEmpty,
+              let streamKey = pendingStreamKey, !streamKey.isEmpty,
+              let endpoint = pendingStreamEndpoint, !endpoint.isEmpty,
+              let sToken = pendingStreamToken, !sToken.isEmpty,
+              let vSid = voiceSessionId, !vSid.isEmpty else { return }
+
+        if let cur = streamSession, cur.token == sToken, cur.rtcServerId == rtcServerId {
+            return
+        }
+
+        streamSession?.stop()
+        let ss = DiscordStreamMediaSession(
+            rtcServerId: rtcServerId,
+            streamKey: streamKey,
+            userId: self.userId,
+            sessionId: vSid,
+            token: sToken,
+            endpoint: endpoint,
+            username: self.username
+        )
+        ss.targetWidth = prof.width
+        ss.targetHeight = prof.height
+        ss.targetFps = prof.fps
+        ss.targetMaxBitrateKbps = prof.maxBitrateKbps
+        ss.onLog = { [weak self] msg in
+            DispatchQueue.main.async {
+                self?.onLog?(msg)
+            }
+        }
+        ss.onReady = { [weak self] in
+            DispatchQueue.main.async {
+                self?.isGoLiveActive = true
+            }
+            self?.onGoLiveReady?()
+        }
+        self.streamSession = ss
+        ss.connect()
+    }
+
+    func sendGoLiveVideoFrame(_ annexBFrame: Data, frametimeMs: Double) {
+        streamSession?.sendVideoH264Frame(annexBFrame, frametimeMs: frametimeMs)
+    }
+
+    func sendGoLiveAudioPacket(_ opusPayload: Data) {
+        streamSession?.sendOpusPacket(opusPayload)
     }
 
     func setSpeaking(_ speaking: Bool) {
@@ -4940,6 +5283,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     }
 
     func stop() {
+        stopGoLive()
         isVoiceConnecting = false
         activeVoiceToken = nil
         activeVoiceSessionId = nil
@@ -4947,8 +5291,10 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         voiceToken = nil
         voiceEndpoint = nil
         gatewaySeq = nil
+        desiredFakeCamProfile = nil
         hasLoggedAudioStart = false
         hasLoggedDaveReady = false
+        hasLoggedCamVideoStart = false
         hasSentVoiceIdentify = false
         hasSentSelectProtocol = false
         if let gid = currentGuildId {
@@ -4987,6 +5333,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             self.isJoined = false
             self.isSpeaking = false
             self.isVoiceUDPReady = false
+            self.isFakeCamActive = false
+            self.isGoLiveActive = false
         }
         log("Đã ngắt kết nối.")
     }
@@ -5007,7 +5355,7 @@ struct VoiceLogEntry: Identifiable {
 }
 
 // ==============================================================================
-// MARK: - VOICE ROOM MANAGER (TREO ROOM 24/7)
+// MARK: - VOICE ROOM MANAGER (TREO ROOM 24/7 + FAKE CAM + GO LIVE STREAM)
 // ==============================================================================
 @MainActor
 final class VoiceRoomManager: ObservableObject {
@@ -5025,13 +5373,28 @@ final class VoiceRoomManager: ObservableObject {
     @Published var selfDeaf = false
     @Published var selfVideo = false
 
+    // Cấu hình Fake Cam + Go Live Stream (từ room.js)
+    @Published var videoQualityMode: TreoVideoQualityMode = .autoNitro
+    @Published var streamMedia: TreoMediaSource? = nil
+    @Published var camMedia: TreoMediaSource? = nil
+    @Published var isStreamEnabled: Bool = false
+    @Published var isCamEnabled: Bool = false
+
     @Published var sessions: [VoiceGatewaySession] = []
     @Published var elapsedSeconds: Int = 0
     @Published var logs: [VoiceLogEntry] = []
 
     private var timer: Timer?
+    private var joinTask: Task<Void, Never>?
+    private let goLiveEngine = TreoMediaBroadcastEngine()
+    private let fakeCamEngine = TreoMediaBroadcastEngine()
 
     private init() {}
+
+    var activeProfile: DiscordStreamProfile {
+        let hasNitro = sessions.contains { $0.premiumType == 1 || $0.premiumType == 2 }
+        return videoQualityMode.resolveProfile(hasNitroAccount: hasNitro)
+    }
 
     func loadVoiceChannels(guild: Guild, token: String) async {
         selectedGuild = guild
@@ -5050,6 +5413,197 @@ final class VoiceRoomManager: ObservableObject {
             addLog("Lỗi lấy danh sách Voice: \(error.localizedDescription)")
         }
         isLoadingChannels = false
+    }
+
+    // MARK: - MEDIA PICKER CHO GO LIVE STREAM & FAKE CAM (HỖ TRỢ MP4/MOV/MP3/M4A/WAV)
+    func pickMediaFile(url: URL, forStream: Bool) {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+        }
+
+        let fm = FileManager.default
+        let cacheDir = fm.urls(for: .cachesDirectory, in: .userDomainMask).first?.appendingPathComponent("TreoMedia", isDirectory: true)
+        if let dir = cacheDir {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        var finalURL = url
+        if let dir = cacheDir {
+            let safeName = "\(UUID().uuidString.prefix(8))_\(url.lastPathComponent)"
+            let dest = dir.appendingPathComponent(safeName)
+            if (try? fm.copyItem(at: url, to: dest)) != nil {
+                finalURL = dest
+            }
+        }
+
+        let ext = finalURL.pathExtension.lowercased()
+        let audioExts: Set<String> = ["mp3", "m4a", "wav", "flac", "aac", "ogg", "caf"]
+        let asset = AVURLAsset(url: finalURL)
+        let hasVideoTrack = !asset.tracks(withMediaType: .video).isEmpty
+        let isAudioOnly = audioExts.contains(ext) || !hasVideoTrack
+
+        let source = TreoMediaSource(
+            id: UUID(),
+            title: url.lastPathComponent,
+            url: finalURL,
+            isAudioOnly: isAudioOnly,
+            isVirtualPattern: false
+        )
+
+        if forStream {
+            self.streamMedia = source
+            self.isStreamEnabled = true
+            addLog("📺 Đã nạp file Stream: \(source.title)\(isAudioOnly ? " (Audio → Màn đen)" : "")")
+            if isRunning { reconcileStream() }
+        } else {
+            self.camMedia = source
+            self.isCamEnabled = true
+            self.selfVideo = true
+            addLog("🎥 Đã nạp file Fake Cam: \(source.title)\(isAudioOnly ? " (Audio → Màn đen)" : "")")
+            if isRunning { reconcileCam() }
+        }
+    }
+
+    func selectVirtualMedia(_ source: TreoMediaSource, forStream: Bool) {
+        if forStream {
+            self.streamMedia = source
+            self.isStreamEnabled = true
+            addLog("📺 Đã chọn Stream mẫu: \(source.title)")
+            if isRunning { reconcileStream() }
+        } else {
+            self.camMedia = source
+            self.isCamEnabled = true
+            self.selfVideo = true
+            addLog("🎥 Đã chọn Fake Cam mẫu: \(source.title)")
+            if isRunning { reconcileCam() }
+        }
+    }
+
+    func setStreamEnabled(_ enabled: Bool) {
+        if enabled && streamMedia == nil {
+            streamMedia = .virtualCamPattern
+        }
+        isStreamEnabled = enabled
+        if isRunning {
+            reconcileStream()
+        }
+    }
+
+    func clearStreamMedia() {
+        isStreamEnabled = false
+        streamMedia = nil
+        if isRunning {
+            reconcileStream()
+        }
+    }
+
+    func setCamEnabled(_ enabled: Bool) {
+        if enabled && camMedia == nil {
+            camMedia = .virtualCamPattern
+        }
+        isCamEnabled = enabled
+        selfVideo = enabled
+        if isRunning {
+            reconcileCam()
+        }
+    }
+
+    func clearCamMedia() {
+        isCamEnabled = false
+        selfVideo = false
+        camMedia = nil
+        if isRunning {
+            reconcileCam()
+        }
+    }
+
+    func updateQualityMode(_ mode: TreoVideoQualityMode) {
+        self.videoQualityMode = mode
+        if isRunning {
+            if isStreamEnabled { reconcileStream() }
+            if isCamEnabled { reconcileCam() }
+        }
+    }
+
+    func reconcileStream() {
+        goLiveEngine.stop()
+        guard isRunning, isStreamEnabled, let media = streamMedia else {
+            for s in sessions {
+                s.stopGoLive()
+            }
+            return
+        }
+
+        let prof = activeProfile
+        addLog("▶ GO LIVE (\(prof.label) • Loop ∞): \(media.title)")
+        for s in sessions {
+            s.startGoLive(profile: prof)
+        }
+
+        let activeList = sessions
+        goLiveEngine.start(
+            source: media,
+            profile: prof,
+            includeAudio: true,
+            onVideoFrame: { annexB, frametimeMs in
+                for s in activeList where s.isGoLiveActive {
+                    s.sendGoLiveVideoFrame(annexB, frametimeMs: frametimeMs)
+                }
+            },
+            onAudioFrame: { opus in
+                for s in activeList where s.isGoLiveActive {
+                    s.sendGoLiveAudioPacket(opus)
+                }
+            },
+            onLog: { [weak self] msg in
+                DispatchQueue.main.async { self?.addLog(msg) }
+            }
+        )
+    }
+
+    func reconcileCam() {
+        fakeCamEngine.stop()
+        guard isRunning, isCamEnabled, let media = camMedia else {
+            self.selfVideo = false
+            for s in sessions {
+                s.setFakeCam(enabled: false, profile: nil)
+            }
+            return
+        }
+
+        self.selfVideo = true
+        let baseProf = activeProfile
+        // Fake Cam giảm bitrate ~70% giống room.js để mượt khi chạy song song với Go Live
+        let camProf = DiscordStreamProfile(
+            width: baseProf.width,
+            height: baseProf.height,
+            fps: baseProf.fps,
+            bitrateKbps: max(400, Int(Double(baseProf.bitrateKbps) * 0.7)),
+            maxBitrateKbps: baseProf.maxBitrateKbps,
+            label: baseProf.label
+        )
+
+        addLog("▶ FAKE CAM (\(camProf.label) • Loop ∞): \(media.title)")
+        for s in sessions {
+            s.setFakeCam(enabled: true, profile: camProf)
+        }
+
+        let activeList = sessions
+        fakeCamEngine.start(
+            source: media,
+            profile: camProf,
+            includeAudio: false,
+            onVideoFrame: { annexB, frametimeMs in
+                for s in activeList where s.isFakeCamActive {
+                    s.sendCamVideoFrame(annexB, frametimeMs: frametimeMs)
+                }
+            },
+            onAudioFrame: nil,
+            onLog: { [weak self] msg in
+                DispatchQueue.main.async { self?.addLog(msg) }
+            }
+        )
     }
 
     func startTreo(guildId: String, channelId: String, channelName: String, tokens: [TokenInfo]) {
@@ -5078,16 +5632,55 @@ final class VoiceRoomManager: ObservableObject {
             session.onLog = { [weak self] msg in
                 self?.addLog(msg)
             }
-            session.start(
-                guildId: guildId,
-                channelId: channelId,
-                mute: selfMute,
-                deaf: selfDeaf,
-                video: selfVideo
-            )
+            session.onVoiceUDPReady = { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.isRunning else { return }
+                    if self.isCamEnabled {
+                        self.fakeCamEngine.requestKeyFrame()
+                    }
+                }
+            }
+            session.onGoLiveReady = { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self = self, self.isRunning else { return }
+                    self.goLiveEngine.requestKeyFrame()
+                }
+            }
             newSessions.append(session)
         }
         self.sessions = newSessions
+
+        let initialCamOn = self.isCamEnabled && self.camMedia != nil
+        let initialStreamOn = self.isStreamEnabled && self.streamMedia != nil
+        let initialMute = self.selfMute
+        let initialDeaf = self.selfDeaf
+
+        if initialStreamOn {
+            self.reconcileStream()
+        }
+        if initialCamOn {
+            self.reconcileCam()
+        }
+
+        // Nối lần lượt từng token cách nhau 300ms (y hệt room.js) để tránh rate limit Gateway
+        joinTask?.cancel()
+        joinTask = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            for (idx, session) in newSessions.enumerated() {
+                if Task.isCancelled || !self.isRunning { break }
+                session.start(
+                    guildId: guildId,
+                    channelId: channelId,
+                    mute: initialMute,
+                    deaf: initialDeaf,
+                    video: self.isCamEnabled && self.camMedia != nil,
+                    enableVideo: true
+                )
+                if idx + 1 < newSessions.count {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                }
+            }
+        }
 
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -5106,6 +5699,10 @@ final class VoiceRoomManager: ObservableObject {
     }
 
     func stopTreo() {
+        joinTask?.cancel()
+        joinTask = nil
+        goLiveEngine.stop()
+        fakeCamEngine.stop()
         timer?.invalidate()
         timer = nil
 
@@ -5114,7 +5711,7 @@ final class VoiceRoomManager: ObservableObject {
         }
         sessions.removeAll()
         isRunning = false
-        addLog("Đã dừng treo room.")
+        addLog("Đã dừng treo room, Fake Cam và Go Live.")
     }
 
     func updateToggles(mute: Bool, deaf: Bool, video: Bool) {
@@ -5855,6 +6452,8 @@ struct VoiceRoomTabView: View {
 
     @State private var showGuildPicker = false
     @State private var showDocumentPicker = false
+    @State private var showStreamMediaPicker = false
+    @State private var showCamMediaPicker = false
 
     var body: some View {
         NavigationStack {
@@ -5881,7 +6480,7 @@ struct VoiceRoomTabView: View {
                     .padding()
                 }
             }
-            .navigationTitle(mode == .xaMic ? "Xả Nhạc Make Super VIP" : "Treo Voice 24/7")
+            .navigationTitle(mode == .xaMic ? "Xả Nhạc Make Super VIP" : "Treo Voice • Cam • Stream")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showGuildPicker) {
                 VoiceGuildPickerSheet(isForSpam: mode == .xaMic)
@@ -5889,6 +6488,16 @@ struct VoiceRoomTabView: View {
             .sheet(isPresented: $showDocumentPicker) {
                 DocumentPicker(contentTypes: [.audio], allowsMultipleSelection: true) { _ in } onPickMultiple: { urls in
                     musicStream.addFiles(urls: urls)
+                }
+            }
+            .sheet(isPresented: $showStreamMediaPicker) {
+                DocumentPicker(contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .audio], allowsMultipleSelection: false) { url in
+                    voiceRoom.pickMediaFile(url: url, forStream: true)
+                }
+            }
+            .sheet(isPresented: $showCamMediaPicker) {
+                DocumentPicker(contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .audio], allowsMultipleSelection: false) { url in
+                    voiceRoom.pickMediaFile(url: url, forStream: false)
                 }
             }
         }
@@ -6612,19 +7221,37 @@ struct VoiceRoomTabView: View {
                     }
                 }
 
-                Toggle(isOn: Binding(
-                    get: { voiceRoom.selfVideo },
-                    set: { on in
-                        voiceRoom.updateToggles(mute: voiceRoom.selfMute, deaf: voiceRoom.selfDeaf, video: on)
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Chất lượng Video / Stream", systemImage: "sparkles.tv")
+                            .font(.subheadline.bold())
+                        Spacer()
+                        Text(voiceRoom.activeProfile.label)
+                            .font(.caption2.bold())
+                            .foregroundStyle(.indigo)
                     }
-                )) {
-                    Label("Bật Camera / Video ảo", systemImage: "video.fill")
-                        .font(.subheadline)
+                    Picker("Chất lượng", selection: Binding(
+                        get: { voiceRoom.videoQualityMode },
+                        set: { voiceRoom.updateQualityMode($0) }
+                    )) {
+                        ForEach(TreoVideoQualityMode.allCases) { q in
+                            Text(q.rawValue).tag(q)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
             }
             .padding()
             .background(Color(UIColor.secondarySystemBackground))
             .cornerRadius(15)
+
+            // Card: Go Live Stream (từ room.js — đổi file / bật tắt trực tiếp real-time)
+            treoGoLiveCard
+
+            // Card: Fake Cam (từ room.js — chạy song song với Go Live Stream)
+            treoFakeCamCard
 
             // Nút Bắt Đầu / Dừng Treo
             if voiceRoom.isRunning {
@@ -6729,7 +7356,36 @@ struct VoiceRoomTabView: View {
                             }
 
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(s.username).font(.subheadline.bold())
+                                HStack(spacing: 5) {
+                                    Text(s.username).font(.subheadline.bold()).lineLimit(1)
+                                    if s.premiumType == 1 || s.premiumType == 2 {
+                                        Text("NITRO")
+                                            .font(.system(size: 8, weight: .black))
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Color.pink.opacity(0.2))
+                                            .foregroundStyle(.pink)
+                                            .cornerRadius(4)
+                                    }
+                                    if s.isGoLiveActive {
+                                        Text("LIVE")
+                                            .font(.system(size: 8, weight: .black))
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Color.red)
+                                            .foregroundStyle(.white)
+                                            .cornerRadius(4)
+                                    }
+                                    if s.isFakeCamActive {
+                                        Text("CAM")
+                                            .font(.system(size: 8, weight: .black))
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Color.purple)
+                                            .foregroundStyle(.white)
+                                            .cornerRadius(4)
+                                    }
+                                }
                                 Text(s.lastLog.isEmpty ? (s.isJoined ? "Đang trong phòng" : "Đang kết nối...") : s.lastLog)
                                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                             }
@@ -6777,6 +7433,198 @@ struct VoiceRoomTabView: View {
                 .cornerRadius(15)
             }
         }
+    }
+
+    // MARK: - CARD GO LIVE STREAM (TỪ room.js)
+    private var treoGoLiveCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "play.tv.fill").foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Go Live Stream (Loop ∞)").font(.headline)
+                    Text("Phát Video (.mp4/.mov) hoặc Nhạc (.mp3 → Màn đen + Tiếng)")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { voiceRoom.isStreamEnabled },
+                    set: { voiceRoom.setStreamEnabled($0) }
+                ))
+                .labelsHidden()
+                .tint(.red)
+            }
+
+            if let media = voiceRoom.streamMedia {
+                HStack(spacing: 8) {
+                    Image(systemName: media.isAudioOnly ? "music.note" : "film.fill")
+                        .foregroundStyle(.red)
+                    Text(media.title)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                    Spacer()
+                    if voiceRoom.isRunning && voiceRoom.isStreamEnabled {
+                        Text("ĐANG LIVE")
+                            .font(.system(size: 9, weight: .black))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.red)
+                            .foregroundColor(.white)
+                            .cornerRadius(4)
+                    }
+                    Button {
+                        voiceRoom.clearStreamMedia()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(8)
+                .background(Color(UIColor.tertiarySystemBackground))
+                .cornerRadius(8)
+            } else {
+                Text("Chưa chọn file Stream (Bật nút để dùng mẫu ảo hoặc chọn file bên dưới)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    showStreamMediaPicker = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder.badge.plus")
+                        Text("Chọn Video / MP3")
+                    }
+                    .font(.caption.bold())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color.red.opacity(0.15))
+                    .foregroundColor(.red)
+                    .cornerRadius(8)
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualCamPattern, forStream: true)
+                } label: {
+                    Text("🌈 Mẫu Ảo")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualBlackScreen, forStream: true)
+                } label: {
+                    Text("⬛ Màn Đen")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                }
+            }
+        }
+        .padding()
+        .background(Color(UIColor.secondarySystemBackground))
+        .cornerRadius(15)
+    }
+
+    // MARK: - CARD FAKE CAM (TỪ room.js)
+    private var treoFakeCamCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "video.fill").foregroundStyle(.purple)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Fake Cam (Camera Ảo • Loop ∞)").font(.headline)
+                    Text("Phát hình ảnh Video lên khung Camera của toàn bộ Token")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { voiceRoom.isCamEnabled },
+                    set: { voiceRoom.setCamEnabled($0) }
+                ))
+                .labelsHidden()
+                .tint(.purple)
+            }
+
+            if let media = voiceRoom.camMedia {
+                HStack(spacing: 8) {
+                    Image(systemName: "video.badge.waveform.fill")
+                        .foregroundStyle(.purple)
+                    Text(media.title)
+                        .font(.caption.bold())
+                        .lineLimit(1)
+                    Spacer()
+                    if voiceRoom.isRunning && voiceRoom.isCamEnabled {
+                        Text("ĐANG BẬT CAM")
+                            .font(.system(size: 9, weight: .black))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.purple)
+                            .foregroundColor(.white)
+                            .cornerRadius(4)
+                    }
+                    Button {
+                        voiceRoom.clearCamMedia()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(8)
+                .background(Color(UIColor.tertiarySystemBackground))
+                .cornerRadius(8)
+            } else {
+                Text("Chưa chọn file Fake Cam (Có thể chạy song song với Go Live Stream)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    showCamMediaPicker = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "folder.badge.plus")
+                        Text("Chọn Video Cam")
+                    }
+                    .font(.caption.bold())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color.purple.opacity(0.15))
+                    .foregroundColor(.purple)
+                    .cornerRadius(8)
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualCamPattern, forStream: false)
+                } label: {
+                    Text("🌈 Cam Ảo Mẫu")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualBlackScreen, forStream: false)
+                } label: {
+                    Text("⬛ Cam Đen")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
+                        .background(Color(UIColor.tertiarySystemBackground))
+                        .cornerRadius(8)
+                }
+            }
+        }
+        .padding()
+        .background(Color(UIColor.secondarySystemBackground))
+        .cornerRadius(15)
     }
 
     // MARK: - HELPERS

@@ -63,6 +63,7 @@ int32_t dave_session_execute_transition(DaveSessionHandle *handle, uint16_t tran
 void dave_session_set_passthrough_mode(DaveSessionHandle *handle, bool passthrough, uint32_t transition_expiry);
 
 DaveByteBuffer dave_session_encrypt_opus(DaveSessionHandle *handle, const uint8_t *opus_data, size_t opus_len);
+DaveByteBuffer dave_session_encrypt_video_h264(DaveSessionHandle *handle, const uint8_t *annexb_data, size_t annexb_len);
 
 /* Transport AEAD helper: XChaCha20-Poly1305 (key = 32 bytes, nonce = 24 bytes) */
 DaveByteBuffer dave_xchacha20_poly1305_encrypt(

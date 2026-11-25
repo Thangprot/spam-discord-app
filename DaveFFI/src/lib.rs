@@ -7,7 +7,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use davey::{DAVE_PROTOCOL_VERSION, DaveSession, ProposalsOperationType};
+use davey::{Codec, DAVE_PROTOCOL_VERSION, DaveSession, MediaType, ProposalsOperationType};
 use ropus::{Application as OpusApplication, Bitrate as OpusBitrate, Channels as OpusChannels, Encoder as OpusEncoder};
 
 pub struct DaveSessionHandle {
@@ -407,6 +407,29 @@ pub unsafe extern "C" fn dave_session_encrypt_opus(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn dave_session_encrypt_video_h264(
+    handle: *mut DaveSessionHandle,
+    annexb_data: *const u8,
+    annexb_len: usize,
+) -> DaveByteBuffer {
+    catch_unwind(AssertUnwindSafe(|| {
+        if handle.is_null() || annexb_data.is_null() || annexb_len == 0 {
+            return DaveByteBuffer::empty();
+        }
+        let session_handle = unsafe { &*handle };
+        let bytes = unsafe { slice::from_raw_parts(annexb_data, annexb_len) };
+        let Ok(mut guard) = session_handle.inner.lock() else {
+            return DaveByteBuffer::empty();
+        };
+        match guard.encrypt(MediaType::VIDEO, Codec::H264, bytes) {
+            Ok(cow) => DaveByteBuffer::from_vec(cow.into_owned()),
+            Err(_) => DaveByteBuffer::empty(),
+        }
+    }))
+    .unwrap_or_else(|_| DaveByteBuffer::empty())
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn dave_xchacha20_poly1305_encrypt(
     key: *const u8,
     nonce24: *const u8,
@@ -555,6 +578,10 @@ mod tests {
             dave_buffer_free(kp);
 
             assert!(dave_session_reinit(handle, 1, 1042665958503886918, 123456789012345678));
+            let dummy_h264 = [0x00u8, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00];
+            let not_ready_vid = dave_session_encrypt_video_h264(handle, dummy_h264.as_ptr(), dummy_h264.len());
+            assert!(not_ready_vid.ptr.is_null());
+            dave_buffer_free(not_ready_vid);
             assert!(dave_session_reset(handle));
             dave_session_free(handle);
         }
