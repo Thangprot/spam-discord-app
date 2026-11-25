@@ -5751,6 +5751,8 @@ final class VoiceRoomManager: ObservableObject {
     @Published var camMedia: TreoMediaSource? = nil
     @Published var isStreamEnabled: Bool = false
     @Published var isCamEnabled: Bool = false
+    @Published var streamCacheStatus: H264CacheStatus = .none
+    @Published var camCacheStatus: H264CacheStatus = .none
 
     @Published var sessions: [VoiceGatewaySession] = []
     @Published var elapsedSeconds: Int = 0
@@ -5760,12 +5762,91 @@ final class VoiceRoomManager: ObservableObject {
     private var joinTask: Task<Void, Never>?
     private let goLiveEngine = TreoMediaBroadcastEngine()
     private let fakeCamEngine = TreoMediaBroadcastEngine()
+    private var streamCacheListener: (H264FullVideoCacheSession, UUID)?
+    private var camCacheListener: (H264FullVideoCacheSession, UUID)?
 
     private init() {}
 
     var activeProfile: DiscordStreamProfile {
         let hasNitro = sessions.contains { $0.premiumType == 1 || $0.premiumType == 2 }
         return videoQualityMode.resolveProfile(hasNitroAccount: hasNitro)
+    }
+
+    private func camProfile(from base: DiscordStreamProfile) -> DiscordStreamProfile {
+        DiscordStreamProfile(
+            width: base.width,
+            height: base.height,
+            fps: base.fps,
+            bitrateKbps: max(400, Int(Double(base.bitrateKbps) * 0.7)),
+            maxBitrateKbps: base.maxBitrateKbps,
+            label: base.label
+        )
+    }
+
+    /// Tự động chuẩn bị Full-Video H.264 0%-GPU cache ngay khi chọn file video để thoát app phát trọn video!
+    func prepareBackgroundCache(forStream: Bool) {
+        if forStream {
+            if let old = streamCacheListener { old.0.removeListener(old.1); streamCacheListener = nil }
+            streamCacheStatus = .none
+        } else {
+            if let old = camCacheListener { old.0.removeListener(old.1); camCacheListener = nil }
+            camCacheStatus = .none
+        }
+
+        let media = forStream ? streamMedia : camMedia
+        guard let src = media, !src.isVirtualPattern, !src.isAudioOnly, let url = src.url else {
+            return
+        }
+
+        let prof = forStream ? activeProfile : camProfile(from: activeProfile)
+        let targetId = src.id
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let asset = AVURLAsset(url: url)
+            guard let track = asset.tracks(withMediaType: .video).first else { return }
+            let isDirect = TreoMediaBroadcastEngine.canUseDirectH264Passthrough(asset: asset, track: track, profile: prof)
+
+            await MainActor.run { [weak self] in
+                guard let self = self else { return }
+                let curMedia = forStream ? self.streamMedia : self.camMedia
+                guard curMedia?.id == targetId else { return }
+
+                if isDirect {
+                    if forStream { self.streamCacheStatus = .directPassthrough }
+                    else { self.camCacheStatus = .directPassthrough }
+                    return
+                }
+
+                let sess = H264FullVideoCacheManager.shared.getOrCreateSession(
+                    url: url,
+                    title: src.title,
+                    profile: prof
+                )
+                let lid = sess.addListener(
+                    onStatus: { [weak self] st in
+                        Task { @MainActor [weak self] in
+                            guard let self = self else { return }
+                            if forStream {
+                                if self.streamMedia?.id == targetId { self.streamCacheStatus = st }
+                            } else {
+                                if self.camMedia?.id == targetId { self.camCacheStatus = st }
+                            }
+                        }
+                    },
+                    onLog: { [weak self] msg in
+                        Task { @MainActor [weak self] in
+                            self?.addLog(msg)
+                        }
+                    }
+                )
+                if forStream {
+                    self.streamCacheListener = (sess, lid)
+                } else {
+                    self.camCacheListener = (sess, lid)
+                }
+                sess.startOrResumePreparation()
+            }
+        }
     }
 
     func loadVoiceChannels(guild: Guild, token: String) async {
@@ -5827,12 +5908,14 @@ final class VoiceRoomManager: ObservableObject {
             self.streamMedia = source
             self.isStreamEnabled = true
             addLog("📺 Đã nạp file Stream: \(source.title)\(isAudioOnly ? " (Audio → Màn đen)" : "")")
+            prepareBackgroundCache(forStream: true)
             if isRunning { reconcileStream() }
         } else {
             self.camMedia = source
             self.isCamEnabled = true
             self.selfVideo = true
             addLog("🎥 Đã nạp file Fake Cam: \(source.title)\(isAudioOnly ? " (Audio → Màn đen)" : "")")
+            prepareBackgroundCache(forStream: false)
             if isRunning { reconcileCam() }
         }
     }
@@ -5841,12 +5924,14 @@ final class VoiceRoomManager: ObservableObject {
         if forStream {
             self.streamMedia = source
             self.isStreamEnabled = true
+            prepareBackgroundCache(forStream: true)
             addLog("📺 Đã chọn Stream mẫu: \(source.title)")
             if isRunning { reconcileStream() }
         } else {
             self.camMedia = source
             self.isCamEnabled = true
             self.selfVideo = true
+            prepareBackgroundCache(forStream: false)
             addLog("🎥 Đã chọn Fake Cam mẫu: \(source.title)")
             if isRunning { reconcileCam() }
         }
@@ -5865,6 +5950,7 @@ final class VoiceRoomManager: ObservableObject {
     func clearStreamMedia() {
         isStreamEnabled = false
         streamMedia = nil
+        prepareBackgroundCache(forStream: true)
         if isRunning {
             reconcileStream()
         }
@@ -5885,6 +5971,7 @@ final class VoiceRoomManager: ObservableObject {
         isCamEnabled = false
         selfVideo = false
         camMedia = nil
+        prepareBackgroundCache(forStream: false)
         if isRunning {
             reconcileCam()
         }
@@ -5892,6 +5979,8 @@ final class VoiceRoomManager: ObservableObject {
 
     func updateQualityMode(_ mode: TreoVideoQualityMode) {
         self.videoQualityMode = mode
+        prepareBackgroundCache(forStream: true)
+        prepareBackgroundCache(forStream: false)
         if isRunning {
             if isStreamEnabled { reconcileStream() }
             if isCamEnabled { reconcileCam() }
@@ -5908,6 +5997,7 @@ final class VoiceRoomManager: ObservableObject {
         }
 
         let prof = activeProfile
+        prepareBackgroundCache(forStream: true)
         addLog("▶ GO LIVE (\(prof.label) • Loop ∞): \(media.title)")
         for s in sessions {
             s.startGoLive(profile: prof)
@@ -5946,15 +6036,8 @@ final class VoiceRoomManager: ObservableObject {
 
         self.selfVideo = true
         let baseProf = activeProfile
-        // Fake Cam giảm bitrate ~70% giống room.js để mượt khi chạy song song với Go Live
-        let camProf = DiscordStreamProfile(
-            width: baseProf.width,
-            height: baseProf.height,
-            fps: baseProf.fps,
-            bitrateKbps: max(400, Int(Double(baseProf.bitrateKbps) * 0.7)),
-            maxBitrateKbps: baseProf.maxBitrateKbps,
-            label: baseProf.label
-        )
+        let camProf = camProfile(from: baseProf)
+        prepareBackgroundCache(forStream: false)
 
         addLog("▶ FAKE CAM (\(camProf.label) • Loop ∞): \(media.title)")
         for s in sessions {
@@ -6080,6 +6163,7 @@ final class VoiceRoomManager: ObservableObject {
     }
 
     func setAppInBackground(_ inBackground: Bool) {
+        H264FullVideoCacheManager.shared.setAppInBackground(inBackground)
         goLiveEngine.setBackgroundMode(inBackground)
         fakeCamEngine.setBackgroundMode(inBackground)
         if inBackground && isRunning {
@@ -8301,32 +8385,36 @@ struct VoiceRoomTabView: View {
             }
 
             if let media = voiceRoom.streamMedia {
-                HStack(spacing: 10) {
-                    Image(systemName: media.isAudioOnly ? "music.note" : "film.fill")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.red)
-                        .frame(width: 30, height: 30)
-                        .background(Color.red.opacity(0.14))
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(systemName: media.isAudioOnly ? "music.note" : "film.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(.red)
+                            .frame(width: 30, height: 30)
+                            .background(Color.red.opacity(0.14))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(media.title)
-                            .font(.caption.bold())
-                            .lineLimit(1)
-                        Text(media.isAudioOnly ? "Chế độ Nhạc + Màn hình đen" : "H.264 Loop ∞ • Chạy nền mượt")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(media.title)
+                                .font(.caption.bold())
+                                .lineLimit(1)
+                            Text(media.isAudioOnly ? "Chế độ Nhạc + Màn hình đen" : "Full Video Loop ∞ • Chạy nền 0% GPU")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Button {
+                            voiceRoom.clearStreamMedia()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.secondary)
+                        }
                     }
 
-                    Spacer()
-
-                    Button {
-                        voiceRoom.clearStreamMedia()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 18))
-                            .foregroundStyle(.secondary)
-                    }
+                    cacheReadinessView(status: voiceRoom.streamCacheStatus, accent: .red)
                 }
                 .padding(10)
                 .background(Color(UIColor.tertiarySystemGroupedBackground))
@@ -8411,32 +8499,36 @@ struct VoiceRoomTabView: View {
             }
 
             if let media = voiceRoom.camMedia {
-                HStack(spacing: 10) {
-                    Image(systemName: "camera.fill")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.purple)
-                        .frame(width: 30, height: 30)
-                        .background(Color.purple.opacity(0.14))
-                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(.purple)
+                            .frame(width: 30, height: 30)
+                            .background(Color.purple.opacity(0.14))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(media.title)
-                            .font(.caption.bold())
-                            .lineLimit(1)
-                        Text("Camera Ảo Loop ∞ • Toàn bộ dàn Token")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(media.title)
+                                .font(.caption.bold())
+                                .lineLimit(1)
+                            Text("Camera Ảo Full Video Loop ∞ • Chạy nền 0% GPU")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        Button {
+                            voiceRoom.clearCamMedia()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.secondary)
+                        }
                     }
 
-                    Spacer()
-
-                    Button {
-                        voiceRoom.clearCamMedia()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 18))
-                            .foregroundStyle(.secondary)
-                    }
+                    cacheReadinessView(status: voiceRoom.camCacheStatus, accent: .purple)
                 }
                 .padding(10)
                 .background(Color(UIColor.tertiarySystemGroupedBackground))
@@ -8728,6 +8820,84 @@ struct VoiceRoomTabView: View {
                 .clipShape(Capsule())
         }
         .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func cacheReadinessView(status: H264CacheStatus, accent: Color) -> some View {
+        switch status {
+        case .none:
+            EmptyView()
+        case .directPassthrough:
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 11))
+                Text("Sẵn sàng chạy nền Full Video (Direct 0% GPU)")
+                    .font(.system(size: 10, weight: .bold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.green)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.green.opacity(0.12))
+            .clipShape(Capsule())
+        case .ready(let totalSec):
+            HStack(spacing: 5) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 11))
+                Text("Sẵn sàng chạy nền Full Video (\(formatSeconds(totalSec)) • 0% GPU)")
+                    .font(.system(size: 10, weight: .bold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.green)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.green.opacity(0.12))
+            .clipShape(Capsule())
+        case .preparing(let pct, let cachedSec):
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    ProgressView()
+                        .scaleEffect(0.65)
+                        .frame(width: 12, height: 12)
+                    Text("Đang tối ưu chạy nền Full Video: \(Int(pct * 100))% (\(formatSeconds(cachedSec)))")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(accent)
+                        .lineLimit(1)
+                }
+                ProgressView(value: min(1.0, max(0.0, pct)))
+                    .tint(accent)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(accent.opacity(0.09))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        case .pausedForBackground(let pct, let cachedSec):
+            HStack(spacing: 5) {
+                Image(systemName: "moon.stars.fill")
+                    .font(.system(size: 11))
+                Text("Đã tối ưu \(Int(pct * 100))% (\(formatSeconds(cachedSec))) • Mở app để tối ưu nốt")
+                    .font(.system(size: 10, weight: .bold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.orange)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.orange.opacity(0.14))
+            .clipShape(Capsule())
+        case .failed(let msg):
+            HStack(spacing: 5) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                Text(msg)
+                    .font(.system(size: 10, weight: .bold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.red)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.red.opacity(0.12))
+            .clipShape(Capsule())
+        }
     }
 
     private func shortQualityTitle(_ q: TreoVideoQualityMode) -> String {

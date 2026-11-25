@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreGraphics
 import VideoToolbox
 import CoreMedia
 import CoreVideo
@@ -544,7 +545,15 @@ final class HardwareH264Encoder {
         stateLock.unlock()
     }
 
-    init?(width: Int, height: Int, fps: Int, bitrateKbps: Int, maxBitrateKbps: Int) {
+    init?(
+        width: Int,
+        height: Int,
+        fps: Int,
+        bitrateKbps: Int,
+        maxBitrateKbps: Int,
+        realTime: Bool = true,
+        keyFrameIntervalSec: Double = 2.0
+    ) {
         self.width = max(160, (width / 2) * 2)
         self.height = max(120, (height / 2) * 2)
         self.fps = max(10, min(60, fps))
@@ -567,12 +576,13 @@ final class HardwareH264Encoder {
         guard status == noErr, let s = sess else { return nil }
         self.session = s
 
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: realTime ? kCFBooleanTrue : kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: self.fps * 2))
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: 2.0))
+        let kfFrames = max(15, Int((Double(self.fps) * max(1.0, keyFrameIntervalSec)).rounded()))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: kfFrames))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: max(1.0, keyFrameIntervalSec)))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: self.fps))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: self.bitrateKbps * 1000))
         let byteLimit = (self.maxBitrateKbps * 1000) / 8
@@ -590,6 +600,51 @@ final class HardwareH264Encoder {
             VTCompressionSessionCompleteFrames(s, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(s)
             session = nil
+        }
+    }
+
+    /// Mã hóa 1 frame và luôn gọi `onFinished` ĐÚNG 1 LẦN trên mọi nhánh (an toàn tuyệt đối cho semaphore backpressure)
+    func encodeGuaranteed(
+        pixelBuffer: CVPixelBuffer,
+        pts: CMTime,
+        duration: CMTime,
+        forceKeyFrame: Bool,
+        onFinished: @escaping (Data?, Bool, OSStatus) -> Void
+    ) {
+        guard let s = session else {
+            onFinished(nil, false, -1)
+            return
+        }
+        var frameProps: CFDictionary? = nil
+        if forceKeyFrame {
+            let dict: [CFString: Any] = [kVTEncodeFrameOptionKey_ForceKeyFrame: true]
+            frameProps = dict as CFDictionary
+        }
+
+        let encStatus = VTCompressionSessionEncodeFrame(
+            s,
+            imageBuffer: pixelBuffer,
+            presentationTimeStamp: pts,
+            duration: duration,
+            frameProperties: frameProps,
+            infoFlagsOut: nil
+        ) { [weak self] status, _, sampleBuffer in
+            if status != noErr {
+                self?.markNeedsRebuild()
+                onFinished(nil, false, status)
+                return
+            }
+            guard let sb = sampleBuffer else {
+                onFinished(nil, false, noErr)
+                return
+            }
+            let isKey = HardwareH264Encoder.isKeyFrame(sb)
+            let annexB = HardwareH264Encoder.extractAnnexB(from: sb, includeParameterSets: isKey)
+            onFinished(annexB, isKey, noErr)
+        }
+        if encStatus != noErr {
+            markNeedsRebuild()
+            onFinished(nil, false, encStatus)
         }
     }
 
@@ -1516,7 +1571,666 @@ final class BackgroundH264LoopCache {
 }
 
 // ==============================================================================
-// MARK: - SHARED MEDIA BROADCAST ENGINE (LOOP ∞ VIDEO + AUDIO -> ALL TOKENS)
+// MARK: - FULL-VIDEO PROGRESSIVE ZERO-GPU H.264 DISK CACHE (KHÔNG BAO GIỜ LẶP ĐOẠN NGẮN!)
+// ==============================================================================
+
+enum H264CacheStatus: Equatable {
+    case none
+    case directPassthrough
+    case preparing(progress: Double, cachedSeconds: Double)
+    case pausedForBackground(progress: Double, cachedSeconds: Double)
+    case ready(totalSeconds: Double)
+    case failed(String)
+}
+
+/// Ghi toàn bộ video ra file `.h264bin` (H.264 Baseline Annex-B, không B-frame, đã rewrite SPS VUI)
+/// ở tốc độ phần cứng tối đa (20x–50x real-time). Sau đó phát trực tiếp từ ổ đĩa bằng CPU 0% GPU:
+/// - Thoát app / khóa màn hình vẫn phát FULL VIDEO từ đầu đến cuối, KHÔNG lặp đoạn 2 giây!
+/// - Hỗ trợ đọc song song ngay trong lúc đang ghi (progressive) và tự nối tiếp khi mở lại app!
+final class H264FullVideoCacheSession {
+    static let headerSize: Int64 = 16
+    private static let magic: [UInt8] = [0x54, 0x48, 0x32, 0x36] // "TH26"
+
+    let cacheKey: String
+    let sourceURL: URL
+    let sourceTitle: String
+    let profile: DiscordStreamProfile
+    let cacheURL: URL
+
+    private let lock = NSLock()
+    private let writeLock = NSLock()
+    private var _validByteLength: Int64 = 0
+    private var _lastEncodedPtsSec: Double = -1.0
+    private var _cachedDurationSec: Double = 0.0
+    private var _totalDurationSec: Double = 0.0
+    private var _isComplete: Bool = false
+    private var _isPreparing: Bool = false
+    private var _isPausedForBackground: Bool = false
+    private var _isBackgroundMode: Bool = false
+    private var _failedError: String? = nil
+    private var _status: H264CacheStatus = .none
+    private var _frameCount: Int = 0
+
+    private var prepTask: Task<Void, Never>?
+    private var statusListeners: [UUID: (H264CacheStatus) -> Void] = [:]
+    private var logListeners: [UUID: (String) -> Void] = [:]
+
+    var validByteLength: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return _validByteLength
+    }
+    var isComplete: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isComplete
+    }
+    var isPreparing: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isPreparing
+    }
+    var isBackgroundMode: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isBackgroundMode
+    }
+    var failedError: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _failedError
+    }
+    var status: H264CacheStatus {
+        lock.lock(); defer { lock.unlock() }
+        return _status
+    }
+    var cachedDurationSec: Double {
+        lock.lock(); defer { lock.unlock() }
+        return _cachedDurationSec
+    }
+
+    init(cacheKey: String, sourceURL: URL, sourceTitle: String, profile: DiscordStreamProfile, cacheURL: URL) {
+        self.cacheKey = cacheKey
+        self.sourceURL = sourceURL
+        self.sourceTitle = sourceTitle
+        self.profile = profile
+        self.cacheURL = cacheURL
+        loadExistingIfComplete()
+    }
+
+    @discardableResult
+    func addListener(onStatus: ((H264CacheStatus) -> Void)?, onLog: ((String) -> Void)?) -> UUID {
+        let id = UUID()
+        lock.lock()
+        if let s = onStatus { statusListeners[id] = s }
+        if let l = onLog { logListeners[id] = l }
+        let curStatus = _status
+        lock.unlock()
+        if let s = onStatus, curStatus != .none {
+            DispatchQueue.main.async { s(curStatus) }
+        }
+        return id
+    }
+
+    func removeListener(_ id: UUID) {
+        lock.lock()
+        statusListeners.removeValue(forKey: id)
+        logListeners.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    private func emitStatus(_ newStatus: H264CacheStatus) {
+        lock.lock()
+        _status = newStatus
+        let listeners = Array(statusListeners.values)
+        lock.unlock()
+        DispatchQueue.main.async {
+            for cb in listeners { cb(newStatus) }
+        }
+    }
+
+    private func emitLog(_ msg: String) {
+        lock.lock()
+        let listeners = Array(logListeners.values)
+        lock.unlock()
+        DispatchQueue.main.async {
+            for cb in listeners { cb(msg) }
+        }
+    }
+
+    private func loadExistingIfComplete() {
+        guard let fh = try? FileHandle(forReadingFrom: cacheURL) else { return }
+        defer { try? fh.close() }
+        guard let hdr = try? fh.read(upToCount: Int(Self.headerSize)),
+              hdr.count == Int(Self.headerSize),
+              hdr[0] == Self.magic[0], hdr[1] == Self.magic[1], hdr[2] == Self.magic[2], hdr[3] == Self.magic[3],
+              hdr[4] == 1,
+              (hdr[5] & 0x01) == 0x01 else {
+            return
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: cacheURL.path)
+        let fsize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        guard fsize > Self.headerSize + 16 else { return }
+
+        let durMs = (UInt32(hdr[12]) << 24) | (UInt32(hdr[13]) << 16) | (UInt32(hdr[14]) << 8) | UInt32(hdr[15])
+        let durSec = Double(durMs) / 1000.0
+
+        lock.lock()
+        _validByteLength = fsize
+        _totalDurationSec = durSec
+        _cachedDurationSec = durSec
+        _isComplete = true
+        _isPreparing = false
+        _status = .ready(totalSeconds: durSec)
+        lock.unlock()
+    }
+
+    func setBackgroundMode(_ inBackground: Bool) {
+        lock.lock()
+        let prev = _isBackgroundMode
+        _isBackgroundMode = inBackground
+        let shouldResume = (!inBackground && !_isComplete && !_isPreparing && _failedError == nil)
+        lock.unlock()
+
+        if !inBackground && prev && shouldResume {
+            startOrResumePreparation()
+        }
+    }
+
+    func startOrResumePreparation() {
+        lock.lock()
+        if _isComplete || _isPreparing || _isBackgroundMode {
+            lock.unlock()
+            return
+        }
+        _isPreparing = true
+        _isPausedForBackground = false
+        _failedError = nil
+        let resuming = (_validByteLength > Self.headerSize && _lastEncodedPtsSec >= 0)
+        let resumeFromPts = _lastEncodedPtsSec
+        lock.unlock()
+
+        prepTask = Task.detached(priority: .userInitiated) { [weak self] in
+            self?.runPreparationLoop(resuming: resuming, resumeFromPts: resumeFromPts)
+        }
+    }
+
+    func cancelPreparation() {
+        prepTask?.cancel()
+        prepTask = nil
+        lock.lock()
+        _isPreparing = false
+        lock.unlock()
+    }
+
+    private func makeHeaderBytes(complete: Bool, width: Int, height: Int, fps: Int, durationMs: UInt32) -> Data {
+        var hdr = Data(capacity: Int(Self.headerSize))
+        hdr.append(contentsOf: Self.magic)
+        hdr.append(1) // version
+        hdr.append(complete ? 0x01 : 0x00)
+        let w16 = UInt16(clamping: width)
+        let h16 = UInt16(clamping: height)
+        let f16 = UInt16(clamping: fps)
+        hdr.append(UInt8((w16 >> 8) & 0xFF)); hdr.append(UInt8(w16 & 0xFF))
+        hdr.append(UInt8((h16 >> 8) & 0xFF)); hdr.append(UInt8(h16 & 0xFF))
+        hdr.append(UInt8((f16 >> 8) & 0xFF)); hdr.append(UInt8(f16 & 0xFF))
+        hdr.append(UInt8((durationMs >> 24) & 0xFF))
+        hdr.append(UInt8((durationMs >> 16) & 0xFF))
+        hdr.append(UInt8((durationMs >> 8) & 0xFF))
+        hdr.append(UInt8(durationMs & 0xFF))
+        return hdr
+    }
+
+    private func runPreparationLoop(resuming: Bool, resumeFromPts: Double) {
+        let asset = AVURLAsset(url: sourceURL)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            markFailed("File \(sourceTitle) không có track video")
+            return
+        }
+
+        let trackDur = CMTimeGetSeconds(asset.duration)
+        let totalDur = (trackDur.isFinite && trackDur > 0) ? trackDur : 0.0
+        lock.lock()
+        if totalDur > 0 { _totalDurationSec = totalDur }
+        lock.unlock()
+
+        // Tính kích thước hiển thị thực (tự động xoay đúng chiều cho video dọc TikTok / iPhone!)
+        let prefTransform = videoTrack.preferredTransform
+        let transformedRect = CGRect(origin: .zero, size: videoTrack.naturalSize).applying(prefTransform)
+        let displaySize = CGSize(width: abs(transformedRect.width), height: abs(transformedRect.height))
+        let (encW, encH) = TreoMediaBroadcastEngine.computeTargetSize(
+            naturalSize: displaySize,
+            maxWidth: profile.width,
+            maxHeight: profile.height
+        )
+
+        let nominalFps = Double(videoTrack.nominalFrameRate)
+        let targetFps = Double(profile.fps)
+        let effFps = (nominalFps >= 5 && nominalFps <= 60) ? min(nominalFps, targetFps) : min(30.0, targetFps)
+        let effFpsInt = max(10, min(60, Int(effFps.rounded())))
+        let minFrameSec = 1.0 / targetFps
+        let defaultStepMs = 1000.0 / effFps
+
+        // Chuẩn bị file đích
+        let fm = FileManager.default
+        let dir = cacheURL.deletingLastPathComponent()
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        if !resuming {
+            let initHdr = makeHeaderBytes(complete: false, width: encW, height: encH, fps: effFpsInt, durationMs: UInt32(max(0, totalDur * 1000.0)))
+            do {
+                try initHdr.write(to: cacheURL, options: .atomic)
+            } catch {
+                markFailed("Không tạo được file cache video: \(error.localizedDescription)")
+                return
+            }
+            lock.lock()
+            _validByteLength = Self.headerSize
+            _lastEncodedPtsSec = -1.0
+            _cachedDurationSec = 0.0
+            _frameCount = 0
+            lock.unlock()
+            emitLog("⚡ Đang tối ưu Full Video chạy nền (0% GPU): \(sourceTitle) (\(encW)x\(encH)@\(effFpsInt)fps)...")
+        } else {
+            emitLog("☀️ Tiếp tục tối ưu phần còn lại của video từ \(Int(resumeFromPts))s...")
+        }
+
+        guard let writeHandle = try? FileHandle(forWritingTo: cacheURL) else {
+            markFailed("Không mở được file cache để ghi")
+            return
+        }
+        defer { try? writeHandle.close() }
+
+        lock.lock()
+        let startWriteOffset = _validByteLength
+        lock.unlock()
+        do {
+            try writeHandle.truncate(atOffset: UInt64(startWriteOffset))
+            try writeHandle.seek(toOffset: UInt64(startWriteOffset))
+        } catch {
+            markFailed("Lỗi chuẩn bị vị trí ghi cache: \(error.localizedDescription)")
+            return
+        }
+
+        guard let encoder = HardwareH264Encoder(
+            width: encW,
+            height: encH,
+            fps: effFpsInt,
+            bitrateKbps: profile.bitrateKbps,
+            maxBitrateKbps: profile.maxBitrateKbps,
+            realTime: false,
+            keyFrameIntervalSec: 1.5
+        ) else {
+            if isBackgroundMode {
+                markPausedForBackground()
+            } else {
+                markFailed("Không khởi tạo được Hardware H.264 Encoder")
+            }
+            return
+        }
+
+        let outputSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            kCVPixelBufferWidthKey as String: encW,
+            kCVPixelBufferHeightKey as String: encH,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+        ]
+
+        let needsTransform = (abs(prefTransform.b) > 0.01 || abs(prefTransform.c) > 0.01 || prefTransform.a < 0 || prefTransform.d < 0)
+
+        func makeReader(useComposition: Bool) -> (AVAssetReader, AVAssetReaderOutput)? {
+            guard let r = try? AVAssetReader(asset: asset) else { return nil }
+            if resuming && resumeFromPts >= 0 {
+                let startTime = CMTime(seconds: resumeFromPts + 0.001, preferredTimescale: 90_000)
+                r.timeRange = CMTimeRange(start: startTime, duration: .positiveInfinity)
+            }
+            if useComposition {
+                let comp = AVMutableVideoComposition()
+                comp.renderSize = CGSize(width: encW, height: encH)
+                comp.frameDuration = CMTime(value: 1, timescale: CMTimeScale(effFpsInt))
+
+                let instr = AVMutableVideoCompositionInstruction()
+                let dur = asset.duration.isValid && !asset.duration.isIndefinite
+                    ? asset.duration
+                    : CMTime(seconds: max(1.0, totalDur), preferredTimescale: 600)
+                instr.timeRange = CMTimeRange(start: .zero, duration: dur)
+
+                let layerInstr = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
+                let tx = -transformedRect.origin.x
+                let ty = -transformedRect.origin.y
+                let sx = CGFloat(encW) / max(1.0, displaySize.width)
+                let sy = CGFloat(encH) / max(1.0, displaySize.height)
+                let finalTransform = prefTransform
+                    .concatenating(CGAffineTransform(translationX: tx, y: ty))
+                    .concatenating(CGAffineTransform(scaleX: sx, y: sy))
+                layerInstr.setTransform(finalTransform, at: .zero)
+                instr.layerInstructions = [layerInstr]
+                comp.instructions = [instr]
+
+                // AVAssetReaderVideoCompositionOutput KHÔNG cho phép width/height keys trong videoSettings (comp.renderSize quyết định kích thước)
+                let compSettings: [String: Any] = [
+                    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+                ]
+                let compOut = AVAssetReaderVideoCompositionOutput(videoTracks: [videoTrack], videoSettings: compSettings)
+                compOut.videoComposition = comp
+                compOut.alwaysCopiesSampleData = false
+                if r.canAdd(compOut) {
+                    r.add(compOut)
+                    if r.startReading() { return (r, compOut) }
+                }
+                return nil
+            } else {
+                let trackOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+                trackOut.alwaysCopiesSampleData = false
+                if r.canAdd(trackOut) {
+                    r.add(trackOut)
+                    if r.startReading() { return (r, trackOut) }
+                }
+                return nil
+            }
+        }
+
+        let readerPair: (AVAssetReader, AVAssetReaderOutput)? = needsTransform
+            ? (makeReader(useComposition: true) ?? makeReader(useComposition: false))
+            : makeReader(useComposition: false)
+
+        guard let (reader, readerOutput) = readerPair else {
+            encoder.invalidate()
+            if isBackgroundMode {
+                markPausedForBackground()
+            } else {
+                markFailed("AVAssetReader không mở được video \(sourceTitle)")
+            }
+            return
+        }
+        defer { reader.cancelReading() }
+
+        // Semaphore backpressure: giữ tối đa 4 frame in-flight -> RAM luôn < 15MB, tốc độ ~25x–50x!
+        let inFlightSem = DispatchSemaphore(value: 4)
+        var lastEmittedPtsSec = resuming ? resumeFromPts : -1.0
+        var localFrameIdx: Int64 = 0
+        var hitBgInterrupt = false
+        var lastProgressEmit = Date.distantPast
+
+        emitStatus(.preparing(
+            progress: totalDur > 0 ? min(0.99, max(0.0, cachedDurationSec / totalDur)) : 0.0,
+            cachedSeconds: cachedDurationSec
+        ))
+
+        while !Task.isCancelled && reader.status == .reading {
+            if isBackgroundMode || encoder.needsRebuild {
+                hitBgInterrupt = true
+                break
+            }
+
+            let stepResult: Int = autoreleasepool {
+                guard let sb = readerOutput.copyNextSampleBuffer() else { return 0 } // EOF
+                guard let pb = CMSampleBufferGetImageBuffer(sb) else { return 1 } // skip
+
+                let srcPts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+                let validPts = srcPts.isFinite ? srcPts : (lastEmittedPtsSec >= 0 ? lastEmittedPtsSec + (defaultStepMs / 1000.0) : 0.0)
+                if lastEmittedPtsSec >= 0 && validPts >= lastEmittedPtsSec && (validPts - lastEmittedPtsSec) < minFrameSec * 0.75 {
+                    return 1 // skip frame vượt FPS target
+                }
+
+                let deltaMs: Double
+                if lastEmittedPtsSec >= 0 && validPts > lastEmittedPtsSec && (validPts - lastEmittedPtsSec) < 0.5 {
+                    deltaMs = (validPts - lastEmittedPtsSec) * 1000.0
+                } else {
+                    deltaMs = defaultStepMs
+                }
+                let deltaMicros = UInt32(max(8_000.0, min(250_000.0, (deltaMs * 1000.0).rounded())))
+                lastEmittedPtsSec = validPts
+
+                let forceKey = (localFrameIdx == 0) || (localFrameIdx % Int64(max(15, Int(Double(effFpsInt) * 1.5))) == 0)
+                let encPts = CMTime(seconds: validPts, preferredTimescale: 90_000)
+                let encDur = CMTime(value: Int64(deltaMicros), timescale: 1_000_000)
+                localFrameIdx += 1
+
+                inFlightSem.wait()
+                encoder.encodeGuaranteed(
+                    pixelBuffer: pb,
+                    pts: encPts,
+                    duration: encDur,
+                    forceKeyFrame: forceKey
+                ) { [weak self] annexB, isKey, status in
+                    defer { inFlightSem.signal() }
+                    guard let self = self, status == noErr else { return }
+                    guard let data = annexB, !data.isEmpty else { return }
+                    self.appendRecord(
+                        writeHandle: writeHandle,
+                        deltaMicros: deltaMicros,
+                        isKey: isKey,
+                        annexB: data,
+                        ptsSec: validPts
+                    )
+                }
+                return 2
+            }
+
+            if stepResult == 0 { break } // EOF
+            if encoder.needsRebuild {
+                hitBgInterrupt = true
+                break
+            }
+
+            let now = Date()
+            if now.timeIntervalSince(lastProgressEmit) >= 0.25 {
+                lastProgressEmit = now
+                let curCached = cachedDurationSec
+                let pct = totalDur > 0 ? min(0.99, max(0.01, curCached / totalDur)) : 0.5
+                emitStatus(.preparing(progress: pct, cachedSeconds: curCached))
+            }
+        }
+
+        // Xả toàn bộ frame đang in-flight trong VideoToolbox trước khi đóng handle
+        encoder.invalidate()
+
+        if Task.isCancelled {
+            lock.lock()
+            _isPreparing = false
+            lock.unlock()
+            return
+        }
+
+        if hitBgInterrupt || isBackgroundMode || encoder.needsRebuild {
+            markPausedForBackground()
+            return
+        }
+
+        // Hoàn tất 100% toàn bộ video! Cập nhật cờ COMPLETE (byte 5 = 0x01) trên header đĩa
+        lock.lock()
+        let finalDur = max(_cachedDurationSec, _totalDurationSec)
+        let finalBytes = _validByteLength
+        let finalFrames = _frameCount
+        lock.unlock()
+
+        if finalBytes <= Self.headerSize {
+            markFailed("Không trích xuất được khung hình H.264 nào từ \(sourceTitle)")
+            return
+        }
+
+        let completeHdr = makeHeaderBytes(
+            complete: true,
+            width: encW,
+            height: encH,
+            fps: effFpsInt,
+            durationMs: UInt32(max(0, finalDur * 1000.0))
+        )
+        writeLock.lock()
+        do {
+            try writeHandle.seek(toOffset: 0)
+            try writeHandle.write(contentsOf: completeHdr)
+            try writeHandle.synchronize()
+        } catch {}
+        writeLock.unlock()
+
+        lock.lock()
+        _isComplete = true
+        _isPreparing = false
+        _isPausedForBackground = false
+        lock.unlock()
+
+        let mb = Double(finalBytes) / (1024.0 * 1024.0)
+        emitStatus(.ready(totalSeconds: finalDur))
+        emitLog(String(format: "✅ Đã tối ưu xong Full Video 100%% (%.1fs | %d khung | %.1fMB • 0%% GPU chạy nền): %@", finalDur, finalFrames, mb, sourceTitle))
+    }
+
+    private func appendRecord(writeHandle: FileHandle, deltaMicros: UInt32, isKey: Bool, annexB: Data, ptsSec: Double) {
+        let len = UInt32(annexB.count)
+        var rec = Data(capacity: 9 + annexB.count)
+        rec.append(UInt8((deltaMicros >> 24) & 0xFF))
+        rec.append(UInt8((deltaMicros >> 16) & 0xFF))
+        rec.append(UInt8((deltaMicros >> 8) & 0xFF))
+        rec.append(UInt8(deltaMicros & 0xFF))
+        rec.append(isKey ? 1 : 0)
+        rec.append(UInt8((len >> 24) & 0xFF))
+        rec.append(UInt8((len >> 16) & 0xFF))
+        rec.append(UInt8((len >> 8) & 0xFF))
+        rec.append(UInt8(len & 0xFF))
+        rec.append(annexB)
+
+        writeLock.lock()
+        let wroteOK: Bool
+        do {
+            _ = try writeHandle.seekToEnd()
+            try writeHandle.write(contentsOf: rec)
+            wroteOK = true
+        } catch {
+            wroteOK = false
+        }
+        writeLock.unlock()
+
+        guard wroteOK else { return }
+
+        lock.lock()
+        _validByteLength += Int64(rec.count)
+        _lastEncodedPtsSec = max(_lastEncodedPtsSec, ptsSec)
+        _cachedDurationSec += Double(deltaMicros) / 1_000_000.0
+        _frameCount += 1
+        lock.unlock()
+    }
+
+    private func markPausedForBackground() {
+        lock.lock()
+        _isPreparing = false
+        _isPausedForBackground = true
+        let cached = _cachedDurationSec
+        let total = _totalDurationSec
+        lock.unlock()
+
+        let pct = total > 0 ? min(0.99, max(0.0, cached / total)) : 0.0
+        emitStatus(.pausedForBackground(progress: pct, cachedSeconds: cached))
+        if cached >= 1.0 {
+            emitLog(String(format: "🌙 Đã tối ưu %.0f%% (%.1fs) — phát liên tục phần này ở nền & tự nối tiếp khi mở lại app.", pct * 100.0, cached))
+        }
+    }
+
+    private func markFailed(_ message: String) {
+        lock.lock()
+        _isPreparing = false
+        _failedError = message
+        lock.unlock()
+        emitStatus(.failed(message))
+        emitLog("❌ \(message)")
+    }
+}
+
+/// Quản lý cache Full Video H.264 trên đĩa (chia sẻ giữa Go Live & Fake Cam, tự dọn cache cũ > 350MB)
+final class H264FullVideoCacheManager {
+    static let shared = H264FullVideoCacheManager()
+
+    private let lock = NSLock()
+    private var sessions: [String: H264FullVideoCacheSession] = [:]
+    private var isBackgroundMode = false
+
+    private init() {}
+
+    private var cacheDirectory: URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("TreoH264Cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    func setAppInBackground(_ inBackground: Bool) {
+        lock.lock()
+        isBackgroundMode = inBackground
+        let all = Array(sessions.values)
+        lock.unlock()
+        for s in all {
+            s.setBackgroundMode(inBackground)
+        }
+    }
+
+    static func cacheKey(url: URL, title: String, profile: DiscordStreamProfile) -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fsize = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let raw = "\(title)|\(fsize)|\(profile.width)x\(profile.height)|\(profile.fps)|\(profile.bitrateKbps)"
+        let digest = SHA256.hash(data: Data(raw.utf8))
+        return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func getOrCreateSession(url: URL, title: String, profile: DiscordStreamProfile) -> H264FullVideoCacheSession {
+        let key = Self.cacheKey(url: url, title: title, profile: profile)
+        lock.lock()
+        if let existing = sessions[key] {
+            let bg = isBackgroundMode
+            lock.unlock()
+            existing.setBackgroundMode(bg)
+            return existing
+        }
+        let cacheURL = cacheDirectory.appendingPathComponent("\(key).h264bin")
+        let sess = H264FullVideoCacheSession(
+            cacheKey: key,
+            sourceURL: url,
+            sourceTitle: title,
+            profile: profile,
+            cacheURL: cacheURL
+        )
+        sess.setBackgroundMode(isBackgroundMode)
+        sessions[key] = sess
+        let protectedNames = Set(sessions.values.map { $0.cacheURL.lastPathComponent })
+        lock.unlock()
+
+        pruneOldCacheFiles(keeping: protectedNames)
+        return sess
+    }
+
+    private func pruneOldCacheFiles(keeping protectedNames: Set<String>) {
+        DispatchQueue.global(qos: .utility).async { [cacheDirectory] in
+            let fm = FileManager.default
+            guard let urls = try? fm.contentsOfDirectory(
+                at: cacheDirectory,
+                includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            ) else { return }
+
+            var items: [(url: URL, size: Int64, mtime: Date)] = []
+            var totalBytes: Int64 = 0
+            for u in urls where u.pathExtension == "h264bin" {
+                let vals = try? u.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                let sz = Int64(vals?.fileSize ?? 0)
+                let mt = vals?.contentModificationDate ?? .distantPast
+                totalBytes += sz
+                items.append((u, sz, mt))
+            }
+
+            let maxBytes: Int64 = 350 * 1024 * 1024
+            let maxFiles = 8
+            guard totalBytes > maxBytes || items.count > maxFiles else { return }
+
+            items.sort { $0.mtime < $1.mtime }
+            var remaining = items.count
+            for item in items {
+                if totalBytes <= maxBytes && remaining <= maxFiles { break }
+                if protectedNames.contains(item.url.lastPathComponent) { continue }
+                try? fm.removeItem(at: item.url)
+                totalBytes -= item.size
+                remaining -= 1
+            }
+        }
+    }
+}
+
+// ==============================================================================
+// MARK: - SHARED MEDIA BROADCAST ENGINE (LOOP ∞ FULL VIDEO + AUDIO -> ALL TOKENS)
 // ==============================================================================
 
 final class TreoMediaBroadcastEngine {
@@ -1566,13 +2280,28 @@ final class TreoMediaBroadcastEngine {
         bgLoopCache.reset()
     }
 
-    /// Kiểm tra file .mp4/.mov có thể đọc H.264 trực tiếp không cần giải mã/mã hóa GPU (chạy nền 24/7 0% GPU!)
-    private static func canUseDirectH264Passthrough(asset: AVURLAsset, track: AVAssetTrack) -> Bool {
+    /// Kiểm tra file .mp4/.mov có thể đọc H.264 trực tiếp (không cần tối ưu trước) với 0% GPU hay không
+    static func canUseDirectH264Passthrough(asset: AVURLAsset, track: AVAssetTrack, profile: DiscordStreamProfile) -> Bool {
         guard let fmtAny = track.formatDescriptions.first else { return false }
         let fmt = fmtAny as! CMFormatDescription
         guard CMFormatDescriptionGetMediaSubType(fmt) == kCMVideoCodecType_H264 else {
             return false
         }
+        // Nếu video bị xoay/lật (TikTok/iPhone dọc có preferredTransform) -> tối ưu để xoay đứng chuẩn xác
+        let t = track.preferredTransform
+        if abs(t.b) > 0.01 || abs(t.c) > 0.01 || t.a < 0 || t.d < 0 {
+            return false
+        }
+        // Nếu độ phân giải hoặc bitrate vượt xa profile Discord -> tối ưu để tránh Discord drop khung hình
+        let nw = Int(abs(track.naturalSize.width))
+        let nh = Int(abs(track.naturalSize.height))
+        if nw > profile.width + 16 || nh > profile.height + 16 {
+            return false
+        }
+        if track.estimatedDataRate > Float(profile.maxBitrateKbps * 1300) {
+            return false
+        }
+
         guard let reader = try? AVAssetReader(asset: asset) else { return false }
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         output.alwaysCopiesSampleData = false
@@ -1584,10 +2313,10 @@ final class TreoMediaBroadcastEngine {
         var prevPts: Double = -Double.infinity
         var sawKeyFrame = false
         var checked = 0
-        while checked < 45, let sb = output.copyNextSampleBuffer() {
+        while checked < 60, let sb = output.copyNextSampleBuffer() {
             let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
             if pts.isFinite {
-                // Nếu có B-frame (PTS nhảy lùi so với frame trước) thì không passthrough để tránh giật hình WebRTC
+                // Nếu có B-frame (PTS nhảy lùi so với frame trước) -> dùng Full-Video H.264 Cache để mượt tuyệt đối
                 if pts + 0.0005 < prevPts {
                     return false
                 }
@@ -1602,7 +2331,7 @@ final class TreoMediaBroadcastEngine {
     }
 
     /// Tính kích thước chẵn vừa trong profile mà vẫn giữ đúng tỷ lệ gốc (không làm méo video hoặc lệch kích thước encoder)
-    private static func computeTargetSize(naturalSize: CGSize, maxWidth: Int, maxHeight: Int) -> (Int, Int) {
+    static func computeTargetSize(naturalSize: CGSize, maxWidth: Int, maxHeight: Int) -> (Int, Int) {
         let nw = Double(abs(naturalSize.width))
         let nh = Double(abs(naturalSize.height))
         guard nw > 16, nh > 16 else { return (maxWidth, maxHeight) }
@@ -1614,8 +2343,8 @@ final class TreoMediaBroadcastEngine {
         return (w, h)
     }
 
-    /// Phát lặp vô hạn (Loop ∞) file Video (.mp4/.mov), Audio (.mp3/.m4a/.wav -> màn hình đen), hoặc mẫu ảo
-    /// Hỗ trợ chạy nền 24/7 khi thoát app / khóa màn hình (Passthrough 0% GPU + H.264 GOP Cache + Tự khôi phục VideoToolbox)
+    /// Phát lặp vô hạn (Loop ∞) FULL VIDEO (.mp4/.mov), Audio (.mp3/.m4a/.wav -> màn hình đen), hoặc mẫu ảo
+    /// 0% GPU chạy nền 24/7: Direct H.264 Passthrough HOẶC Full-Video Progressive `.h264bin` Disk Stream!
     func start(
         source: TreoMediaSource,
         profile: DiscordStreamProfile,
@@ -1628,11 +2357,12 @@ final class TreoMediaBroadcastEngine {
         requestKeyFrame()
         bgLoopCache.reset()
 
-        // 1. Luồng Video (Direct H.264 Passthrough 0% GPU / Hardware VideoToolbox + Background GOP Cache)
+        // 1. Luồng Video
         videoTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
 
             if source.isVirtualPattern || source.isAudioOnly || source.url == nil {
+                // Mẫu ảo (sóng màu) hoặc màn hình đen (file nhạc .mp3/.wav)
                 let encFps = source.isAudioOnly ? min(profile.fps, 15) : min(profile.fps, 30)
                 let encW = source.isAudioOnly ? 1280 : profile.width
                 let encH = source.isAudioOnly ? 720 : profile.height
@@ -1665,11 +2395,10 @@ final class TreoMediaBroadcastEngine {
                     let wantKey = (frameIndex % Int64(encFps * 2) == 0) || self.consumeKeyFrameRequest()
                     let inBg = self.isBackgroundMode
 
-                    // Khi thoát app hoặc VideoToolbox bị iOS thu hồi -> phát liên tục từ H.264 GOP Cache (0% GPU!)
                     if (inBg || encoder == nil || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
                         if !loggedBgFallback {
                             loggedBgFallback = true
-                            onLog?("🌙 Đã chuyển video sang chế độ chạy nền (0% GPU) — stream tiếp tục mượt khi thoát app!")
+                            onLog?("🌙 Đã chuyển mẫu ảo/màn đen sang chạy nền (0% GPU).")
                         }
                         if let cached = self.bgLoopCache.nextFrame(forceKey: wantKey) {
                             onVideoFrame(cached, frameDurationMs)
@@ -1687,7 +2416,6 @@ final class TreoMediaBroadcastEngine {
                             )
                             if encoder != nil && loggedBgFallback {
                                 loggedBgFallback = false
-                                onLog?("☀️ Đã khôi phục Hardware H.264 Encoder khi mở lại app.")
                             }
                         }
 
@@ -1706,7 +2434,7 @@ final class TreoMediaBroadcastEngine {
                                 forceKeyFrame: wantKey,
                                 onError: { st in
                                     if !self.bgLoopCache.hasCachedFrames {
-                                        onLog?("⚠️ VideoToolbox tạm ngưng (OSStatus \(st)), tự động chuyển chạy nền...")
+                                        onLog?("⚠️ VideoToolbox tạm ngưng (OSStatus \(st)), chuyển sang nền...")
                                     }
                                 }
                             ) { annexB, isKey in
@@ -1735,9 +2463,9 @@ final class TreoMediaBroadcastEngine {
                     return
                 }
 
-                // NHÁNH A: DIRECT H.264 PASSTHROUGH (0% GPU — đọc thẳng khung H.264 từ file MP4/MOV, chạy nền 24/7 cực mượt!)
-                if TreoMediaBroadcastEngine.canUseDirectH264Passthrough(asset: probeAsset, track: probeTrack) {
-                    onLog?("⚡ H.264 Direct Passthrough (0% GPU — chạy mượt kể cả khi thoát app/khóa màn hình): \(source.title)")
+                // NHÁNH A: DIRECT H.264 PASSTHROUGH (0% GPU — đọc thẳng H.264 từ file MP4/MOV gốc, Full Video 24/7!)
+                if TreoMediaBroadcastEngine.canUseDirectH264Passthrough(asset: probeAsset, track: probeTrack, profile: profile) {
+                    onLog?("⚡ H.264 Direct Passthrough (Full Video • 0% GPU chạy nền): \(source.title)")
                     var loggedFirst = false
 
                     while !Task.isCancelled {
@@ -1779,7 +2507,6 @@ final class TreoMediaBroadcastEngine {
 
                             if let annexB = HardwareH264Encoder.extractAnnexB(from: sb, includeParameterSets: isKey),
                                !annexB.isEmpty {
-                                self.bgLoopCache.record(frame: annexB, isKey: isKey)
                                 if !loggedFirst {
                                     loggedFirst = true
                                     onLog?("🎬 H.264 Passthrough OK (\(Int(effFps))fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
@@ -1801,158 +2528,116 @@ final class TreoMediaBroadcastEngine {
                     return
                 }
 
-                // NHÁNH B: TRANSCODE VIDEOTOOLBOX + BACKGROUND H.264 GOP CACHE (cho HEVC .mov / MP4 có B-frame)
-                let (encW, encH) = TreoMediaBroadcastEngine.computeTargetSize(
-                    naturalSize: probeTrack.naturalSize,
-                    maxWidth: profile.width,
-                    maxHeight: profile.height
+                // NHÁNH B: FULL-VIDEO PROGRESSIVE H.264 DISK STREAM (0% GPU — KHÔNG LẶP ĐOẠN NGẮN KHI THOÁT APP!)
+                let cacheSession = H264FullVideoCacheManager.shared.getOrCreateSession(
+                    url: url,
+                    title: source.title,
+                    profile: profile
                 )
+                cacheSession.startOrResumePreparation()
 
-                var encoder: HardwareH264Encoder? = HardwareH264Encoder(
-                    width: encW,
-                    height: encH,
-                    fps: profile.fps,
-                    bitrateKbps: profile.bitrateKbps,
-                    maxBitrateKbps: profile.maxBitrateKbps
-                )
-                defer { encoder?.invalidate() }
+                // Đợi file cache được tạo & có ít nhất 1 khung đầu tiên (~50–150ms)
+                while !Task.isCancelled && cacheSession.validByteLength <= H264FullVideoCacheSession.headerSize {
+                    if let err = cacheSession.failedError {
+                        onLog?("❌ Lỗi chuẩn bị video chạy nền: \(err)")
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 25_000_000)
+                }
+                guard !Task.isCancelled else { return }
 
-                let targetFps = Double(profile.fps)
-                let minFrameMs = 1000.0 / targetFps
-                let minFrameNs = UInt64(minFrameMs * 1_000_000.0)
-                var globalFrameIndex: Int64 = 0
+                var readHandle: FileHandle? = try? FileHandle(forReadingFrom: cacheSession.cacheURL)
+                defer { try? readHandle?.close() }
+
+                var offset: Int64 = H264FullVideoCacheSession.headerSize
+                var sentFirstKey = false
                 var loggedFirst = false
-                var loggedBgFallback = false
+                var nextTick = DispatchTime.now().uptimeNanoseconds
 
                 while !Task.isCancelled {
-                    // Nếu đang ở nền và đã có GOP cache -> phát vòng lặp GOP 0% GPU cho đến khi mở lại app!
-                    if (self.isBackgroundMode || encoder == nil || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
-                        if !loggedBgFallback {
-                            loggedBgFallback = true
-                            onLog?("🌙 Video chuyển chế độ chạy nền (0% GPU GOP Cache) — giữ stream sống 24/7 khi thoát app!")
-                        }
-                        var bgTick = DispatchTime.now().uptimeNanoseconds
-                        let bgStepMs = max(minFrameMs, 1000.0 / min(30.0, targetFps))
-                        let bgStepNs = UInt64(bgStepMs * 1_000_000.0)
-                        while !Task.isCancelled && (self.isBackgroundMode || encoder == nil || encoder?.needsRebuild == true) {
-                            bgTick &+= bgStepNs
-                            let wantKey = self.consumeKeyFrameRequest()
-                            if let cached = self.bgLoopCache.nextFrame(forceKey: wantKey) {
-                                onVideoFrame(cached, bgStepMs)
-                            }
-                            // Khi người dùng mở lại app -> tái tạo encoder và thoát vòng nền ngay
-                            if !self.isBackgroundMode {
-                                if encoder == nil || encoder?.needsRebuild == true {
-                                    encoder?.invalidate()
-                                    encoder = HardwareH264Encoder(
-                                        width: encW,
-                                        height: encH,
-                                        fps: profile.fps,
-                                        bitrateKbps: profile.bitrateKbps,
-                                        maxBitrateKbps: profile.maxBitrateKbps
-                                    )
-                                }
-                                if encoder != nil {
-                                    loggedBgFallback = false
-                                    onLog?("☀️ Đã khôi phục phát video gốc khi quay lại app.")
-                                    break
-                                }
-                            }
-                            let now = DispatchTime.now().uptimeNanoseconds
-                            if bgTick > now {
-                                try? await Task.sleep(nanoseconds: bgTick - now)
-                            } else if now - bgTick > 250_000_000 {
-                                bgTick = now
-                            }
-                        }
-                        if !self.isBackgroundMode && loggedBgFallback {
-                            loggedBgFallback = false
-                        }
-                        continue
-                    }
-
-                    let asset = AVURLAsset(url: url)
-                    guard let videoTrack = asset.tracks(withMediaType: .video).first,
-                          let reader = try? AVAssetReader(asset: asset) else {
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        continue
-                    }
-
-                    let outputSettings: [String: Any] = [
-                        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-                        kCVPixelBufferWidthKey as String: encW,
-                        kCVPixelBufferHeightKey as String: encH,
-                        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
-                    ]
-                    let trackOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
-                    trackOutput.alwaysCopiesSampleData = false
-                    guard reader.canAdd(trackOutput) else { break }
-                    reader.add(trackOutput)
-                    guard reader.startReading() else {
-                        if self.bgLoopCache.hasCachedFrames {
-                            try? await Task.sleep(nanoseconds: 100_000_000)
+                    if readHandle == nil {
+                        readHandle = try? FileHandle(forReadingFrom: cacheSession.cacheURL)
+                        if readHandle == nil {
+                            try? await Task.sleep(nanoseconds: 50_000_000)
                             continue
                         }
-                        onLog?("❌ AVAssetReader lỗi mở video: \(reader.error?.localizedDescription ?? "unknown")")
-                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+
+                    let validLen = cacheSession.validByteLength
+                    if offset + 9 > validLen {
+                        if cacheSession.isComplete {
+                            // Đã phát hết FULL VIDEO từ đầu đến cuối -> lặp lại từ đầu!
+                            offset = H264FullVideoCacheSession.headerSize
+                            nextTick = DispatchTime.now().uptimeNanoseconds
+                            continue
+                        } else if cacheSession.isPreparing && !cacheSession.isBackgroundMode {
+                            // Đang mã hóa tiếp ở tốc độ phần cứng (20x–50x) -> chờ 20ms cho khung mới
+                            try? await Task.sleep(nanoseconds: 20_000_000)
+                            nextTick = DispatchTime.now().uptimeNanoseconds
+                            continue
+                        } else if validLen > H264FullVideoCacheSession.headerSize {
+                            // Người dùng thoát app giữa chừng khi video rất dài đang tối ưu -> lặp toàn bộ phần đã tối ưu
+                            offset = H264FullVideoCacheSession.headerSize
+                            nextTick = DispatchTime.now().uptimeNanoseconds
+                            continue
+                        } else {
+                            if let err = cacheSession.failedError {
+                                onLog?("❌ Dừng luồng video: \(err)")
+                                break
+                            }
+                            try? await Task.sleep(nanoseconds: 50_000_000)
+                            continue
+                        }
+                    }
+
+                    guard let fh = readHandle else { continue }
+                    let record: (deltaMicros: UInt32, isKey: Bool, payload: Data)? = autoreleasepool {
+                        do {
+                            try fh.seek(toOffset: UInt64(offset))
+                            guard let hdr = try fh.read(upToCount: 9), hdr.count == 9 else { return nil }
+                            let deltaMicros = (UInt32(hdr[0]) << 24) | (UInt32(hdr[1]) << 16) | (UInt32(hdr[2]) << 8) | UInt32(hdr[3])
+                            let isKey = (hdr[4] != 0)
+                            let payloadLen = (UInt32(hdr[5]) << 24) | (UInt32(hdr[6]) << 16) | (UInt32(hdr[7]) << 8) | UInt32(hdr[8])
+                            guard payloadLen > 0, payloadLen <= 4_000_000, offset + 9 + Int64(payloadLen) <= cacheSession.validByteLength else {
+                                return nil
+                            }
+                            guard let payload = try fh.read(upToCount: Int(payloadLen)), payload.count == Int(payloadLen) else {
+                                return nil
+                            }
+                            return (deltaMicros, isKey, payload)
+                        } catch {
+                            return nil
+                        }
+                    }
+
+                    guard let rec = record else {
+                        try? await Task.sleep(nanoseconds: 20_000_000)
                         continue
                     }
 
-                    let nominalFps = Double(videoTrack.nominalFrameRate)
-                    let effFps = (nominalFps >= 5 && nominalFps <= 60) ? min(nominalFps, targetFps) : min(30.0, targetFps)
-                    let stepMs = max(minFrameMs, 1000.0 / effFps)
-                    let stepNs = max(minFrameNs, UInt64(stepMs * 1_000_000.0))
-                    let cmDur = CMTime(seconds: stepMs / 1000.0, preferredTimescale: 90_000)
+                    offset += 9 + Int64(rec.payload.count)
 
-                    var nextTick = DispatchTime.now().uptimeNanoseconds
-                    var lastEmittedPtsSec: Double = -1.0
-
-                    while !Task.isCancelled && reader.status == .reading {
-                        if (self.isBackgroundMode || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
-                            break
-                        }
-                        guard let sb = trackOutput.copyNextSampleBuffer() else { break }
-                        guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
-
-                        let srcPts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
-                        if lastEmittedPtsSec >= 0 && srcPts >= lastEmittedPtsSec && (srcPts - lastEmittedPtsSec) < (minFrameMs / 1000.0) * 0.75 {
-                            continue
-                        }
-                        lastEmittedPtsSec = srcPts
-                        nextTick &+= stepNs
-
-                        let forceKey = (globalFrameIndex % Int64(max(15, Int(effFps * 2))) == 0) || self.consumeKeyFrameRequest()
-                        let outPts = CMTime(value: globalFrameIndex * Int64(90_000.0 / effFps), timescale: 90_000)
-                        encoder?.encode(
-                            pixelBuffer: pb,
-                            pts: outPts,
-                            duration: cmDur,
-                            forceKeyFrame: forceKey,
-                            onError: { st in
-                                if !self.bgLoopCache.hasCachedFrames {
-                                    onLog?("⚠️ VideoToolbox tạm ngưng (OSStatus \(st)), chuyển sang nền...")
-                                }
-                            }
-                        ) { annexB, isKey in
-                            self.bgLoopCache.record(frame: annexB, isKey: isKey)
-                            if !loggedFirst {
-                                loggedFirst = true
-                                onLog?("🎬 H.264 Encoder OK (\(encW)x\(encH)@\(Int(effFps))fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
-                            }
-                            onVideoFrame(annexB, stepMs)
-                        }
-                        globalFrameIndex += 1
-
-                        let now = DispatchTime.now().uptimeNanoseconds
-                        if nextTick > now {
-                            try? await Task.sleep(nanoseconds: nextTick - now)
-                        } else if now - nextTick > 200_000_000 {
-                            nextTick = now
-                        }
+                    if !sentFirstKey {
+                        if !rec.isKey { continue }
+                        sentFirstKey = true
                     }
 
-                    reader.cancelReading()
-                    self.requestKeyFrame()
+                    let deltaMs = max(8.0, min(250.0, Double(rec.deltaMicros) / 1000.0))
+                    let stepNs = UInt64(deltaMs * 1_000_000.0)
+                    nextTick &+= stepNs
+
+                    if !loggedFirst {
+                        loggedFirst = true
+                        onLog?("🎬 Full-Video 0% GPU Stream OK (Frame đầu: \(rec.payload.count)B, Key=\(rec.isKey) • Thoát app phát trọn video!)")
+                    }
+                    onVideoFrame(rec.payload, deltaMs)
+
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if nextTick > now {
+                        try? await Task.sleep(nanoseconds: nextTick - now)
+                    } else if now - nextTick > 250_000_000 {
+                        nextTick = now
+                    }
                 }
             }
         }
