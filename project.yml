@@ -14,9 +14,21 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: Sources/discord
-      - path: Assets.xcassets 
+      - path: Sources/Discord
+      - path: Assets.xcassets
     settings:
       base:
         INFOPLIST_FILE: info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        SWIFT_OBJC_BRIDGING_HEADER: DaveFFI/include/dave_ffi.h
+        HEADER_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/DaveFFI/include"
+        LIBRARY_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(SRCROOT)/DaveFFI/lib"
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-ldave_ffi"
+          - "-framework"
+          - "Security"

@@ -3512,17 +3512,18 @@ func extractUserId(from token: String) -> String? {
 
 // MARK: - DISCORD VOICE UDP CLIENT & PROTOCOL HANDSHAKE
 final class DiscordVoiceUDPClient {
+    private let lock = NSLock()
     private var sockfd: Int32 = -1
     private var serverAddr: sockaddr_in?
     private(set) var isConnected = false
 
     func connect(ip: String, port: UInt16) -> Bool {
         close()
-        sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-        guard sockfd >= 0 else { return false }
+        let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard fd >= 0 else { return false }
 
         var tv = timeval(tv_sec: 2, tv_usec: 0)
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -3533,19 +3534,28 @@ final class DiscordVoiceUDPClient {
             if let resolved = resolveHostToIPv4(ip) {
                 inet_pton(AF_INET, resolved, &addr.sin_addr)
             } else {
-                close()
+                Darwin.close(fd)
                 return false
             }
         }
 
+        lock.lock()
+        self.sockfd = fd
         self.serverAddr = addr
         self.isConnected = true
+        lock.unlock()
         return true
     }
 
     /// IP Discovery (Discord Voice UDP Protocol RFC - Hỗ trợ retry 3 lần)
     func discoverIP(ssrc: UInt32) -> (ip: String, port: UInt16)? {
-        guard sockfd >= 0, var addr = serverAddr else { return nil }
+        lock.lock()
+        let fd = sockfd
+        guard fd >= 0, var addr = serverAddr else {
+            lock.unlock()
+            return nil
+        }
+        lock.unlock()
 
         var packet = [UInt8](repeating: 0, count: 74)
         packet[0] = 0x00
@@ -3558,13 +3568,13 @@ final class DiscordVoiceUDPClient {
         packet[7] = UInt8(ssrc & 0xFF)
 
         var tv = timeval(tv_sec: 1, tv_usec: 0)
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
         for _ in 0..<3 {
             let sent = withUnsafePointer(to: &addr) { ptr -> Int in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                     packet.withUnsafeBufferPointer { buf in
-                        Darwin.sendto(sockfd, buf.baseAddress, 74, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        Darwin.sendto(fd, buf.baseAddress, 74, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                     }
                 }
             }
@@ -3577,7 +3587,7 @@ final class DiscordVoiceUDPClient {
             let recvd = withUnsafeMutablePointer(to: &fromAddr) { ptr -> Int in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                     response.withUnsafeMutableBufferPointer { buf in
-                        Darwin.recvfrom(sockfd, buf.baseAddress, 74, 0, sa, &fromLen)
+                        Darwin.recvfrom(fd, buf.baseAddress, 74, 0, sa, &fromLen)
                     }
                 }
             }
@@ -3597,22 +3607,32 @@ final class DiscordVoiceUDPClient {
     }
 
     func sendPacket(_ data: Data) {
-        guard sockfd >= 0, var addr = serverAddr else { return }
+        lock.lock()
+        let fd = sockfd
+        guard fd >= 0, var addr = serverAddr else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
         _ = withUnsafePointer(to: &addr) { ptr -> Int in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 data.withUnsafeBytes { raw in
-                    Darwin.sendto(sockfd, raw.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    Darwin.sendto(fd, raw.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
         }
     }
 
     func close() {
-        if sockfd >= 0 {
-            Darwin.close(sockfd)
-            sockfd = -1
-        }
+        lock.lock()
+        let fd = sockfd
+        sockfd = -1
+        serverAddr = nil
         isConnected = false
+        lock.unlock()
+        if fd >= 0 {
+            Darwin.close(fd)
+        }
     }
 
     deinit {
@@ -3620,86 +3640,277 @@ final class DiscordVoiceUDPClient {
     }
 }
 
-// MARK: - NATIVE OPUS AUDIO ENCODER (AVFOUNDATION & COREAUDIO)
-final class NativeOpusEncoder {
-    private var converter: AVAudioConverter?
-    private let inputFormat: AVAudioFormat
-    private let outputFormat: AVAudioFormat
+// MARK: - DAVE FFI BUFFER HELPER & E2EE SESSION (DISCORD DAVE / MLS PROTOCOL)
+private func consumeDaveBuffer(_ buf: DaveByteBuffer) -> Data? {
+    defer { dave_buffer_free(buf) }
+    guard let ptr = buf.ptr, buf.len > 0 else { return nil }
+    return Data(bytes: ptr, count: buf.len)
+}
 
-    init?() {
-        // Định dạng PCM đầu vào: 48kHz Stereo Float32
-        guard let inFmt = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: 48000.0,
-            channels: 2,
-            interleaved: false
-        ) else { return nil }
-        self.inputFormat = inFmt
+final class DaveE2EESession {
+    private let lock = NSLock()
+    private var handle: OpaquePointer?
+    private(set) var protocolVersion: UInt16 = 0
+    private let userId: UInt64
+    private let channelId: UInt64
+    private var pendingTransitions: [UInt16: UInt16] = [:]
+    private var pendingExternalSender: Data?
+    private var downgraded: Bool = false
 
-        var opusDesc = AudioStreamBasicDescription(
-            mSampleRate: 48000.0,
-            mFormatID: kAudioFormatOpus,
-            mFormatFlags: 0,
-            mBytesPerPacket: 0,
-            mFramesPerPacket: 960, // 20ms ở 48000Hz = 960 samples
-            mBytesPerFrame: 0,
-            mChannelsPerFrame: 2,
-            mBitsPerChannel: 0,
-            mReserved: 0
-        )
-
-        guard let outFmt = AVAudioFormat(streamDescription: &opusDesc) else {
-            return nil
-        }
-        self.outputFormat = outFmt
-
-        guard let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
-            return nil
-        }
-        conv.bitRate = 64000
-        self.converter = conv
+    static var maxProtocolVersion: Int {
+        Int(dave_max_protocol_version())
     }
 
-    /// Mã hóa 960 frame Float32 Stereo (20ms) thành 1 gói tin Opus chuẩn RFC 6716
+    init(protocolVersion: UInt16, userId: UInt64, channelId: UInt64) {
+        self.protocolVersion = protocolVersion
+        self.userId = userId
+        self.channelId = channelId
+        self.downgraded = (protocolVersion == 0)
+    }
+
+    deinit {
+        destroy()
+    }
+
+    func destroy() {
+        lock.lock()
+        defer { lock.unlock() }
+        if let h = handle {
+            dave_session_free(h)
+            handle = nil
+        }
+        pendingTransitions.removeAll()
+        pendingExternalSender = nil
+    }
+
+    /// Khởi tạo hoặc tái khởi tạo phiên MLS. Trả về KeyPackage (gửi binary Op 26) nếu protocolVersion > 0.
+    func reinit(protocolVersion newVersion: UInt16? = nil) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let nv = newVersion {
+            self.protocolVersion = nv
+        }
+        if self.protocolVersion > 0 {
+            if let h = handle {
+                _ = dave_session_reinit(h, self.protocolVersion, userId, channelId)
+            } else {
+                handle = dave_session_new(self.protocolVersion, userId, channelId)
+            }
+            guard let h = handle else { return nil }
+            if let ext = pendingExternalSender {
+                _ = ext.withUnsafeBytes { raw -> Bool in
+                    guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+                    return dave_session_set_external_sender(h, ptr, ext.count)
+                }
+                pendingExternalSender = nil
+            }
+            if downgraded {
+                dave_session_set_passthrough_mode(h, true, 10)
+            }
+            return consumeDaveBuffer(dave_session_create_key_package(h))
+        } else {
+            if let h = handle {
+                _ = dave_session_reset(h)
+                dave_session_set_passthrough_mode(h, true, 10)
+            }
+            return nil
+        }
+    }
+
+    func setExternalSender(_ data: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !data.isEmpty else { return false }
+        guard let h = handle else {
+            // Lưu tạm nếu Op 25 đến trước khi nâng cấp từ DAVE v0 -> v1
+            pendingExternalSender = data
+            return true
+        }
+        return data.withUnsafeBytes { raw in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return dave_session_set_external_sender(h, ptr, data.count)
+        }
+    }
+
+    /// Xử lý Binary Op 27 (MLS Proposals). Trả về (ok, commitWelcomeData?).
+    func processProposals(payload: Data) -> (ok: Bool, commitWelcome: Data?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle, payload.count >= 2 else { return (false, nil) }
+        let opType = payload[payload.startIndex]
+        let propSlice = Data(payload.dropFirst(1))
+        var outBuf = DaveByteBuffer(ptr: nil, len: 0, cap: 0)
+        let ok = propSlice.withUnsafeBytes { raw -> Bool in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return dave_session_process_proposals(h, opType, ptr, propSlice.count, nil, 0, &outBuf)
+        }
+        let cw = consumeDaveBuffer(outBuf)
+        return (ok, cw)
+    }
+
+    /// Xử lý Binary Op 29 (MLS Announce Commit Transition).
+    /// Trả về (transitionId, result: 1=processed, 0=ignored, -1=error).
+    func processCommit(payload: Data) -> (transitionId: UInt16, result: Int32) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle, payload.count > 2 else { return (0, -1) }
+        let b = payload.startIndex
+        let tid = (UInt16(payload[b]) << 8) | UInt16(payload[b + 1])
+        let commitData = Data(payload.dropFirst(2))
+        let res = commitData.withUnsafeBytes { raw -> Int32 in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return -1 }
+            return dave_session_process_commit(h, ptr, commitData.count)
+        }
+        if res == 1 {
+            let curVer = dave_session_protocol_version(h)
+            let prepOk = dave_session_prepare_transition(h, tid, curVer)
+            if !prepOk { return (tid, -1) }
+            if tid != 0 {
+                pendingTransitions[tid] = curVer
+            }
+        }
+        return (tid, res)
+    }
+
+    /// Xử lý Binary Op 30 (MLS Welcome).
+    func processWelcome(payload: Data) -> (transitionId: UInt16, ok: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle, payload.count > 2 else { return (0, false) }
+        let b = payload.startIndex
+        let tid = (UInt16(payload[b]) << 8) | UInt16(payload[b + 1])
+        let welcomeData = Data(payload.dropFirst(2))
+        let ok = welcomeData.withUnsafeBytes { raw -> Bool in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else { return false }
+            return dave_session_process_welcome(h, ptr, welcomeData.count, nil, 0)
+        }
+        if ok {
+            let curVer = dave_session_protocol_version(h)
+            let prepOk = dave_session_prepare_transition(h, tid, curVer)
+            if !prepOk { return (tid, false) }
+            if tid != 0 {
+                pendingTransitions[tid] = curVer
+            }
+        }
+        return (tid, ok)
+    }
+
+    /// Xử lý JSON Op 21 (DAVE Prepare Transition). Trả về true nếu cần gửi JSON Op 23 (Transition Ready).
+    func prepareTransition(transitionId: UInt16, protocolVersion newVer: UInt16) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pendingTransitions[transitionId] = newVer
+        if let h = handle {
+            _ = dave_session_prepare_transition(h, transitionId, newVer)
+        }
+        if transitionId == 0 {
+            executeTransitionLocked(transitionId: 0)
+            return false
+        } else {
+            if newVer == 0, let h = handle {
+                dave_session_set_passthrough_mode(h, true, 24)
+            }
+            return true
+        }
+    }
+
+    /// Xử lý JSON Op 22 (DAVE Execute Transition).
+    @discardableResult
+    func executeTransition(transitionId: UInt16) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return executeTransitionLocked(transitionId: transitionId)
+    }
+
+    @discardableResult
+    private func executeTransitionLocked(transitionId: UInt16) -> Bool {
+        guard let newVer = pendingTransitions.removeValue(forKey: transitionId) else {
+            return false
+        }
+        if transitionId != 0, let h = handle {
+            _ = dave_session_execute_transition(h, transitionId)
+        }
+        let oldVer = self.protocolVersion
+        self.protocolVersion = newVer
+        if oldVer != newVer && newVer == 0 {
+            self.downgraded = true
+        } else if transitionId > 0 && self.downgraded {
+            self.downgraded = false
+            if let h = handle {
+                dave_session_set_passthrough_mode(h, false, 10)
+            }
+        }
+        return true
+    }
+
+    var isEncryptionRequired: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return protocolVersion > 0 && !downgraded
+    }
+
+    var canEncrypt: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard protocolVersion > 0 && !downgraded, let h = handle else { return false }
+        return dave_session_can_encrypt(h)
+    }
+
+    /// Mã hóa E2EE khung âm thanh Opus.
+    func encryptOpus(_ opus: Data) -> Data? {
+        if opus.count == 3 {
+            let b = opus.startIndex
+            if opus[b] == 0xF8 && opus[b + 1] == 0xFF && opus[b + 2] == 0xFE {
+                return opus
+            }
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        if protocolVersion == 0 || downgraded {
+            return opus
+        }
+        guard let h = handle, dave_session_can_encrypt(h) else {
+            return nil
+        }
+        let buf = opus.withUnsafeBytes { raw -> DaveByteBuffer in
+            guard let ptr = raw.bindMemory(to: UInt8.self).baseAddress else {
+                return DaveByteBuffer(ptr: nil, len: 0, cap: 0)
+            }
+            return dave_session_encrypt_opus(h, ptr, opus.count)
+        }
+        return consumeDaveBuffer(buf)
+    }
+}
+
+// MARK: - NATIVE OPUS AUDIO ENCODER (XIPH OPUS RUST CORE - 48kHz STEREO RFC 6716)
+final class NativeOpusEncoder {
+    private var handle: OpaquePointer?
+
+    init?(sampleRate: Int32 = 48000, channels: Int32 = 2, bitRate: Int32 = 96000) {
+        guard let h = dave_opus_encoder_new(sampleRate, channels, bitRate) else {
+            return nil
+        }
+        self.handle = h
+    }
+
+    deinit {
+        if let h = handle {
+            dave_opus_encoder_free(h)
+            handle = nil
+        }
+    }
+
+    /// Mã hóa 960 frame Float32 Stereo (20ms ở 48kHz) thành 1 gói tin Opus chuẩn RFC 6716
     func encode(leftChannel: [Float], rightChannel: [Float]) -> Data? {
-        guard let converter = converter else { return nil }
+        guard let h = handle else { return nil }
         guard leftChannel.count >= 960, rightChannel.count >= 960 else { return nil }
 
-        guard let pcmBuf = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 960) else { return nil }
-        pcmBuf.frameLength = 960
-
-        if let chData = pcmBuf.floatChannelData {
-            leftChannel.withUnsafeBufferPointer { ptr in
-                chData[0].initialize(from: ptr.baseAddress!, count: 960)
-            }
-            rightChannel.withUnsafeBufferPointer { ptr in
-                chData[1].initialize(from: ptr.baseAddress!, count: 960)
+        let buf = leftChannel.withUnsafeBufferPointer { lPtr in
+            rightChannel.withUnsafeBufferPointer { rPtr in
+                dave_opus_encoder_encode_float(h, lPtr.baseAddress, rPtr.baseAddress, 960)
             }
         }
-
-        let compBuf = AVAudioCompressedBuffer(
-            format: outputFormat,
-            packetCapacity: 1,
-            maximumPacketSize: 1275
-        )
-
-        var error: NSError?
-        var hasSupplied = false
-
-        let status = converter.convert(to: compBuf, error: &error) { _, outStatus in
-            if hasSupplied {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            hasSupplied = true
-            outStatus.pointee = .haveData
-            return pcmBuf
-        }
-
-        if (status == .haveData || status == .inputRanDry || compBuf.byteLength > 0) && compBuf.byteLength > 0 {
-            return Data(bytes: compBuf.data, count: Int(compBuf.byteLength))
-        }
-        return nil
+        return consumeDaveBuffer(buf)
     }
 }
 
@@ -3713,10 +3924,15 @@ final class AudioTrackDecoder {
     }
 
     init?(url: URL) {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+        }
+
         guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
         let processingFormat = audioFile.processingFormat
         let fileLength = audioFile.length
-        durationSeconds = Double(fileLength) / processingFormat.sampleRate
+        guard fileLength > 0, processingFormat.sampleRate > 0 else { return nil }
 
         guard let targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -3726,44 +3942,66 @@ final class AudioTrackDecoder {
         ) else { return nil }
 
         guard let converter = AVAudioConverter(from: processingFormat, to: targetFormat) else { return nil }
+        if processingFormat.channelCount == 1 {
+            converter.channelMap = [0, 0]
+        }
 
         let readCapacity: AVAudioFrameCount = 4096
+        let ratio = 48000.0 / max(1.0, processingFormat.sampleRate)
+        let outCapacity: AVAudioFrameCount = AVAudioFrameCount(ceil(Double(readCapacity) * ratio)) + 2048
+
         guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: readCapacity),
-              let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: readCapacity) else { return nil }
+              let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return nil }
 
         audioFile.framePosition = 0
+        let estimatedOutSamples = Int(ceil(Double(fileLength) * ratio)) + 4096
         var allL: [Float] = []
         var allR: [Float] = []
-        allL.reserveCapacity(Int(fileLength))
-        allR.reserveCapacity(Int(fileLength))
+        allL.reserveCapacity(estimatedOutSamples)
+        allR.reserveCapacity(estimatedOutSamples)
 
-        while audioFile.framePosition < fileLength {
+        var reachedEOF = false
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if reachedEOF {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
             do {
+                inputBuffer.frameLength = 0
                 try audioFile.read(into: inputBuffer)
-                if inputBuffer.frameLength == 0 { break }
-
-                var isDone = false
-                var error: NSError?
-                let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
-                    if isDone {
-                        outStatus.pointee = .noDataNow
-                        return nil
-                    }
-                    isDone = true
-                    outStatus.pointee = .haveData
-                    return inputBuffer
+                if inputBuffer.frameLength == 0 {
+                    reachedEOF = true
+                    outStatus.pointee = .endOfStream
+                    return nil
                 }
-
-                outputBuffer.frameLength = 0
-                converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
-                if error != nil { break }
-
-                let count = Int(outputBuffer.frameLength)
-                if count > 0, let ch = outputBuffer.floatChannelData {
-                    allL.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: count))
-                    allR.append(contentsOf: UnsafeBufferPointer(start: ch[1], count: count))
-                }
+                outStatus.pointee = .haveData
+                return inputBuffer
             } catch {
+                reachedEOF = true
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+        }
+
+        while true {
+            var error: NSError?
+            outputBuffer.frameLength = outCapacity
+            let status = converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
+
+            if status == .error || error != nil {
+                break
+            }
+
+            let count = Int(outputBuffer.frameLength)
+            if count > 0, let ch = outputBuffer.floatChannelData {
+                allL.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: count))
+                allR.append(contentsOf: UnsafeBufferPointer(start: ch[1], count: count))
+            }
+
+            if status == .endOfStream {
+                break
+            }
+            if status == .inputRanDry && reachedEOF {
                 break
             }
         }
@@ -3889,6 +4127,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var voiceGatewaySession: URLSession?
     private var heartbeatTask: Task<Void, Never>?
     private var voiceHeartbeatTask: Task<Void, Never>?
+    private var udpKeepAliveTask: Task<Void, Never>?
     private var listenTask: Task<Void, Never>?
     private var voiceListenTask: Task<Void, Never>?
 
@@ -3903,6 +4142,12 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var voiceEndpoint: String?
     private var ssrc: Int = 0
     private var secretKey: Data?
+    private var encryptionMode: String = "aead_aes256_gcm_rtpsize"
+    private var voiceSeq: Int = -1
+    private var daveSession: DaveE2EESession?
+    private var hasLoggedAudioStart = false
+    private var hasLoggedDaveReady = false
+    private let packetLock = NSLock()
 
     private var isVoiceConnecting = false
     private var activeVoiceToken: String?
@@ -3911,6 +4156,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var rtpSequence: UInt16 = UInt16.random(in: 0...65535)
     private var rtpTimestamp: UInt32 = UInt32.random(in: 0...4000000)
     private var rtpNonceCounter: UInt32 = 0
+    private var udpKeepAliveCounter: UInt32 = 0
 
     var onLog: ((String) -> Void)?
 
@@ -4140,7 +4386,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
               let ep = voiceEndpoint, !ep.isEmpty,
               let gid = currentGuildId, !gid.isEmpty else { return }
 
-        // Chống race condition: không hủy kết nối đang bắt tay nếu token và endpoint không đổi
+        // Chống race condition: không hủy kết nối đang bắt tay nếu token không đổi
         if isVoiceConnecting && activeVoiceToken == vtok {
             return
         }
@@ -4150,9 +4396,14 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
 
         isVoiceConnecting = true
         activeVoiceToken = vtok
+        voiceSeq = -1
+        hasLoggedAudioStart = false
+        hasLoggedDaveReady = false
+        daveSession?.destroy()
+        daveSession = nil
 
         let cleanHost = cleanVoiceEndpoint(ep)
-        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=4") else {
+        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=8") else {
             log("Lỗi: Voice Endpoint không hợp lệ (\(ep))")
             isVoiceConnecting = false
             return
@@ -4161,6 +4412,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         voiceWsTask?.cancel(with: .goingAway, reason: nil)
         voiceListenTask?.cancel()
         voiceHeartbeatTask?.cancel()
+        udpKeepAliveTask?.cancel()
         voiceGatewaySession?.invalidateAndCancel()
 
         let config = URLSessionConfiguration.default
@@ -4173,7 +4425,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         vWs.maximumMessageSize = 32 * 1024 * 1024
         self.voiceWsTask = vWs
         vWs.resume()
-        log("Đang bắt tay Voice Gateway: \(vUrl.absoluteString)...")
+        log("Đang bắt tay Voice Gateway v8 (DAVE E2EE): \(vUrl.absoluteString)...")
 
         voiceListenTask = Task { [weak self] in
             guard let self = self else { return }
@@ -4184,9 +4436,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     case .string(let s):
                         await self.handleVoiceMessage(s, guildId: gid, sessionId: sid, voiceToken: vtok)
                     case .data(let d):
-                        if let s = String(data: d, encoding: .utf8) {
-                            await self.handleVoiceMessage(s, guildId: gid, sessionId: sid, voiceToken: vtok)
-                        }
+                        await self.handleVoiceBinaryMessage(d)
                     @unknown default:
                         break
                     }
@@ -4200,10 +4450,29 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         }
     }
 
+    private func sendVoiceJSON(_ payload: [String: Any]) async {
+        guard let ws = voiceWsTask else { return }
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            try? await ws.send(.string(str))
+        }
+    }
+
+    private func sendVoiceBinary(op: UInt8, payload: Data) async {
+        guard let ws = voiceWsTask else { return }
+        var frame = Data([op])
+        frame.append(payload)
+        try? await ws.send(.data(frame))
+    }
+
     private func handleVoiceMessage(_ text: String, guildId: String, sessionId: String, voiceToken: String) async {
         guard let data = text.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let op = json["op"] as? Int else { return }
+
+        if let seq = json["seq"] as? Int {
+            self.voiceSeq = seq
+        }
 
         switch op {
         case 8: // Hello
@@ -4211,35 +4480,66 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 let interval: Double = (d["heartbeat_interval"] as? Double)
                     ?? (d["heartbeat_interval"] as? Int).map { Double($0) }
                     ?? ((d["heartbeat_interval"] as? NSNumber)?.doubleValue)
-                    ?? 41250.0
+                    ?? 13750.0
                 startVoiceHeartbeat(intervalMs: interval)
-                log("Nhận Voice Hello (HB: \(Int(interval))ms). Đang gửi Identify...")
-                sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
+                log("Nhận Voice Hello (HB: \(Int(interval))ms). Đang gửi Identify v8 (DAVE v\(DaveE2EESession.maxProtocolVersion))...")
+                await sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
             }
         case 2: // Ready
             if let d = json["d"] as? [String: Any] {
                 self.isVoiceConnecting = false
-                if let ssrcVal = d["ssrc"] as? Int {
+                if let ssrcVal = (d["ssrc"] as? Int) ?? (d["ssrc"] as? NSNumber)?.intValue {
                     self.ssrc = ssrcVal
                 }
                 let ip = d["ip"] as? String ?? ""
-                let port = d["port"] as? Int ?? 0
-                log("Voice Ready! SSRC: \(self.ssrc), UDP Server: \(ip):\(port). Đang bắt tay UDP...")
+                let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
+                let modes = d["modes"] as? [String] ?? []
+                if modes.contains("aead_aes256_gcm_rtpsize") {
+                    self.encryptionMode = "aead_aes256_gcm_rtpsize"
+                } else if modes.contains("aead_xchacha20_poly1305_rtpsize") {
+                    self.encryptionMode = "aead_xchacha20_poly1305_rtpsize"
+                } else {
+                    self.encryptionMode = "aead_aes256_gcm_rtpsize"
+                }
+                log("Voice Ready! SSRC: \(self.ssrc), UDP: \(ip):\(port), Mode: \(self.encryptionMode)")
                 startVoiceUDP(ip: ip, port: port)
             }
         case 4: // Session Description
             if let d = json["d"] as? [String: Any] {
-                let mode = d["mode"] as? String ?? ""
+                let mode = d["mode"] as? String ?? self.encryptionMode
+                self.encryptionMode = mode
                 if let keyArr = d["secret_key"] as? [Int] {
                     self.secretKey = Data(keyArr.map { UInt8($0 & 0xFF) })
                 } else if let keyArr = d["secret_key"] as? [UInt8] {
                     self.secretKey = Data(keyArr)
                 }
+
+                let daveVer = (d["dave_protocol_version"] as? Int)
+                    ?? ((d["dave_protocol_version"] as? NSNumber)?.intValue)
+                    ?? 0
+                if (self.userId.isEmpty || self.userId == "0"), let ext = extractUserId(from: self.token) {
+                    self.userId = ext
+                }
+                let uid64 = UInt64(self.userId) ?? 0
+                let cid64 = UInt64(self.currentChannelId ?? "") ?? 0
+
+                self.daveSession?.destroy()
+                if uid64 > 0 && cid64 > 0 {
+                    let dave = DaveE2EESession(protocolVersion: UInt16(daveVer), userId: uid64, channelId: cid64)
+                    self.daveSession = dave
+                    if let kp = dave.reinit() {
+                        await sendVoiceBinary(op: 26, payload: kp)
+                        log("🔐 Khởi tạo DAVE E2EE v\(daveVer): Đã gửi MLS KeyPackage (\(kp.count)B)")
+                    }
+                } else {
+                    self.daveSession = nil
+                }
+
                 DispatchQueue.main.async {
                     self.isVoiceUDPReady = true
                     self.isJoined = true
                 }
-                log("Kênh thoại đã sẵn sàng xả nhạc (\(mode))!")
+                log("✅ Kênh thoại sẵn sàng (\(mode) | DAVE v\(daveVer))!")
                 if self.isSpeaking {
                     sendSpeaking(true)
                 }
@@ -4248,6 +4548,109 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             break
         case 9: // Resumed
             log("Voice Gateway đã hồi phục phiên (Resumed).")
+        case 11, 13: // Clients Connect / Client Disconnect
+            break
+        case 21: // DAVE Prepare Transition
+            if let d = json["d"] as? [String: Any],
+               let tid = (d["transition_id"] as? Int) ?? (d["transition_id"] as? NSNumber)?.intValue,
+               let ver = (d["protocol_version"] as? Int) ?? (d["protocol_version"] as? NSNumber)?.intValue,
+               let dave = self.daveSession {
+                let needReady = dave.prepareTransition(transitionId: UInt16(tid), protocolVersion: UInt16(ver))
+                if needReady {
+                    await sendVoiceJSON(["op": 23, "d": ["transition_id": tid]])
+                }
+            }
+        case 22: // DAVE Execute Transition
+            if let d = json["d"] as? [String: Any],
+               let tid = (d["transition_id"] as? Int) ?? (d["transition_id"] as? NSNumber)?.intValue,
+               let dave = self.daveSession {
+                if dave.executeTransition(transitionId: UInt16(tid)) {
+                    if dave.canEncrypt && !self.hasLoggedDaveReady {
+                        self.hasLoggedDaveReady = true
+                        log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Transition #\(tid))!")
+                        if self.isSpeaking {
+                            self.sendSpeaking(true)
+                        }
+                    }
+                }
+            }
+        case 24: // DAVE Prepare Epoch
+            if let d = json["d"] as? [String: Any],
+               let epoch = (d["epoch"] as? Int) ?? (d["epoch"] as? NSNumber)?.intValue,
+               let ver = (d["protocol_version"] as? Int) ?? (d["protocol_version"] as? NSNumber)?.intValue,
+               epoch == 1 {
+                if (self.userId.isEmpty || self.userId == "0"), let ext = extractUserId(from: self.token) {
+                    self.userId = ext
+                }
+                if self.daveSession == nil, ver > 0, let uid64 = UInt64(self.userId), let cid64 = UInt64(self.currentChannelId ?? "") {
+                    self.daveSession = DaveE2EESession(protocolVersion: UInt16(ver), userId: uid64, channelId: cid64)
+                }
+                if let kp = self.daveSession?.reinit(protocolVersion: UInt16(ver)) {
+                    await sendVoiceBinary(op: 26, payload: kp)
+                    log("🔐 DAVE Epoch 1 (v\(ver)): Đã gửi MLS KeyPackage mới")
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func handleVoiceBinaryMessage(_ raw: Data) async {
+        guard raw.count >= 3 else { return }
+        let b = raw.startIndex
+        let seq = (Int(raw[b]) << 8) | Int(raw[b + 1])
+        self.voiceSeq = seq
+        let op = raw[b + 2]
+        let payload = Data(raw.dropFirst(3))
+
+        guard let dave = self.daveSession else { return }
+
+        switch op {
+        case 25: // MLS External Sender
+            if dave.setExternalSender(payload) {
+                log("🔐 DAVE: Đã nhận MLS External Sender")
+            }
+        case 27: // MLS Proposals
+            let res = dave.processProposals(payload: payload)
+            if res.ok, let cw = res.commitWelcome {
+                await sendVoiceBinary(op: 28, payload: cw)
+            }
+        case 29: // MLS Announce Commit Transition
+            let res = dave.processCommit(payload: payload)
+            if res.result == 1 {
+                if res.transitionId != 0 {
+                    await sendVoiceJSON(["op": 23, "d": ["transition_id": Int(res.transitionId)]])
+                } else if dave.canEncrypt && !self.hasLoggedDaveReady {
+                    self.hasLoggedDaveReady = true
+                    log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Commit #0)!")
+                    if self.isSpeaking {
+                        self.sendSpeaking(true)
+                    }
+                }
+            } else if res.result == -1 {
+                await sendVoiceJSON(["op": 31, "d": ["transition_id": Int(res.transitionId)]])
+                if let kp = dave.reinit() {
+                    await sendVoiceBinary(op: 26, payload: kp)
+                }
+            }
+        case 30: // MLS Welcome
+            let res = dave.processWelcome(payload: payload)
+            if res.ok {
+                if res.transitionId != 0 {
+                    await sendVoiceJSON(["op": 23, "d": ["transition_id": Int(res.transitionId)]])
+                } else if dave.canEncrypt && !self.hasLoggedDaveReady {
+                    self.hasLoggedDaveReady = true
+                    log("🔐 DAVE E2EE đã kích hoạt hoàn tất (Welcome #0)!")
+                    if self.isSpeaking {
+                        self.sendSpeaking(true)
+                    }
+                }
+            } else {
+                await sendVoiceJSON(["op": 31, "d": ["transition_id": Int(res.transitionId)]])
+                if let kp = dave.reinit() {
+                    await sendVoiceBinary(op: 26, payload: kp)
+                }
+            }
         default:
             break
         }
@@ -4265,6 +4668,25 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         return nil
     }
 
+    private func startUDPKeepAlive() {
+        udpKeepAliveTask?.cancel()
+        udpKeepAliveCounter = 0
+        udpKeepAliveTask = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                guard let self = self else { break }
+                var buf = [UInt8](repeating: 0, count: 8)
+                let c = self.udpKeepAliveCounter
+                buf[0] = UInt8(c & 0xFF)
+                buf[1] = UInt8((c >> 8) & 0xFF)
+                buf[2] = UInt8((c >> 16) & 0xFF)
+                buf[3] = UInt8((c >> 24) & 0xFF)
+                self.udpKeepAliveCounter = c &+ 1
+                self.udpClient.sendPacket(Data(buf))
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+            }
+        }
+    }
+
     private func startVoiceUDP(ip: String, port: Int) {
         log("Đang mở socket UDP tới \(ip):\(port)...")
         guard udpClient.connect(ip: ip, port: UInt16(port)) else {
@@ -4277,7 +4699,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             var extIP = ""
             var extPort = port
 
-            if let disc = self.udpClient.discoverIP(ssrc: UInt32(self.ssrc)) {
+            if let disc = self.udpClient.discoverIP(ssrc: UInt32(truncatingIfNeeded: self.ssrc)) {
                 extIP = disc.ip
                 extPort = Int(disc.port)
                 self.log("Phát hiện UDP IP ngoại vi: \(extIP):\(extPort)")
@@ -4293,13 +4715,13 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 }
             }
 
-            self.log("Gửi Select Protocol tới Voice Gateway...")
-            self.sendSelectProtocol(ip: extIP, port: extPort)
+            self.startUDPKeepAlive()
+            self.log("Gửi Select Protocol (\(self.encryptionMode)) tới Voice Gateway...")
+            await self.sendSelectProtocol(ip: extIP, port: extPort)
         }
     }
 
-    private func sendSelectProtocol(ip: String, port: Int) {
-        guard let ws = voiceWsTask else { return }
+    private func sendSelectProtocol(ip: String, port: Int) async {
         let payload: [String: Any] = [
             "op": 1,
             "d": [
@@ -4307,33 +4729,33 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 "data": [
                     "address": ip,
                     "port": port,
-                    "mode": "aead_aes256_gcm_rtpsize"
+                    "mode": self.encryptionMode
                 ]
             ]
         ]
-        if let data = try? JSONSerialization.data(withJSONObject: payload),
-           let str = String(data: data, encoding: .utf8) {
-            Task { try? await ws.send(.string(str)) }
-        }
+        await sendVoiceJSON(payload)
     }
 
     private func startVoiceHeartbeat(intervalMs: Double) {
         voiceHeartbeatTask?.cancel()
-        let intervalSec = intervalMs / 1000.0
+        let intervalSec = max(1.0, intervalMs / 1000.0)
         voiceHeartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(intervalSec * 1_000_000_000))
-                guard let self = self, let ws = self.voiceWsTask else { break }
-                let nonce = Int.random(in: 1000...999999)
-                let hb = "{\"op\":3,\"d\":\(nonce)}"
-                try? await ws.send(.string(hb))
+                guard let self = self, self.voiceWsTask != nil else { break }
+                let nowMs = Int(Date().timeIntervalSince1970 * 1000)
+                await self.sendVoiceJSON([
+                    "op": 3,
+                    "d": [
+                        "t": nowMs,
+                        "seq_ack": self.voiceSeq
+                    ]
+                ])
             }
         }
     }
 
-    private func sendVoiceIdentify(guildId: String, sessionId: String, token: String) {
-        guard let ws = voiceWsTask else { return }
-
+    private func sendVoiceIdentify(guildId: String, sessionId: String, token: String) async {
         var uid = self.userId
         if (uid.isEmpty || uid == "0"), let ext = extractUserId(from: self.token) {
             uid = ext
@@ -4346,14 +4768,12 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 "server_id": guildId,
                 "user_id": uid,
                 "session_id": sessionId,
-                "token": token
+                "token": token,
+                "max_dave_protocol_version": DaveE2EESession.maxProtocolVersion
             ]
         ]
-        log("Gửi Voice Identify: Server=\(guildId), User=\(uid)...")
-        if let data = try? JSONSerialization.data(withJSONObject: payload),
-           let str = String(data: data, encoding: .utf8) {
-            Task { try? await ws.send(.string(str)) }
-        }
+        log("Gửi Voice Identify v8: Server=\(guildId), User=\(uid), DAVE=\(DaveE2EESession.maxProtocolVersion)...")
+        await sendVoiceJSON(payload)
     }
 
     func setSpeaking(_ speaking: Bool) {
@@ -4377,50 +4797,108 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         }
     }
 
-    /// Truyền gói tin âm thanh Opus trực tiếp vào kênh thoại qua UDP RTP (aead_aes256_gcm_rtpsize)
+    /// Truyền gói tin âm thanh Opus trực tiếp vào kênh thoại qua UDP RTP (DAVE E2EE + AES-256-GCM / XChaCha20-Poly1305)
     func sendOpusPacket(_ opusPayload: Data) {
         guard isVoiceUDPReady, let key = secretKey, key.count == 32 else { return }
+
+        let silenceFrame = Data([0xF8, 0xFF, 0xFE])
+        let mediaPayload: Data
+        if let dave = self.daveSession, dave.isEncryptionRequired {
+            if let encrypted = dave.encryptOpus(opusPayload) {
+                mediaPayload = encrypted
+                if !self.hasLoggedAudioStart && opusPayload != silenceFrame {
+                    self.hasLoggedAudioStart = true
+                    log("🔊 Đang truyền âm thanh Opus + DAVE E2EE vào kênh thoại!")
+                }
+            } else {
+                // DAVE đang chờ hoàn tất MLS transition -> gửi khung im lặng để giữ luồng UDP
+                mediaPayload = silenceFrame
+            }
+        } else {
+            mediaPayload = opusPayload
+            if !self.hasLoggedAudioStart && opusPayload != silenceFrame {
+                self.hasLoggedAudioStart = true
+                log("🔊 Đang truyền âm thanh Opus vào kênh thoại!")
+            }
+        }
+
+        packetLock.lock()
+        let seq = rtpSequence
+        let ts = rtpTimestamp
+        rtpNonceCounter = rtpNonceCounter &+ 1
+        let nonceVal = rtpNonceCounter
+        rtpSequence = rtpSequence &+ 1
+        rtpTimestamp = rtpTimestamp &+ 960
+        packetLock.unlock()
 
         // 12-byte RTP Header
         var header = [UInt8](repeating: 0, count: 12)
         header[0] = 0x80
         header[1] = 0x78 // Payload type 120 (Opus)
-        header[2] = UInt8((rtpSequence >> 8) & 0xFF)
-        header[3] = UInt8(rtpSequence & 0xFF)
-        header[4] = UInt8((rtpTimestamp >> 24) & 0xFF)
-        header[5] = UInt8((rtpTimestamp >> 16) & 0xFF)
-        header[6] = UInt8((rtpTimestamp >> 8) & 0xFF)
-        header[7] = UInt8(rtpTimestamp & 0xFF)
+        header[2] = UInt8((seq >> 8) & 0xFF)
+        header[3] = UInt8(seq & 0xFF)
+        header[4] = UInt8((ts >> 24) & 0xFF)
+        header[5] = UInt8((ts >> 16) & 0xFF)
+        header[6] = UInt8((ts >> 8) & 0xFF)
+        header[7] = UInt8(ts & 0xFF)
         header[8] = UInt8((ssrc >> 24) & 0xFF)
         header[9] = UInt8((ssrc >> 16) & 0xFF)
         header[10] = UInt8((ssrc >> 8) & 0xFF)
         header[11] = UInt8(ssrc & 0xFF)
 
-        // aead_aes256_gcm_rtpsize: 4-byte counter + 8 bytes zero = 12 bytes nonce
-        var nonceBytes = [UInt8](repeating: 0, count: 12)
-        nonceBytes[0] = UInt8((rtpNonceCounter >> 24) & 0xFF)
-        nonceBytes[1] = UInt8((rtpNonceCounter >> 16) & 0xFF)
-        nonceBytes[2] = UInt8((rtpNonceCounter >> 8) & 0xFF)
-        nonceBytes[3] = UInt8(rtpNonceCounter & 0xFF)
+        let noncePrefix: [UInt8] = [
+            UInt8((nonceVal >> 24) & 0xFF),
+            UInt8((nonceVal >> 16) & 0xFF),
+            UInt8((nonceVal >> 8) & 0xFF),
+            UInt8(nonceVal & 0xFF)
+        ]
 
-        do {
-            let nonce = try AES.GCM.Nonce(data: nonceBytes)
-            let symKey = SymmetricKey(data: key)
-            let sealed = try AES.GCM.seal(opusPayload, using: symKey, nonce: nonce, authenticating: Data(header))
+        if encryptionMode == "aead_xchacha20_poly1305_rtpsize" {
+            var nonce24 = [UInt8](repeating: 0, count: 24)
+            nonce24[0] = noncePrefix[0]
+            nonce24[1] = noncePrefix[1]
+            nonce24[2] = noncePrefix[2]
+            nonce24[3] = noncePrefix[3]
 
-            // Packet = Header (12) + Ciphertext + Tag (16) + Nonce Suffix (4)
-            var packet = Data(header)
-            packet.append(sealed.ciphertext)
-            packet.append(sealed.tag)
-            packet.append(contentsOf: nonceBytes[0..<4])
+            let cipherData: Data? = key.withUnsafeBytes { keyRaw in
+                header.withUnsafeBufferPointer { aadBuf in
+                    mediaPayload.withUnsafeBytes { ptRaw in
+                        guard let kPtr = keyRaw.bindMemory(to: UInt8.self).baseAddress,
+                              let pPtr = ptRaw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+                        let out = dave_xchacha20_poly1305_encrypt(kPtr, nonce24, aadBuf.baseAddress, header.count, pPtr, mediaPayload.count)
+                        return consumeDaveBuffer(out)
+                    }
+                }
+            }
+            if let ct = cipherData {
+                var packet = Data(header)
+                packet.append(ct)
+                packet.append(contentsOf: noncePrefix)
+                udpClient.sendPacket(packet)
+            }
+        } else {
+            // aead_aes256_gcm_rtpsize: 4-byte counter (BE) + 8 bytes zero = 12 bytes nonce
+            var nonceBytes = [UInt8](repeating: 0, count: 12)
+            nonceBytes[0] = noncePrefix[0]
+            nonceBytes[1] = noncePrefix[1]
+            nonceBytes[2] = noncePrefix[2]
+            nonceBytes[3] = noncePrefix[3]
 
-            udpClient.sendPacket(packet)
+            do {
+                let nonce = try AES.GCM.Nonce(data: nonceBytes)
+                let symKey = SymmetricKey(data: key)
+                let sealed = try AES.GCM.seal(mediaPayload, using: symKey, nonce: nonce, authenticating: Data(header))
 
-            rtpSequence = rtpSequence &+ 1
-            rtpTimestamp = rtpTimestamp &+ 960
-            rtpNonceCounter = rtpNonceCounter &+ 1
-        } catch {
-            // Error
+                // Packet = Header (12) + Ciphertext + Tag (16) + Nonce Suffix (4)
+                var packet = Data(header)
+                packet.append(sealed.ciphertext)
+                packet.append(sealed.tag)
+                packet.append(contentsOf: noncePrefix)
+
+                udpClient.sendPacket(packet)
+            } catch {
+                // Transport encrypt error
+            }
         }
     }
 
@@ -4432,6 +4910,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     func stop() {
         isVoiceConnecting = false
         activeVoiceToken = nil
+        hasLoggedAudioStart = false
+        hasLoggedDaveReady = false
         if let gid = currentGuildId {
             let payload: [String: Any] = [
                 "op": 4,
@@ -4456,9 +4936,11 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         gatewaySession?.invalidateAndCancel(); gatewaySession = nil
 
         voiceHeartbeatTask?.cancel(); voiceHeartbeatTask = nil
+        udpKeepAliveTask?.cancel(); udpKeepAliveTask = nil
         voiceListenTask?.cancel(); voiceListenTask = nil
         voiceWsTask?.cancel(with: .goingAway, reason: nil); voiceWsTask = nil
         voiceGatewaySession?.invalidateAndCancel(); voiceGatewaySession = nil
+        daveSession?.destroy(); daveSession = nil
         udpClient.close()
 
         DispatchQueue.main.async {
@@ -4680,7 +5162,6 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     @Published var activeSessions: [VoiceGatewaySession] = []
     private var streamTask: Task<Void, Never>?
     var currentDecoder: AudioTrackDecoder?
-    private let opusEncoder = NativeOpusEncoder()
     private var streamFrameIndex = 0
     private var localPlayer: AVAudioPlayer?
 
@@ -4711,24 +5192,44 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
     // MARK: - PLAYLIST QUEUE MANAGEMENT
     func addFiles(urls: [URL]) {
+        let fm = FileManager.default
+        let cacheDir = fm.urls(for: .cachesDirectory, in: .userDomainMask).first?.appendingPathComponent("SpamAudio", isDirectory: true)
+        if let dir = cacheDir {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+
+        var addedCount = 0
         for url in urls {
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessed { url.stopAccessingSecurityScopedResource() }
+            }
+
+            var finalURL = url
+            if let dir = cacheDir {
+                let safeName = "\(UUID().uuidString.prefix(8))_\(url.lastPathComponent)"
+                let dest = dir.appendingPathComponent(safeName)
+                if (try? fm.copyItem(at: url, to: dest)) != nil {
+                    finalURL = dest
+                }
+            }
+
             let title = url.deletingPathExtension().lastPathComponent
-            let asset = AVURLAsset(url: url)
+            let asset = AVURLAsset(url: finalURL)
             let dur = CMTimeGetSeconds(asset.duration)
             let durationSeconds = (dur.isNaN || dur.isInfinite) ? 0 : dur
             let item = PlaylistItem(
                 id: UUID(),
                 title: title,
-                url: url,
+                url: finalURL,
                 durationSeconds: durationSeconds,
                 isPreset: false,
                 preset: nil
             )
-            if !playlist.contains(where: { $0.url?.path == url.path }) {
-                playlist.append(item)
-            }
+            playlist.append(item)
+            addedCount += 1
         }
-        addLog("📥 Đã nạp thêm \(urls.count) pháp bảo vào Linh Hồn Hàng Đợi (Tổng: \(playlist.count) bài)")
+        addLog("📥 Đã nạp thêm \(addedCount) pháp bảo vào Linh Hồn Hàng Đợi (Tổng: \(playlist.count) bài)")
         statusText = "Đã có \(playlist.count) pháp bảo trong hàng đợi"
 
         if currentDecoder == nil && !playlist.isEmpty {
@@ -5040,8 +5541,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 self.statusText = "🔥 Đang xả hỏa lực: \(self.currentSongTitle) (\(readySessions.count) Đạo hữu)"
                 self.addLog("🔥 Trận pháp đã kết thành! \(readySessions.count)/\(createdSessions.count) phân thân bắt đầu xả nhạc đồng loạt!")
 
+                let silence = Data([0xF8, 0xFF, 0xFE])
                 for s in readySessions {
                     s.setSpeaking(true)
+                    // Gửi 5 gói im lặng mở luồng SSRC để Discord kích hoạt bộ giải mã thoại ngay lập tức
+                    for _ in 0..<5 {
+                        s.sendOpusPacket(silence)
+                    }
                 }
 
                 if self.playLocalSpeaker, let url = self.audioFileURL {
@@ -5122,7 +5628,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         streamTask = Task.detached { [weak self] in
             guard let self = self else { return }
             var speedAccumulator: Float = 0
-            let encoder = NativeOpusEncoder()
+            guard let encoder = NativeOpusEncoder() else {
+                await MainActor.run {
+                    self.addLog("❌ Lỗi nghiêm trọng: Không thể khởi tạo bộ mã hóa Opus!")
+                    self.statusText = "❌ Lỗi bộ mã hóa Opus"
+                }
+                return
+            }
 
             var hpStateL: Float = 0
             var hpStateR: Float = 0
@@ -5132,9 +5644,10 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             var lpStateR: Float = 0
             var bassStateL: Float = 0
             var bassStateR: Float = 0
+            var nextTickNanos = DispatchTime.now().uptimeNanoseconds
 
             while !Task.isCancelled {
-                let start = DispatchTime.now()
+                nextTickNanos &+= 20_000_000
 
                 let snapshot = await MainActor.run { () -> (curIdx: Int, currentVol: Float, currentBoost: Float, bassAmt: Float, isClean: Bool, isMax: Bool, isPaused: Bool, currentFX: SpamAudioFX, currentSpeed: Float, decoder: AudioTrackDecoder?, readySessions: [VoiceGatewaySession]) in
                     return (
@@ -5154,11 +5667,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
                 if snapshot.isPaused {
                     try? await Task.sleep(nanoseconds: 20_000_000)
+                    nextTickNanos = DispatchTime.now().uptimeNanoseconds
                     continue
                 }
 
                 guard let decoder = snapshot.decoder, !decoder.leftSamples.isEmpty else {
                     try? await Task.sleep(nanoseconds: 20_000_000)
+                    nextTickNanos = DispatchTime.now().uptimeNanoseconds
                     continue
                 }
 
@@ -5174,6 +5689,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                         self.playNext()
                     }
                     try? await Task.sleep(nanoseconds: 20_000_000)
+                    nextTickNanos = DispatchTime.now().uptimeNanoseconds
                     continue
                 }
 
@@ -5241,8 +5757,8 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     }
                 }
 
-                // 5. Mã hóa Opus và gửi tới toàn bộ các phân thân Đạo Hữu
-                if let opus = encoder?.encode(leftChannel: chunkL, rightChannel: chunkR) {
+                // 5. Mã hóa Opus bằng lõi Xiph Opus thuần Rust và xả tới toàn bộ phân thân Đạo Hữu
+                if let opus = encoder.encode(leftChannel: chunkL, rightChannel: chunkR) {
                     for s in snapshot.readySessions {
                         s.sendOpusPacket(opus)
                     }
@@ -5265,10 +5781,11 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     }
                 }
 
-                let elapsedNanos = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
-                let targetNanos: UInt64 = 20_000_000
-                if targetNanos > elapsedNanos {
-                    try? await Task.sleep(nanoseconds: targetNanos - elapsedNanos)
+                let nowNanos = DispatchTime.now().uptimeNanoseconds
+                if nextTickNanos > nowNanos {
+                    try? await Task.sleep(nanoseconds: nextTickNanos - nowNanos)
+                } else if nowNanos - nextTickNanos > 100_000_000 {
+                    nextTickNanos = nowNanos
                 }
             }
         }

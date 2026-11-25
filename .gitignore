@@ -2,3 +2,5 @@ make super vip/
 .DS_Store
 .build/
 *.xcuserstate
+DaveFFI/target/
+DaveFFI/lib/

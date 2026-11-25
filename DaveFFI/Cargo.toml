@@ -1,0 +1,18 @@
+[package]
+name = "dave_ffi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dave_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+davey = { git = "https://github.com/Snazzah/davey.git", rev = "4f11d0f" }
+chacha20poly1305 = "0.10"
+ropus = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = false

@@ -12,6 +12,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Rust for iOS (DAVE E2EE & Opus)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "DaveFFI -> target"
+
+      - name: Build DaveFFI static library (DAVE E2EE + Opus)
+        run: |
+          cd DaveFFI
+          IPHONEOS_DEPLOYMENT_TARGET=16.0 cargo build --release --target aarch64-apple-ios
+          mkdir -p lib
+          cp target/aarch64-apple-ios/release/libdave_ffi.a lib/libdave_ffi.a
+          ls -lh lib/libdave_ffi.a
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -36,7 +54,7 @@ jobs:
           mkdir Payload
           mv /Users/runner/work/_temp/build/Build/Products/Release-iphoneos/Discord.app Payload/
           zip -r Discord.ipa Payload
-          
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
