@@ -2,12 +2,14 @@ import SwiftUI
 import Foundation
 import Security
 import AVFoundation
+import AudioToolbox
 import UniformTypeIdentifiers
 import UIKit
 import CryptoKit
 import MediaPlayer
 import Darwin
 import MachO
+import Network
 
 // ==========================================
 // MARK: - DOCUMENT PICKER
@@ -1279,7 +1281,9 @@ class UserNukeClient {
         let total = (detail["approximate_member_count"] as? Int) ?? (detail["member_count"] as? Int) ?? 1000
 
         guard let url = URL(string: AppEndpoints.gatewayURL) else { return }
-        let ws = session.webSocketTask(with: url); ws.resume()
+        let ws = session.webSocketTask(with: url)
+        ws.maximumMessageSize = 64 * 1024 * 1024
+        ws.resume()
         defer { ws.cancel(with: .goingAway, reason: nil) }
 
         guard case .string(let hs) = try await ws.receive(),
@@ -3438,6 +3442,286 @@ struct StatCard: View {
 // MARK: - DISCORD VOICE GATEWAY & TREO ROOM 24/7 (MAKE SUPER VIP)
 // ==============================================================================
 
+// MARK: - DISCORD VOICE UDP CLIENT & PROTOCOL HANDSHAKE
+final class DiscordVoiceUDPClient {
+    private var sockfd: Int32 = -1
+    private var serverAddr: sockaddr_in?
+    private(set) var isConnected = false
+
+    func connect(ip: String, port: UInt16) -> Bool {
+        close()
+        sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard sockfd >= 0 else { return false }
+
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        inet_pton(AF_INET, ip, &addr.sin_addr)
+        self.serverAddr = addr
+        self.isConnected = true
+        return true
+    }
+
+    /// IP Discovery (RFC / Discord Protocol)
+    func discoverIP(ssrc: UInt32) -> (ip: String, port: UInt16)? {
+        guard sockfd >= 0, var addr = serverAddr else { return nil }
+
+        var packet = [UInt8](repeating: 0, count: 74)
+        packet[0] = 0x00
+        packet[1] = 0x01
+        packet[2] = 0x00
+        packet[3] = 0x46
+        packet[4] = UInt8((ssrc >> 24) & 0xFF)
+        packet[5] = UInt8((ssrc >> 16) & 0xFF)
+        packet[6] = UInt8((ssrc >> 8) & 0xFF)
+        packet[7] = UInt8(ssrc & 0xFF)
+
+        let sent = withUnsafePointer(to: &addr) { ptr -> Int in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                packet.withUnsafeBufferPointer { buf in
+                    Darwin.sendto(sockfd, buf.baseAddress, 74, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent == 74 else { return nil }
+
+        var response = [UInt8](repeating: 0, count: 74)
+        var fromAddr = sockaddr_in()
+        var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+
+        let recvd = withUnsafeMutablePointer(to: &fromAddr) { ptr -> Int in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                response.withUnsafeMutableBufferPointer { buf in
+                    Darwin.recvfrom(sockfd, buf.baseAddress, 74, 0, sa, &fromLen)
+                }
+            }
+        }
+        guard recvd >= 74 else { return nil }
+
+        var ipBytes = [UInt8]()
+        for i in 8..<72 {
+            if response[i] == 0 { break }
+            ipBytes.append(response[i])
+        }
+        guard let myIP = String(bytes: ipBytes, encoding: .utf8), !myIP.isEmpty else { return nil }
+
+        let myPort = (UInt16(response[72]) << 8) | UInt16(response[73])
+        return (myIP, myPort)
+    }
+
+    func sendPacket(_ data: Data) {
+        guard sockfd >= 0, var addr = serverAddr else { return }
+        _ = withUnsafePointer(to: &addr) { ptr -> Int in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                data.withUnsafeBytes { raw in
+                    Darwin.sendto(sockfd, raw.baseAddress, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+    }
+
+    func close() {
+        if sockfd >= 0 {
+            Darwin.close(sockfd)
+            sockfd = -1
+        }
+        isConnected = false
+    }
+
+    deinit {
+        close()
+    }
+}
+
+// MARK: - OPUS AUDIO ENCODER (NATIVE COREAUDIO)
+final class OpusAudioEncoder {
+    private var converter: AudioConverterRef?
+    private let sampleRate: Double = 48000.0
+    private let channels: UInt32 = 2
+    private let framesPerPacket: UInt32 = 960
+
+    init?() {
+        var inDesc = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: 16,
+            mReserved: 0
+        )
+
+        var outDesc = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatOpus,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: framesPerPacket,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: 0,
+            mReserved: 0
+        )
+
+        let status = AudioConverterNew(&inDesc, &outDesc, &converter)
+        if status != noErr || converter == nil {
+            return nil
+        }
+
+        var bitRate: UInt32 = 64000
+        AudioConverterSetProperty(converter!, kAudioConverterEncodeBitRate, UInt32(MemoryLayout<UInt32>.size), &bitRate)
+    }
+
+    deinit {
+        if let conv = converter {
+            AudioConverterDispose(conv)
+        }
+    }
+
+    func encode(pcmData: Data) -> Data? {
+        guard let conv = converter else { return nil }
+
+        final class InputState {
+            var data: Data
+            var bytesConsumed: Int
+            init(data: Data, bytesConsumed: Int) {
+                self.data = data
+                self.bytesConsumed = bytesConsumed
+            }
+        }
+        let state = InputState(data: pcmData, bytesConsumed: 0)
+
+        var outputBuffer = [UInt8](repeating: 0, count: 1275)
+        var ioOutputDataPacketSize: UInt32 = 1
+        var outBufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(
+                mNumberChannels: channels,
+                mDataByteSize: UInt32(outputBuffer.count),
+                mData: &outputBuffer
+            )
+        )
+        var packetDesc = AudioStreamPacketDescription()
+
+        let proc: AudioConverterComplexInputDataProc = { _, ioNumberDataPackets, ioData, _, inUserData in
+            guard let userData = inUserData else { return noErr }
+            let stateObj = Unmanaged<InputState>.fromOpaque(userData).takeUnretainedValue()
+            let remaining = stateObj.data.count - stateObj.bytesConsumed
+            if remaining <= 0 {
+                ioNumberDataPackets.pointee = 0
+                return noErr
+            }
+
+            let toConsume = min(remaining, Int(ioNumberDataPackets.pointee) * 4)
+            ioNumberDataPackets.pointee = UInt32(toConsume / 4)
+
+            stateObj.data.withUnsafeBytes { rawBuf in
+                let base = rawBuf.baseAddress!.advanced(by: stateObj.bytesConsumed)
+                ioData.pointee.mBuffers.mData = UnsafeMutableRawPointer(mutating: base)
+                ioData.pointee.mBuffers.mDataByteSize = UInt32(toConsume)
+                ioData.pointee.mBuffers.mNumberChannels = 2
+            }
+            stateObj.bytesConsumed += toConsume
+            return noErr
+        }
+
+        let retainedState = Unmanaged.passRetained(state)
+        defer { retainedState.release() }
+
+        let status = AudioConverterFillComplexBuffer(
+            conv,
+            proc,
+            retainedState.toOpaque(),
+            &ioOutputDataPacketSize,
+            &outBufferList,
+            &packetDesc
+        )
+
+        if status == noErr && ioOutputDataPacketSize > 0 {
+            let count = Int(outBufferList.mBuffers.mDataByteSize)
+            if count > 0 {
+                return Data(outputBuffer.prefix(count))
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - AUDIO TRACK DECODER (Decodes any audio file into 48kHz stereo PCM)
+final class AudioTrackDecoder {
+    var pcmData: Data = Data()
+    var totalFrames: Int = 0
+    var durationSeconds: Double = 0
+
+    init?(url: URL) {
+        guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
+        let processingFormat = audioFile.processingFormat
+        let fileLength = audioFile.length
+        durationSeconds = Double(fileLength) / processingFormat.sampleRate
+
+        guard let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 48000,
+            channels: 2,
+            interleaved: true
+        ) else { return nil }
+
+        guard let converter = AVAudioConverter(from: processingFormat, to: targetFormat) else { return nil }
+
+        let readCapacity: AVAudioFrameCount = 4096
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: processingFormat, frameCapacity: readCapacity),
+              let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: readCapacity) else { return nil }
+
+        var allData = Data()
+        audioFile.framePosition = 0
+
+        while audioFile.framePosition < fileLength {
+            do {
+                try audioFile.read(into: inputBuffer)
+                if inputBuffer.frameLength == 0 { break }
+
+                var isDone = false
+                var error: NSError?
+                let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+                    if isDone {
+                        outStatus.pointee = .noDataNow
+                        return nil
+                    }
+                    isDone = true
+                    outStatus.pointee = .haveData
+                    return inputBuffer
+                }
+
+                outputBuffer.frameLength = 0
+                converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
+                if error != nil { break }
+
+                let bytes = Int(outputBuffer.frameLength) * 4
+                if bytes > 0, let pcmPtr = outputBuffer.int16ChannelData?[0] {
+                    allData.append(Data(bytes: pcmPtr, count: bytes))
+                }
+            } catch {
+                break
+            }
+        }
+
+        self.pcmData = allData
+        self.totalFrames = allData.count / 3840
+    }
+
+    init(pcmData: Data, durationSeconds: Double) {
+        self.pcmData = pcmData
+        self.durationSeconds = durationSeconds
+        self.totalFrames = pcmData.count / 3840
+    }
+}
+
+// MARK: - VOICE GATEWAY SESSION (DISCORD GATEWAY + VOICE WEBSOCKET + UDP RTP)
 final class VoiceGatewaySession: Identifiable, ObservableObject {
     let id: UUID
     let token: String
@@ -3448,6 +3732,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
     @Published var isConnected = false
     @Published var isJoined = false
     @Published var isSpeaking = false
+    @Published var isVoiceUDPReady = false
     @Published var pingMs: Int = 0
     @Published var lastLog = ""
 
@@ -3468,6 +3753,12 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
     private var voiceToken: String?
     private var voiceEndpoint: String?
     private var ssrc: Int = 0
+    private var secretKey: Data?
+
+    private let udpClient = DiscordVoiceUDPClient()
+    private var rtpSequence: UInt16 = UInt16.random(in: 0...65535)
+    private var rtpTimestamp: UInt32 = UInt32.random(in: 0...4000000)
+    private var rtpNonceCounter: UInt32 = 0
 
     var onLog: ((String) -> Void)?
 
@@ -3505,6 +3796,8 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
         let session = URLSession(configuration: .default)
         let ws = session.webSocketTask(with: url)
+        // Cố định kích thước tối đa 64MB để tránh lỗi "Message too long" khi tài khoản có nhiều server
+        ws.maximumMessageSize = 64 * 1024 * 1024
         self.wsTask = ws
         ws.resume()
 
@@ -3530,6 +3823,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                     DispatchQueue.main.async {
                         self.isConnected = false
                         self.isJoined = false
+                        self.isVoiceUDPReady = false
                     }
                 }
             }
@@ -3564,10 +3858,13 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                     }
                     if let cid = d["channel_id"] as? String, cid == currentChannelId {
                         DispatchQueue.main.async { self.isJoined = true }
-                        log("Đã vào phòng Voice thành công!")
+                        log("Đã tham gia phòng Voice! Đang kết nối máy chủ âm thanh...")
                         tryConnectVoiceGateway()
                     } else if d["channel_id"] == nil || d["channel_id"] is NSNull {
-                        DispatchQueue.main.async { self.isJoined = false }
+                        DispatchQueue.main.async {
+                            self.isJoined = false
+                            self.isVoiceUDPReady = false
+                        }
                     }
                 }
             } else if event == "VOICE_SERVER_UPDATE" {
@@ -3667,6 +3964,7 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
 
         let session = URLSession(configuration: .default)
         let vWs = session.webSocketTask(with: vUrl)
+        vWs.maximumMessageSize = 32 * 1024 * 1024
         self.voiceWsTask = vWs
         vWs.resume()
 
@@ -3705,16 +4003,76 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
                 sendVoiceIdentify(guildId: guildId, sessionId: sessionId, token: voiceToken)
             }
         case 2: // Ready
-            if let d = json["d"] as? [String: Any],
-               let ssrcVal = d["ssrc"] as? Int {
-                self.ssrc = ssrcVal
-                log("Voice Gateway Ready! SSRC: \(ssrcVal)")
+            if let d = json["d"] as? [String: Any] {
+                if let ssrcVal = d["ssrc"] as? Int {
+                    self.ssrc = ssrcVal
+                }
+                let ip = d["ip"] as? String ?? ""
+                let port = d["port"] as? Int ?? 0
+                log("Voice Gateway Ready! SSRC: \(self.ssrc). Đang thiết lập UDP...")
+                startVoiceUDP(ip: ip, port: port)
+            }
+        case 4: // Session Description (nhận khóa mã hóa secret_key)
+            if let d = json["d"] as? [String: Any] {
+                let mode = d["mode"] as? String ?? ""
+                if let keyArr = d["secret_key"] as? [Int] {
+                    self.secretKey = Data(keyArr.map { UInt8($0 & 0xFF) })
+                } else if let keyArr = d["secret_key"] as? [UInt8] {
+                    self.secretKey = Data(keyArr)
+                }
+                DispatchQueue.main.async {
+                    self.isVoiceUDPReady = true
+                    self.isJoined = true
+                }
+                log("Kênh thoại đã sẵn sàng xả nhạc (\(mode))!")
                 if self.isSpeaking {
                     sendSpeaking(true)
                 }
             }
         default:
             break
+        }
+    }
+
+    private func startVoiceUDP(ip: String, port: Int) {
+        guard udpClient.connect(ip: ip, port: UInt16(port)) else {
+            log("Lỗi khởi tạo UDP socket")
+            return
+        }
+
+        Task.detached { [weak self] in
+            guard let self = self else { return }
+            var extIP = ip
+            var extPort = port
+
+            if let disc = self.udpClient.discoverIP(ssrc: UInt32(self.ssrc)) {
+                extIP = disc.ip
+                extPort = Int(disc.port)
+                self.log("Phát hiện UDP IP ngoại vi: \(extIP):\(extPort)")
+            } else {
+                self.log("Dùng IP trực tiếp: \(extIP):\(extPort)")
+            }
+
+            self.sendSelectProtocol(ip: extIP, port: extPort)
+        }
+    }
+
+    private func sendSelectProtocol(ip: String, port: Int) {
+        guard let ws = voiceWsTask else { return }
+        let payload: [String: Any] = [
+            "op": 1,
+            "d": [
+                "protocol": "udp",
+                "data": [
+                    "address": ip,
+                    "port": port,
+                    "mode": "aead_aes256_gcm_rtpsize"
+                ]
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
         }
     }
 
@@ -3770,6 +4128,53 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         }
     }
 
+    /// Truyền gói tin âm thanh Opus trực tiếp vào kênh thoại qua UDP RTP (aead_aes256_gcm_rtpsize)
+    func sendOpusPacket(_ opusPayload: Data) {
+        guard isVoiceUDPReady, let key = secretKey, key.count == 32 else { return }
+
+        // 12-byte RTP Header
+        var header = [UInt8](repeating: 0, count: 12)
+        header[0] = 0x80
+        header[1] = 0x78 // Payload type 120 (Opus)
+        header[2] = UInt8((rtpSequence >> 8) & 0xFF)
+        header[3] = UInt8(rtpSequence & 0xFF)
+        header[4] = UInt8((rtpTimestamp >> 24) & 0xFF)
+        header[5] = UInt8((rtpTimestamp >> 16) & 0xFF)
+        header[6] = UInt8((rtpTimestamp >> 8) & 0xFF)
+        header[7] = UInt8(rtpTimestamp & 0xFF)
+        header[8] = UInt8((ssrc >> 24) & 0xFF)
+        header[9] = UInt8((ssrc >> 16) & 0xFF)
+        header[10] = UInt8((ssrc >> 8) & 0xFF)
+        header[11] = UInt8(ssrc & 0xFF)
+
+        // aead_aes256_gcm_rtpsize: 4-byte counter + 8 bytes zero = 12 bytes nonce
+        var nonceBytes = [UInt8](repeating: 0, count: 12)
+        nonceBytes[0] = UInt8((rtpNonceCounter >> 24) & 0xFF)
+        nonceBytes[1] = UInt8((rtpNonceCounter >> 16) & 0xFF)
+        nonceBytes[2] = UInt8((rtpNonceCounter >> 8) & 0xFF)
+        nonceBytes[3] = UInt8(rtpNonceCounter & 0xFF)
+
+        do {
+            let nonce = try AES.GCM.Nonce(data: nonceBytes)
+            let symKey = SymmetricKey(data: key)
+            let sealed = try AES.GCM.seal(opusPayload, using: symKey, nonce: nonce, authenticating: Data(header))
+
+            // Packet = Header (12) + Ciphertext + Tag (16) + Nonce Suffix (4)
+            var packet = Data(header)
+            packet.append(sealed.ciphertext)
+            packet.append(sealed.tag)
+            packet.append(contentsOf: nonceBytes[0..<4])
+
+            udpClient.sendPacket(packet)
+
+            rtpSequence = rtpSequence &+ 1
+            rtpTimestamp = rtpTimestamp &+ 960
+            rtpNonceCounter = rtpNonceCounter &+ 1
+        } catch {
+            // Lỗi mã hóa
+        }
+    }
+
     func stop() {
         if let gid = currentGuildId {
             let payload: [String: Any] = [
@@ -3796,11 +4201,13 @@ final class VoiceGatewaySession: Identifiable, ObservableObject {
         voiceHeartbeatTask?.cancel(); voiceHeartbeatTask = nil
         voiceListenTask?.cancel(); voiceListenTask = nil
         voiceWsTask?.cancel(with: .goingAway, reason: nil); voiceWsTask = nil
+        udpClient.close()
 
         DispatchQueue.main.async {
             self.isConnected = false
             self.isJoined = false
             self.isSpeaking = false
+            self.isVoiceUDPReady = false
         }
         log("Đã ngắt kết nối.")
     }
@@ -3935,6 +4342,13 @@ final class VoiceRoomManager: ObservableObject {
         }
     }
 
+    /// Phát trực tiếp gói tin Opus âm thanh vào tất cả tài khoản đang trong kênh Voice
+    func broadcastOpusPacket(_ opusData: Data) {
+        for s in sessions {
+            s.sendOpusPacket(opusData)
+        }
+    }
+
     func addLog(_ msg: String) {
         let entry = VoiceLogEntry(timestamp: Date(), message: msg)
         logs.insert(entry, at: 0)
@@ -3953,7 +4367,7 @@ final class VoiceRoomManager: ObservableObject {
 }
 
 // ==============================================================================
-// MARK: - MUSIC STREAM & XẢ NHẠC VIP (MAKE SUPER VIP)
+// MARK: - MUSIC STREAM & XẢ NHẠC VIP (RTP UDP VOICE STREAMING)
 // ==============================================================================
 
 enum MusicPreset: String, CaseIterable, Identifiable {
@@ -4002,9 +4416,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     @Published var duration: Double = 0
     @Published var visualizerLevels: [CGFloat] = [0.2, 0.4, 0.7, 0.3, 0.9, 0.5, 0.8, 0.4]
     @Published var speakingSyncEnabled = true
+    @Published var playLocalSpeaker = true // Phát kèm loa ngoài điện thoại để nghe thử
 
     private var audioPlayer: AVAudioPlayer?
-    private var progressTimer: Timer?
+    private var streamTask: Task<Void, Never>?
+    private var currentDecoder: AudioTrackDecoder?
+    private let opusEncoder = OpusAudioEncoder()
+    private var streamFrameIndex = 0
 
     private override init() {
         super.init()
@@ -4013,6 +4431,32 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     func loadAudio(url: URL) {
         stop()
 
+        currentSongTitle = "Đang nạp file: \(url.deletingPathExtension().lastPathComponent)..."
+
+        Task.detached { [weak self] in
+            guard let self = self else { return }
+            if let decoder = AudioTrackDecoder(url: url) {
+                await MainActor.run {
+                    self.currentDecoder = decoder
+                    self.currentSongTitle = url.deletingPathExtension().lastPathComponent
+                    self.duration = decoder.durationSeconds
+                    self.currentTime = 0
+
+                    if self.playLocalSpeaker {
+                        self.setupLocalPlayer(url: url)
+                    }
+
+                    self.play()
+                }
+            } else {
+                await MainActor.run {
+                    self.currentSongTitle = "Lỗi định dạng nhạc không hỗ trợ"
+                }
+            }
+        }
+    }
+
+    private func setupLocalPlayer(url: URL) {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [])
@@ -4023,14 +4467,8 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             audioPlayer?.numberOfLoops = isLooping ? -1 : 0
             audioPlayer?.volume = volume
             audioPlayer?.prepareToPlay()
-
-            currentSongTitle = url.deletingPathExtension().lastPathComponent
-            duration = audioPlayer?.duration ?? 0
-            currentTime = 0
-
-            play()
         } catch {
-            currentSongTitle = "Lỗi nạp audio: \(error.localizedDescription)"
+            print("Local player error: \(error)")
         }
     }
 
@@ -4038,22 +4476,18 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         stop()
         currentSongTitle = preset.rawValue
 
-        let sampleRate: Double = 44100
-        let toneDuration: Double = 4.0
+        let sampleRate: Double = 48000.0
+        let toneDuration: Double = 6.0
         let frameCount = Int(sampleRate * toneDuration)
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2),
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
-
-        buffer.frameLength = AVAudioFrameCount(frameCount)
-        let leftChannel = buffer.floatChannelData?[0]
-        let rightChannel = buffer.floatChannelData?[1]
+        var pcmData = Data()
+        pcmData.reserveCapacity(frameCount * 4)
 
         for i in 0..<frameCount {
             let t = Double(i) / sampleRate
             var sample: Float = 0
             switch preset {
             case .djVinahouse:
-                let beat = fmod(t * (130.0 / 60.0), 1.0)
+                let beat = fmod(t * (132.0 / 60.0), 1.0)
                 let kick = beat < 0.15 ? sin(Float(2 * Double.pi * 55 * t) * (1.0 - Float(beat / 0.15))) : 0
                 let lead = sin(Float(2 * Double.pi * 440 * t)) * 0.3
                 sample = Float(kick * 0.7) + lead
@@ -4067,43 +4501,55 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             case .whiteNoise:
                 sample = Float.random(in: -0.2...0.2)
             }
-            leftChannel?[i] = sample
-            rightChannel?[i] = sample
+
+            // Convert Float (-1.0 to 1.0) to Int16 stereo
+            let clamped = max(-1.0, min(1.0, sample))
+            let int16Val = Int16(clamped * 32767.0)
+            let u16Val = UInt16(bitPattern: int16Val)
+            let b0 = UInt8(u16Val & 0xFF)
+            let b1 = UInt8((u16Val >> 8) & 0xFF)
+            // Left channel
+            pcmData.append(b0); pcmData.append(b1)
+            // Right channel
+            pcmData.append(b0); pcmData.append(b1)
         }
 
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("preset_\(preset.id).wav")
-        do {
-            let audioFile = try AVAudioFile(forWriting: tempURL, settings: format.settings)
-            try audioFile.write(from: buffer)
-            loadAudio(url: tempURL)
-            currentSongTitle = preset.rawValue
-        } catch {
-            currentSongTitle = "Lỗi phát mẫu: \(error.localizedDescription)"
-        }
+        let decoder = AudioTrackDecoder(pcmData: pcmData, durationSeconds: toneDuration)
+        self.currentDecoder = decoder
+        self.duration = toneDuration
+        self.currentTime = 0
+
+        play()
     }
 
     func play() {
-        guard let p = audioPlayer else { return }
-        p.numberOfLoops = isLooping ? -1 : 0
-        p.play()
-        isPlaying = true
+        guard let decoder = currentDecoder, !decoder.pcmData.isEmpty else { return }
 
+        isPlaying = true
         BackgroundManager.shared.start()
 
         if speakingSyncEnabled {
             VoiceRoomManager.shared.setSpeaking(true)
         }
 
-        NowPlayingHelper.shared.update(title: "Xả Nhạc: \(currentSongTitle)", detail: "Đang phát trong Voice")
+        if playLocalSpeaker {
+            audioPlayer?.numberOfLoops = isLooping ? -1 : 0
+            audioPlayer?.play()
+        }
 
-        startProgressTimer()
+        NowPlayingHelper.shared.update(
+            title: "Xả Nhạc: \(currentSongTitle)",
+            detail: "Đang xả vào Voice Discord"
+        )
+
+        startStreamingTask()
     }
 
     func pause() {
-        audioPlayer?.pause()
         isPlaying = false
-        progressTimer?.invalidate()
-        progressTimer = nil
+        streamTask?.cancel()
+        streamTask = nil
+        audioPlayer?.pause()
 
         if speakingSyncEnabled {
             VoiceRoomManager.shared.setSpeaking(false)
@@ -4111,12 +4557,20 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     func stop() {
+        isPlaying = false
+        streamTask?.cancel()
+        streamTask = nil
+        streamFrameIndex = 0
+        currentTime = 0
+
         audioPlayer?.stop()
         audioPlayer = nil
-        isPlaying = false
-        currentTime = 0
-        progressTimer?.invalidate()
-        progressTimer = nil
+
+        // Gửi 5 gói tin tĩnh lặng để ngắt sạch âm thanh phía Discord Voice
+        let silencePacket = Data([0xF8, 0xFF, 0xFE])
+        for _ in 0..<5 {
+            VoiceRoomManager.shared.broadcastOpusPacket(silencePacket)
+        }
 
         if speakingSyncEnabled {
             VoiceRoomManager.shared.setSpeaking(false)
@@ -4124,8 +4578,11 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     func seek(to seconds: Double) {
-        audioPlayer?.currentTime = seconds
+        guard let decoder = currentDecoder, decoder.durationSeconds > 0 else { return }
+        let fraction = min(1.0, max(0.0, seconds / decoder.durationSeconds))
+        streamFrameIndex = Int(Double(decoder.totalFrames) * fraction)
         currentTime = seconds
+        audioPlayer?.currentTime = seconds
     }
 
     func toggleLoop() {
@@ -4133,15 +4590,65 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         audioPlayer?.numberOfLoops = isLooping ? -1 : 0
     }
 
-    private func startProgressTimer() {
-        progressTimer?.invalidate()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self = self, let p = self.audioPlayer, self.isPlaying else { return }
-            self.currentTime = p.currentTime
-            self.duration = p.duration
+    /// Vòng lặp truyền âm thanh UDP RTP 20ms trực tiếp vào Voice Channel Discord
+    private func startStreamingTask() {
+        streamTask?.cancel()
+        guard let decoder = currentDecoder, !decoder.pcmData.isEmpty else { return }
 
-            self.visualizerLevels = (0..<8).map { _ in
-                CGFloat.random(in: 0.15...0.95)
+        let pcm = decoder.pcmData
+        let total = decoder.totalFrames
+        let bytesPerChunk = 3840 // 960 samples * 2 channels * 2 bytes = 20ms
+
+        streamTask = Task.detached { [weak self] in
+            guard let self = self else { return }
+
+            while !Task.isCancelled {
+                let start = DispatchTime.now()
+
+                var curIdx = 0
+                await MainActor.run {
+                    curIdx = self.streamFrameIndex
+                }
+
+                let offset = curIdx * bytesPerChunk
+                if offset + bytesPerChunk > pcm.count {
+                    var shouldLoop = false
+                    await MainActor.run {
+                        shouldLoop = self.isLooping
+                    }
+                    if shouldLoop {
+                        await MainActor.run {
+                            self.streamFrameIndex = 0
+                            self.audioPlayer?.currentTime = 0
+                        }
+                        continue
+                    } else {
+                        await MainActor.run { self.stop() }
+                        break
+                    }
+                }
+
+                let chunk = pcm.subdata(in: offset..<(offset + bytesPerChunk))
+                if let opus = self.opusEncoder?.encode(pcmData: chunk) {
+                    await MainActor.run {
+                        VoiceRoomManager.shared.broadcastOpusPacket(opus)
+                    }
+                }
+
+                await MainActor.run {
+                    self.streamFrameIndex += 1
+                    if self.streamFrameIndex % 5 == 0 {
+                        self.currentTime = Double(self.streamFrameIndex * 960) / 48000.0
+                        self.visualizerLevels = (0..<8).map { _ in CGFloat.random(in: 0.15...0.95) }
+                    }
+                }
+
+                // Căn chuẩn chu kỳ 20ms cho mỗi gói tin Voice
+                let elapsedNanos = DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds
+                let targetNanos: UInt64 = 20_000_000 // 20ms
+                if targetNanos > elapsedNanos {
+                    try? await Task.sleep(nanoseconds: targetNanos - elapsedNanos)
+                }
             }
         }
     }
@@ -4168,7 +4675,7 @@ struct VoiceRoomTabView: View {
     @State private var mode: TabMode = .treoRoom
     enum TabMode: String, CaseIterable, Identifiable {
         case treoRoom = "Treo Room 24/7"
-        case xaNhac = "Xả Nhạc VIP"
+        case xaNhac = "Xả Nhạc Voice"
         var id: String { rawValue }
     }
 
@@ -4181,7 +4688,7 @@ struct VoiceRoomTabView: View {
             VStack(spacing: 0) {
                 Picker("Chế độ", selection: $mode) {
                     Label("Treo Room", systemImage: "waveform").tag(TabMode.treoRoom)
-                    Label("Xả Nhạc", systemImage: "music.note").tag(TabMode.xaNhac)
+                    Label("Xả Nhạc Voice", systemImage: "music.note").tag(TabMode.xaNhac)
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal)
@@ -4198,7 +4705,7 @@ struct VoiceRoomTabView: View {
                     .padding()
                 }
             }
-            .navigationTitle(mode == .treoRoom ? "Treo Voice 24/7" : "Xả Nhạc Voice VIP")
+            .navigationTitle(mode == .treoRoom ? "Treo Voice 24/7" : "Xả Nhạc Vào Voice VIP")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showGuildPicker) {
                 VoiceGuildPickerSheet()
@@ -4449,7 +4956,7 @@ struct VoiceRoomTabView: View {
                             }
 
                             Circle()
-                                .fill(s.isJoined ? Color.green : (s.isConnected ? Color.yellow : Color.red))
+                                .fill(s.isVoiceUDPReady ? Color.green : (s.isJoined ? Color.green.opacity(0.7) : (s.isConnected ? Color.yellow : Color.red)))
                                 .frame(width: 10, height: 10)
                         }
                         .padding(8)
@@ -4494,6 +5001,24 @@ struct VoiceRoomTabView: View {
     // MARK: - XẢ NHẠC SECTION
     private var xaNhacSection: some View {
         VStack(spacing: 16) {
+            // Voice Connection Status Banner
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(voiceRoom.isRunning ? Color.green : Color.orange)
+                    .frame(width: 10, height: 10)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(voiceRoom.isRunning ? "ĐÃ KẾT NỐI KÊNH THOẠI DISCORD" : "CHƯA VÀO KÊNH THOẠI")
+                        .font(.caption.bold())
+                        .foregroundStyle(voiceRoom.isRunning ? .green : .orange)
+                    Text(voiceRoom.isRunning ? "Âm thanh sẽ được truyền trực tiếp (RTP UDP) vào Voice" : "Vui lòng bấm 'Treo Room' vào kênh trước khi xả nhạc")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(10)
+            .background(Color(UIColor.secondarySystemBackground))
+            .cornerRadius(10)
+
             // Player Card
             VStack(spacing: 16) {
                 // Vinyl / Album Artwork with Equalizer
@@ -4530,8 +5055,8 @@ struct VoiceRoomTabView: View {
                         .font(.headline.bold())
                         .lineLimit(1)
                         .multilineTextAlignment(.center)
-                    Text(musicStream.isPlaying ? "Đang phát vào Voice..." : "Tạm dừng")
-                        .font(.caption)
+                    Text(musicStream.isPlaying ? "🔊 ĐANG XẢ VÀO KÊNH THOẠI DISCORD" : "Tạm dừng")
+                        .font(.caption.bold())
                         .foregroundStyle(musicStream.isPlaying ? .green : .secondary)
                 }
 
@@ -4603,19 +5128,24 @@ struct VoiceRoomTabView: View {
                     }
                 }
 
-                // Volume Slider
-                HStack(spacing: 12) {
-                    Image(systemName: "speaker.fill").font(.caption).foregroundStyle(.secondary)
-                    Slider(value: $musicStream.volume, in: 0...1.0)
-                        .tint(.indigo)
-                    Image(systemName: "speaker.wave.3.fill").font(.caption).foregroundStyle(.secondary)
-                }
+                Divider()
 
-                Toggle(isOn: $musicStream.speakingSyncEnabled) {
-                    Label("Vòng xanh Discord (Speaking State)", systemImage: "record.circle")
-                        .font(.caption.bold())
+                // Settings: Monitor on phone & Speaking Ring Sync
+                VStack(spacing: 10) {
+                    Toggle(isOn: $musicStream.playLocalSpeaker) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Phát loa ngoài điện thoại (Monitor)").font(.subheadline.bold())
+                            Text("Bật để nghe cùng lúc trên máy, tắt để chỉ phát ngầm vào Discord")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .tint(.indigo)
+
+                    Toggle(isOn: $musicStream.speakingSyncEnabled) {
+                        Text("Vòng xanh Discord (Speaking State)").font(.subheadline)
+                    }
+                    .tint(.green)
                 }
-                .tint(.green)
             }
             .padding()
             .background(Color(UIColor.secondarySystemBackground))
@@ -4641,7 +5171,7 @@ struct VoiceRoomTabView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Image(systemName: "sparkles").foregroundStyle(.indigo)
-                    Text("Kho Nhạc Mẫu VIP (Phát Ngay)").font(.headline)
+                    Text("Kho Nhạc Mẫu VIP (Xả Vào Voice)").font(.headline)
                 }
 
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
