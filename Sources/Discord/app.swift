@@ -663,63 +663,259 @@ final class NowPlayingHelper {
 }
 
 // ==========================================
-// MARK: - BACKGROUND (AVAudioEngine)
+// MARK: - BACKGROUND 24/7 ENGINE (AVAudioPlayer Silent WAV + AVAudioEngine + Auto-Recovery)
 // ==========================================
-class BackgroundManager {
+final class BackgroundManager {
     static let shared = BackgroundManager()
+
+    private let lock = NSLock()
+    private var activeTags: Set<String> = []
+    private var silentPlayer: AVAudioPlayer?
     private var engine: AVAudioEngine?
     private var sourceNode: AVAudioSourceNode?
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    private var watchdogTimer: Timer?
+    private var observersInstalled = false
 
-    func start() {
-        if bgTask == .invalid {
-            bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in
-                self?.stop()
+    private init() {
+        installObservers()
+    }
+
+    var isKeepAliveActive: Bool {
+        lock.lock()
+        let active = !activeTags.isEmpty
+        lock.unlock()
+        return active
+    }
+
+    /// Tạo buffer WAV PCM 16-bit im lặng dài 1 giây (44.1kHz Mono) để AVAudioPlayer lặp vô hạn trên iOS background
+    private static func makeSilentWavData() -> Data {
+        let sampleRate: UInt32 = 44100
+        let numChannels: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let numSamples = Int(sampleRate)
+        let dataSize = UInt32(numSamples * Int(numChannels) * Int(bitsPerSample / 8))
+        let chunkSize = 36 + dataSize
+
+        var d = Data(capacity: 44 + Int(dataSize))
+        func appendLE16(_ v: UInt16) {
+            d.append(UInt8(v & 0xFF))
+            d.append(UInt8((v >> 8) & 0xFF))
+        }
+        func appendLE32(_ v: UInt32) {
+            d.append(UInt8(v & 0xFF))
+            d.append(UInt8((v >> 8) & 0xFF))
+            d.append(UInt8((v >> 16) & 0xFF))
+            d.append(UInt8((v >> 24) & 0xFF))
+        }
+
+        d.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // RIFF
+        appendLE32(chunkSize)
+        d.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // WAVE
+        d.append(contentsOf: [0x66, 0x6D, 0x74, 0x20]) // fmt
+        appendLE32(16)
+        appendLE16(1) // PCM
+        appendLE16(numChannels)
+        appendLE32(sampleRate)
+        appendLE32(sampleRate * UInt32(numChannels) * UInt32(bitsPerSample / 8))
+        appendLE16(numChannels * (bitsPerSample / 8))
+        appendLE16(bitsPerSample)
+        d.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // data
+        appendLE32(dataSize)
+        d.append(Data(count: Int(dataSize)))
+        return d
+    }
+
+    private func installObservers() {
+        guard !observersInstalled else { return }
+        observersInstalled = true
+        let nc = NotificationCenter.default
+
+        nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self = self, self.isKeepAliveActive else { return }
+            let typeVal = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let type = typeVal.flatMap { AVAudioSession.InterruptionType(rawValue: $0) }
+            if type == .ended {
+                self.ensureRunning()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                    guard let self = self, self.isKeepAliveActive else { return }
+                    self.ensureRunning()
+                }
             }
         }
 
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true, options: [])
-        } catch {
-            print("[BG] AVAudioSession FAIL: \(error)")
+        nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.isKeepAliveActive else { return }
+            self.ensureRunning()
         }
 
-        if engine?.isRunning == true { return }
-
-        let eng = AVAudioEngine()
-        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
-
-        let node = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
-            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            for buf in abl {
-                let ptr = buf.mData?.assumingMemoryBound(to: Float.self)
-                for i in 0..<Int(frameCount) { ptr?[i] = 0.00001 }
-            }
-            return noErr
+        nc.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.isKeepAliveActive else { return }
+            self.rebuildAudioPipeline()
         }
 
-        eng.attach(node)
-        eng.connect(node, to: eng.mainMixerNode, format: format)
-        eng.mainMixerNode.outputVolume = 0.01
+        nc.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.isKeepAliveActive else { return }
+            self.beginTransientBgTask()
+            self.ensureRunning()
+        }
 
-        do {
-            try eng.start()
-            engine = eng
-            sourceNode = node
-        } catch {
-            print("[BG] AVAudioEngine FAIL: \(error)")
+        nc.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.isKeepAliveActive else { return }
+            self.endTransientBgTask()
+            self.ensureRunning()
         }
     }
 
-    func stop() {
+    /// Xin background task ngắn hạn để chuyển trạng thái mượt — KHÔNG gọi stop() khi hết 30s!
+    private func beginTransientBgTask() {
+        DispatchQueue.main.async {
+            if self.bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(self.bgTask)
+                self.bgTask = .invalid
+            }
+            self.bgTask = UIApplication.shared.beginBackgroundTask(withName: "DiscordStreamKeepAlive") { [weak self] in
+                guard let self = self else { return }
+                if self.bgTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(self.bgTask)
+                    self.bgTask = .invalid
+                }
+                if self.isKeepAliveActive {
+                    self.ensureRunning()
+                }
+            }
+        }
+    }
+
+    private func endTransientBgTask() {
+        DispatchQueue.main.async {
+            if self.bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(self.bgTask)
+                self.bgTask = .invalid
+            }
+        }
+    }
+
+    func start(tag: String = "default") {
+        lock.lock()
+        activeTags.insert(tag)
+        lock.unlock()
+        ensureRunning()
+        startWatchdog()
+    }
+
+    func ensureRunning() {
+        let work = {
+            guard self.isKeepAliveActive else { return }
+
+            do {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(
+                    .playback,
+                    mode: .default,
+                    options: [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP]
+                )
+                try session.setActive(true, options: [])
+            } catch {
+                print("[BG] AVAudioSession WARN: \(error)")
+            }
+
+            if self.silentPlayer == nil {
+                if let player = try? AVAudioPlayer(data: BackgroundManager.makeSilentWavData()) {
+                    player.numberOfLoops = -1
+                    player.volume = 0.001
+                    player.prepareToPlay()
+                    self.silentPlayer = player
+                }
+            }
+            if let player = self.silentPlayer, !player.isPlaying {
+                player.play()
+            }
+
+            if self.engine == nil {
+                let eng = AVAudioEngine()
+                let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+                let node = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
+                    let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+                    for buf in abl {
+                        if let ptr = buf.mData?.assumingMemoryBound(to: Float.self) {
+                            memset(ptr, 0, Int(frameCount) * MemoryLayout<Float>.size)
+                        }
+                    }
+                    return noErr
+                }
+                eng.attach(node)
+                eng.connect(node, to: eng.mainMixerNode, format: format)
+                eng.mainMixerNode.outputVolume = 0.001
+                self.engine = eng
+                self.sourceNode = node
+            }
+            if let eng = self.engine, !eng.isRunning {
+                try? eng.start()
+            }
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
+    private func rebuildAudioPipeline() {
+        silentPlayer?.stop()
+        silentPlayer = nil
         engine?.stop()
         engine = nil
         sourceNode = nil
-        if bgTask != .invalid {
-            UIApplication.shared.endBackgroundTask(bgTask)
-            bgTask = .invalid
+        ensureRunning()
+    }
+
+    private func startWatchdog() {
+        DispatchQueue.main.async {
+            if self.watchdogTimer != nil { return }
+            self.watchdogTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                if self.isKeepAliveActive {
+                    let playerAlive = self.silentPlayer?.isPlaying == true
+                    let engineAlive = self.engine?.isRunning == true
+                    if !playerAlive || !engineAlive {
+                        self.ensureRunning()
+                    }
+                } else {
+                    self.watchdogTimer?.invalidate()
+                    self.watchdogTimer = nil
+                }
+            }
+        }
+    }
+
+    func stop(tag: String = "default") {
+        lock.lock()
+        activeTags.remove(tag)
+        let shouldShutdown = activeTags.isEmpty
+        lock.unlock()
+        if shouldShutdown {
+            stopAll()
+        }
+    }
+
+    func stopAll() {
+        lock.lock()
+        activeTags.removeAll()
+        lock.unlock()
+        DispatchQueue.main.async {
+            self.watchdogTimer?.invalidate()
+            self.watchdogTimer = nil
+            self.silentPlayer?.stop()
+            self.silentPlayer = nil
+            self.engine?.stop()
+            self.engine = nil
+            self.sourceNode = nil
+            if self.bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(self.bgTask)
+                self.bgTask = .invalid
+            }
         }
     }
 }
@@ -2669,18 +2865,31 @@ struct SpamDiscordApp: App {
                 }
             }
             .onChange(of: scenePhase) { phase in
-                if phase == .active {
+                switch phase {
+                case .active:
                     Task { @MainActor in await license.refreshStatus() }
+                    voiceRoom.setAppInBackground(false)
                     if app.isSending, AppEndpoints.isLoaded {
                         BackgroundManager.shared.start()
                         NowPlayingHelper.shared.update(
                             title: "Quoc Thang Spam",
                             detail: "\(app.totalSent) tin | \(app.selectedTokenIds.count) token")
-                    } else if voiceRoom.isRunning {
-                        BackgroundManager.shared.start()
-                    } else if musicStream.isPlaying {
-                        BackgroundManager.shared.start()
                     }
+                    if voiceRoom.isRunning {
+                        BackgroundManager.shared.start(tag: "treo")
+                    }
+                    if musicStream.isPlaying {
+                        BackgroundManager.shared.start(tag: "music")
+                    }
+                case .background, .inactive:
+                    if voiceRoom.isRunning || musicStream.isPlaying || app.isSending || BackgroundManager.shared.isKeepAliveActive {
+                        BackgroundManager.shared.ensureRunning()
+                    }
+                    if phase == .background {
+                        voiceRoom.setAppInBackground(true)
+                    }
+                @unknown default:
+                    break
                 }
             }
             .onChange(of: license.isUnlocked) { unlocked in
@@ -2690,7 +2899,7 @@ struct SpamDiscordApp: App {
                     userNuke.stop()
                     voiceRoom.stopTreo()
                     musicStream.stop()
-                    BackgroundManager.shared.stop()
+                    BackgroundManager.shared.stopAll()
                     NowPlayingHelper.shared.stop()
                 }
             }
@@ -5783,7 +5992,10 @@ final class VoiceRoomManager: ObservableObject {
 
         addLog("Bắt đầu treo room [\(channelName)] (\(tokens.count) tài khoản)")
 
-        BackgroundManager.shared.start()
+        BackgroundManager.shared.start(tag: "treo")
+        NowPlayingHelper.shared.start(onStop: { [weak self] in
+            Task { @MainActor in self?.stopTreo() }
+        })
         NowPlayingHelper.shared.update(
             title: "Treo Voice: \(channelName)",
             detail: "\(tokens.count) tài khoản đang online"
@@ -5867,6 +6079,17 @@ final class VoiceRoomManager: ObservableObject {
         }
     }
 
+    func setAppInBackground(_ inBackground: Bool) {
+        goLiveEngine.setBackgroundMode(inBackground)
+        fakeCamEngine.setBackgroundMode(inBackground)
+        if inBackground && isRunning {
+            BackgroundManager.shared.start(tag: "treo")
+        } else if !inBackground && isRunning {
+            goLiveEngine.requestKeyFrame()
+            fakeCamEngine.requestKeyFrame()
+        }
+    }
+
     func stopTreo() {
         joinTask?.cancel()
         joinTask = nil
@@ -5880,6 +6103,10 @@ final class VoiceRoomManager: ObservableObject {
         }
         sessions.removeAll()
         isRunning = false
+        BackgroundManager.shared.stop(tag: "treo")
+        if !BackgroundManager.shared.isKeepAliveActive {
+            NowPlayingHelper.shared.stop()
+        }
         addLog("Đã dừng treo room, Fake Cam và Go Live.")
     }
 
@@ -6208,7 +6435,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     private func setupLocalPlayer(url: URL) {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP])
             try session.setActive(true)
 
             localPlayer = try AVAudioPlayer(contentsOf: url)
@@ -6268,7 +6495,10 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         currentTime = 0
         addLog("⚡ Khởi động HỆ THỐNG TIÊN NGHỊCH: Triệu tập \(tokensToUse.count) Đạo hữu vào phòng [\(channelId)]")
 
-        BackgroundManager.shared.start()
+        BackgroundManager.shared.start(tag: "music")
+        NowPlayingHelper.shared.start(onStop: { [weak self] in
+            Task { @MainActor in self?.stopSpam() }
+        })
         NowPlayingHelper.shared.update(
             title: "Xả Cha VIP: \(currentSongTitle)",
             detail: "Đang phát vào kênh [\(channelId)] (\(tokensToUse.count) bot)"
@@ -6411,6 +6641,11 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         localPlayer?.stop()
         localPlayer = nil
+
+        BackgroundManager.shared.stop(tag: "music")
+        if !BackgroundManager.shared.isKeepAliveActive {
+            NowPlayingHelper.shared.stop()
+        }
 
         statusText = "⛩️ Bế quan (Đã thu hồi toàn bộ phân thân)"
         addLog("⛩️ Đã bế quan, giải tán hàng đợi nhạc và thu hồi toàn bộ phân thân.")
@@ -6605,7 +6840,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 }
 
 // ==============================================================================
-// MARK: - VOICE ROOM & XẢ MIC TAB VIEW (GIAO DIỆN CHÍNH MAKE SUPER VIP)
+// MARK: - VOICE ROOM & XẢ MIC TAB VIEW (MODERN STUDIO CONTROL DECK)
 // ==============================================================================
 struct VoiceRoomTabView: View {
     @EnvironmentObject var app: AppState
@@ -6614,7 +6849,7 @@ struct VoiceRoomTabView: View {
 
     @State private var mode: TabMode = .xaMic
     enum TabMode: String, CaseIterable, Identifiable {
-        case xaMic = "Xả Nhạc (Super VIP)"
+        case xaMic = "Xả Nhạc VIP"
         case treoRoom = "Treo Room 24/7"
         var id: String { rawValue }
     }
@@ -6623,34 +6858,66 @@ struct VoiceRoomTabView: View {
     @State private var showDocumentPicker = false
     @State private var showStreamMediaPicker = false
     @State private var showCamMediaPicker = false
+    @State private var copiedMusicLog = false
+    @State private var copiedRoomLog = false
+    @State private var pulseLive = false
+
+    private var accentStart: Color {
+        mode == .xaMic ? Color(red: 0.95, green: 0.24, blue: 0.28) : Color(red: 0.36, green: 0.34, blue: 0.96)
+    }
+
+    private var accentEnd: Color {
+        mode == .xaMic ? Color(red: 1.0, green: 0.50, blue: 0.14) : Color(red: 0.62, green: 0.28, blue: 0.95)
+    }
+
+    private var accentGradient: LinearGradient {
+        LinearGradient(colors: [accentStart, accentEnd], startPoint: .topLeading, endPoint: .bottomTrailing)
+    }
+
+    private var isAnyBackgroundEngineActive: Bool {
+        voiceRoom.isRunning || musicStream.isPlaying
+    }
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                // Header Banner Tiên Nghịch Make Super VIP
-                headerBanner
+            ZStack(alignment: .top) {
+                Color(UIColor.systemGroupedBackground)
+                    .ignoresSafeArea()
 
-                Picker("Chế độ", selection: $mode) {
-                    Label("Xả Nhạc (Super VIP)", systemImage: "flame.fill").tag(TabMode.xaMic)
-                    Label("Treo Room 24/7", systemImage: "waveform").tag(TabMode.treoRoom)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal)
-                .padding(.vertical, 8)
+                LinearGradient(
+                    colors: [accentStart.opacity(0.14), accentEnd.opacity(0.04), Color.clear],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 240)
+                .ignoresSafeArea(edges: .top)
+                .animation(.easeInOut(duration: 0.35), value: mode)
 
-                ScrollView {
-                    VStack(spacing: 16) {
-                        if mode == .xaMic {
-                            makeSuperVipSection
-                        } else {
-                            treoRoomSection
+                VStack(spacing: 0) {
+                    studioTopBar
+                    floatingModeSwitcher
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
+                        .padding(.bottom, 10)
+
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 16) {
+                            if mode == .xaMic {
+                                makeSuperVipSection
+                            } else {
+                                treoRoomSection
+                            }
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 4)
+                        .padding(.bottom, 28)
                     }
-                    .padding()
                 }
             }
-            .navigationTitle(mode == .xaMic ? "Xả Nhạc Make Super VIP" : "Treo Voice • Cam • Stream")
-            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .navigationBar)
+            .onAppear {
+                pulseLive = true
+            }
             .sheet(isPresented: $showGuildPicker) {
                 VoiceGuildPickerSheet(isForSpam: mode == .xaMic)
             }
@@ -6672,39 +6939,281 @@ struct VoiceRoomTabView: View {
         }
     }
 
-    // MARK: - HEADER BANNER TIÊN NGHỊCH MAKE SUPER VIP
-    private var headerBanner: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "flame.fill")
-                .foregroundColor(.red)
-                .font(.title3)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text("TIÊN NGHỊCH [XẢ CHA - ĐỘC TÔN]")
-                    .font(.caption.bold())
-                    .foregroundColor(.red)
-                Text("HỆ THỐNG XẢ NHẠC ĐA PHÂN THÂN BẤT TỬ • ĐIỀU KHIỂN CẢM ỨNG 100%")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(.secondary)
+    // MARK: - MODERN STUDIO HEADER & FLOATING CAPSULE SWITCHER
+    private var studioTopBar: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(accentGradient)
+                    .frame(width: 40, height: 40)
+                    .shadow(color: accentStart.opacity(0.35), radius: 8, y: 4)
+                Image(systemName: mode == .xaMic ? "flame.fill" : "waveform")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white)
             }
 
-            Spacer()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(mode == .xaMic ? "Voice Studio • Xả Nhạc" : "Voice Studio • Treo Room")
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
 
-            Text("MAKE SUPER VIP")
-                .font(.system(size: 10, weight: .black))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(LinearGradient(colors: [.red, .purple], startPoint: .leading, endPoint: .trailing))
+                HStack(spacing: 6) {
+                    if isAnyBackgroundEngineActive {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 6, height: 6)
+                                .scaleEffect(pulseLive ? 1.25 : 0.85)
+                                .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulseLive)
+                            Text("24/7 CHẠY NỀN")
+                                .font(.system(size: 10, weight: .heavy, design: .rounded))
+                                .foregroundColor(.green)
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.14))
+                        .clipShape(Capsule())
+                    } else {
+                        Text("WebRTC • DAVE E2EE • 0% GPU Nền")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+
+            Spacer(minLength: 6)
+
+            Text(mode == .xaMic ? "SUPER VIP" : "24/7 PRO")
+                .font(.system(size: 10, weight: .black, design: .rounded))
+                .tracking(0.5)
                 .foregroundColor(.white)
-                .cornerRadius(6)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(accentGradient)
+                .clipShape(Capsule())
+                .shadow(color: accentStart.opacity(0.25), radius: 6, y: 2)
         }
-        .padding(.horizontal)
-        .padding(.top, 6)
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 6)
     }
 
-    // MARK: - MAKE SUPER VIP SECTION (XẢ NHẠC TIÊN NGHỊCH ĐA PHÂN THÂN)
+    private var floatingModeSwitcher: some View {
+        HStack(spacing: 6) {
+            modePillButton(
+                target: .xaMic,
+                title: "Xả Nhạc VIP",
+                icon: "flame.fill",
+                isLive: musicStream.isPlaying,
+                liveColor: musicStream.isPaused ? .orange : .green,
+                colors: [Color(red: 0.95, green: 0.24, blue: 0.28), Color(red: 1.0, green: 0.50, blue: 0.14)]
+            )
+            modePillButton(
+                target: .treoRoom,
+                title: "Treo Room 24/7",
+                icon: "waveform.circle.fill",
+                isLive: voiceRoom.isRunning,
+                liveColor: .green,
+                colors: [Color(red: 0.36, green: 0.34, blue: 0.96), Color(red: 0.62, green: 0.28, blue: 0.95)]
+            )
+        }
+        .padding(4)
+        .background(Color(UIColor.secondarySystemGroupedBackground))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 8, y: 3)
+    }
+
+    private func modePillButton(
+        target: TabMode,
+        title: String,
+        icon: String,
+        isLive: Bool,
+        liveColor: Color,
+        colors: [Color]
+    ) -> some View {
+        let selected = (mode == target)
+        return Button {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
+                mode = target
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 13, weight: .bold))
+                Text(title)
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                if isLive {
+                    Circle()
+                        .fill(selected ? Color.white : liveColor)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .foregroundColor(selected ? .white : .secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(
+                Group {
+                    if selected {
+                        LinearGradient(colors: colors, startPoint: .leading, endPoint: .trailing)
+                    } else {
+                        Color.clear
+                    }
+                }
+            )
+            .clipShape(Capsule())
+            .shadow(color: selected ? colors[0].opacity(0.32) : .clear, radius: 6, y: 3)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - REUSABLE STUDIO UI PRIMITIVES
+    private func studioCard<Content: View>(
+        borderColor: Color = Color.primary.opacity(0.07),
+        borderWidth: CGFloat = 1,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            content()
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(UIColor.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(borderColor, lineWidth: borderWidth)
+        )
+        .shadow(color: Color.black.opacity(0.05), radius: 10, y: 4)
+    }
+
+    private func iconSquircle(systemName: String, colors: [Color], size: CGFloat = 34) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.30, style: .continuous)
+                .fill(LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing))
+                .frame(width: size, height: size)
+            Image(systemName: systemName)
+                .font(.system(size: size * 0.45, weight: .bold))
+                .foregroundColor(.white)
+        }
+    }
+
+    private func microBadge(_ text: String, bg: Color, fg: Color = .white) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .black, design: .rounded))
+            .tracking(0.3)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(bg)
+            .foregroundColor(fg)
+            .clipShape(Capsule())
+    }
+
+    private func logLineColor(for message: String) -> Color {
+        if message.contains("❌") || message.contains("Lỗi") || message.contains("lỗi") {
+            return Color(red: 1.0, green: 0.45, blue: 0.45)
+        }
+        if message.contains("✅") || message.contains("🎬") || message.contains("sẵn sàng") {
+            return Color(red: 0.36, green: 0.92, blue: 0.56)
+        }
+        if message.contains("⚠️") {
+            return Color(red: 1.0, green: 0.78, blue: 0.32)
+        }
+        if message.contains("🌙") || message.contains("⚡") || message.contains("🔐") || message.contains("🌐") || message.contains("📺") {
+            return Color(red: 0.46, green: 0.84, blue: 1.0)
+        }
+        return Color(white: 0.84)
+    }
+
+    private func studioTerminalCard(
+        title: String,
+        accent: Color,
+        logs: [VoiceLogEntry],
+        copied: Binding<Bool>,
+        onClear: @escaping () -> Void
+    ) -> some View {
+        studioCard {
+            HStack(spacing: 10) {
+                iconSquircle(systemName: "terminal.fill", colors: [accent, accent.opacity(0.7)], size: 30)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                    Text("\(logs.count) dòng gần nhất")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+
+                Button {
+                    let dump = logs.map { "[\(formatTime($0.timestamp))] \($0.message)" }.joined(separator: "\n")
+                    UIPasteboard.general.string = dump
+                    copied.wrappedValue = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        copied.wrappedValue = false
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: copied.wrappedValue ? "checkmark" : "doc.on.doc")
+                        Text(copied.wrappedValue ? "Đã copy" : "Copy")
+                    }
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(copied.wrappedValue ? Color.green.opacity(0.16) : Color(UIColor.tertiarySystemGroupedBackground))
+                    .foregroundColor(copied.wrappedValue ? .green : .primary)
+                    .clipShape(Capsule())
+                }
+
+                Button {
+                    onClear()
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.caption.bold())
+                        .padding(6)
+                        .background(Color.red.opacity(0.12))
+                        .foregroundColor(.red)
+                        .clipShape(Circle())
+                }
+            }
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 5) {
+                    ForEach(logs) { log in
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(formatTime(log.timestamp))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundColor(Color(white: 0.52))
+                            Text(log.message)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(logLineColor(for: log.message))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .padding(10)
+            }
+            .frame(height: 145)
+            .background(Color(red: 0.08, green: 0.09, blue: 0.13))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+    }
+
+    // ==========================================================================
+    // MARK: - TAB 1: XẢ NHẠC VIP (MODERN AUDIO DECK)
+    // ==========================================================================
     private var makeSuperVipSection: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 16) {
             nowPlayingCard
             tokenAndChannelCard
             playlistQueueCard
@@ -6714,56 +7223,121 @@ struct VoiceRoomTabView: View {
         }
     }
 
-    // Card 1: Trạng Thái Hỏa Lực & Now Playing Controller
+    // Card 1: Hero Now Playing Audio Deck
     private var nowPlayingCard: some View {
-        VStack(spacing: 12) {
+        let isLive = musicStream.isPlaying
+        let readyCount = musicStream.activeSessions.filter { $0.isVoiceUDPReady }.count
+
+        return studioCard(
+            borderColor: isLive ? Color.red.opacity(0.35) : Color.primary.opacity(0.07),
+            borderWidth: isLive ? 1.5 : 1
+        ) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(musicStream.isPlaying ? (musicStream.isPaused ? Color.yellow : Color.red) : Color.secondary)
-                    .frame(width: 10, height: 10)
+                ZStack {
+                    if isLive && !musicStream.isPaused {
+                        Circle()
+                            .fill(Color.red.opacity(0.28))
+                            .frame(width: 18, height: 18)
+                            .scaleEffect(pulseLive ? 1.25 : 0.8)
+                            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: pulseLive)
+                    }
+                    Circle()
+                        .fill(isLive ? (musicStream.isPaused ? Color.orange : Color.red) : Color.secondary.opacity(0.5))
+                        .frame(width: 9, height: 9)
+                }
 
                 Text(musicStream.statusText)
-                    .font(.subheadline.bold())
-                    .foregroundStyle(musicStream.isPlaying ? (musicStream.isPaused ? .yellow : .red) : .primary)
+                    .font(.system(size: 13, weight: .bold, design: .rounded))
+                    .foregroundStyle(isLive ? (musicStream.isPaused ? .orange : .red) : .secondary)
                     .lineLimit(1)
 
                 Spacer()
 
-                if musicStream.isPlaying {
-                    let readyCount = musicStream.activeSessions.filter { $0.isVoiceUDPReady }.count
-                    Text("⚡ \(readyCount) ĐẠO HỮU")
-                        .font(.system(size: 10, weight: .black))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.red.opacity(0.15))
-                        .foregroundStyle(.red)
-                        .cornerRadius(4)
+                if isLive {
+                    microBadge("⚡ \(readyCount) ĐẠO HỮU", bg: Color.red.opacity(0.16), fg: .red)
+                } else {
+                    microBadge("STANDBY", bg: Color(UIColor.tertiarySystemGroupedBackground), fg: .secondary)
                 }
             }
 
-            if musicStream.isPlaying && !musicStream.isPaused {
-                HStack(spacing: 6) {
-                    ForEach(0..<8, id: \.self) { i in
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(LinearGradient(colors: [.red, .orange, .purple], startPoint: .bottom, endPoint: .top))
-                            .frame(width: 8, height: max(10, musicStream.visualizerLevels[i] * 38))
-                            .animation(.spring(response: 0.15, dampingFraction: 0.5), value: musicStream.visualizerLevels[i])
+            HStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: isLive
+                                    ? [Color(red: 0.95, green: 0.22, blue: 0.28), Color(red: 1.0, green: 0.50, blue: 0.14)]
+                                    : [Color.red.opacity(0.18), Color.orange.opacity(0.12)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 54, height: 54)
+
+                    if isLive && !musicStream.isPaused {
+                        HStack(alignment: .bottom, spacing: 3) {
+                            ForEach(0..<4, id: \.self) { i in
+                                let lvl = i < musicStream.visualizerLevels.count ? musicStream.visualizerLevels[i] : 0.4
+                                Capsule()
+                                    .fill(Color.white)
+                                    .frame(width: 4, height: max(8, lvl * 28))
+                                    .animation(.spring(response: 0.16, dampingFraction: 0.55), value: lvl)
+                            }
+                        }
+                        .frame(height: 30)
+                    } else {
+                        Image(systemName: "music.note")
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundColor(isLive ? .white : .red)
                     }
                 }
-                .frame(height: 40)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(musicStream.currentSongTitle)
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+
+                    HStack(spacing: 6) {
+                        microBadge(musicStream.audioFX.rawValue, bg: Color.red.opacity(0.12), fg: .red)
+                        if musicStream.isMaxMode {
+                            microBadge("V9 MAX", bg: Color.orange.opacity(0.18), fg: .orange)
+                        }
+                        if musicStream.isCleanMode {
+                            microBadge("CLEAN", bg: Color.teal.opacity(0.18), fg: .teal)
+                        }
+                    }
+                }
+
+                Spacer(minLength: 0)
             }
 
-            HStack(spacing: 8) {
-                Image(systemName: "music.note").foregroundStyle(.red)
-                Text(musicStream.isPlaying ? "▶️ [ĐANG XẢ]: \(musicStream.currentSongTitle)" : musicStream.currentSongTitle)
-                    .font(.subheadline.bold())
-                    .foregroundColor(musicStream.isPlaying ? .red : .primary)
-                    .lineLimit(1)
-                Spacer()
+            if isLive && !musicStream.isPaused {
+                HStack(alignment: .bottom, spacing: 6) {
+                    ForEach(0..<8, id: \.self) { i in
+                        let lvl = i < musicStream.visualizerLevels.count ? musicStream.visualizerLevels[i] : 0.3
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color(red: 0.96, green: 0.24, blue: 0.30), Color.orange, Color.purple],
+                                    startPoint: .bottom,
+                                    endPoint: .top
+                                )
+                            )
+                            .frame(maxWidth: .infinity)
+                            .frame(height: max(8, lvl * 30))
+                            .animation(.spring(response: 0.15, dampingFraction: 0.52), value: lvl)
+                    }
+                }
+                .frame(height: 32)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(UIColor.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
             if musicStream.duration > 0 {
-                VStack(spacing: 2) {
+                VStack(spacing: 4) {
                     Slider(
                         value: Binding(
                             get: { musicStream.currentTime },
@@ -6774,15 +7348,32 @@ struct VoiceRoomTabView: View {
                     .tint(.red)
 
                     HStack {
-                        Text(formatSeconds(musicStream.currentTime)).font(.caption2).foregroundStyle(.secondary)
+                        Text(formatSeconds(musicStream.currentTime))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.secondary)
                         Spacer()
-                        Text(formatSeconds(musicStream.duration)).font(.caption2).foregroundStyle(.secondary)
+                        Text(formatSeconds(musicStream.duration))
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
 
-            HStack(spacing: 12) {
-                if musicStream.isPlaying {
+            HStack(spacing: 10) {
+                Button {
+                    musicStream.playPrevious()
+                } label: {
+                    Image(systemName: "backward.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.primary)
+                        .frame(width: 38, height: 38)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .clipShape(Circle())
+                }
+                .disabled(musicStream.playlist.isEmpty)
+                .opacity(musicStream.playlist.isEmpty ? 0.45 : 1)
+
+                if isLive {
                     Button {
                         if musicStream.isPaused {
                             musicStream.resumeSpam()
@@ -6790,39 +7381,31 @@ struct VoiceRoomTabView: View {
                             musicStream.pauseSpam()
                         }
                     } label: {
-                        HStack(spacing: 4) {
+                        HStack(spacing: 6) {
                             Image(systemName: musicStream.isPaused ? "speaker.wave.3.fill" : "speaker.slash.fill")
-                            Text(musicStream.isPaused ? "🔊 Sủa Tiếp" : "🔇 Câm Mồm")
+                            Text(musicStream.isPaused ? "Sủa Tiếp" : "Câm Mồm")
                         }
-                        .font(.caption.bold())
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(musicStream.isPaused ? Color.green.opacity(0.15) : Color.yellow.opacity(0.15))
-                        .foregroundColor(musicStream.isPaused ? .green : .yellow)
-                        .cornerRadius(8)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .padding(.horizontal, 14)
+                        .frame(height: 38)
+                        .background(musicStream.isPaused ? Color.green.opacity(0.18) : Color.orange.opacity(0.18))
+                        .foregroundColor(musicStream.isPaused ? .green : .orange)
+                        .clipShape(Capsule())
                     }
                 }
-
-                Button {
-                    musicStream.playPrevious()
-                } label: {
-                    Image(systemName: "backward.fill").font(.subheadline).foregroundColor(.primary)
-                }
-                .disabled(musicStream.playlist.isEmpty)
 
                 Button {
                     musicStream.playNext()
                 } label: {
-                    HStack(spacing: 2) {
-                        Text("⏭️")
-                        Text("Next").font(.caption.bold())
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(Color(UIColor.tertiarySystemBackground))
-                    .cornerRadius(6)
+                    Image(systemName: "forward.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.primary)
+                        .frame(width: 38, height: 38)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .clipShape(Circle())
                 }
                 .disabled(musicStream.playlist.isEmpty)
+                .opacity(musicStream.playlist.isEmpty ? 0.45 : 1)
 
                 Spacer()
 
@@ -6833,44 +7416,63 @@ struct VoiceRoomTabView: View {
                     case .shuffle: musicStream.loopMode = .loopAll
                     }
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: musicStream.loopMode.icon)
-                        Text(musicStream.loopMode.rawValue).font(.caption2.bold())
+                            .font(.system(size: 12, weight: .bold))
+                        Text(musicStream.loopMode.rawValue)
+                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                            .lineLimit(1)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(Color.red.opacity(0.15))
+                    .padding(.horizontal, 11)
+                    .frame(height: 34)
+                    .background(Color.red.opacity(0.14))
                     .foregroundColor(.red)
-                    .cornerRadius(8)
+                    .clipShape(Capsule())
                 }
             }
         }
-        .padding()
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(15)
     }
 
-    // Card 2: Cấu Hình Trận Pháp & Kênh Xả
+    // Card 2: Trận Pháp Đạo Hữu & Kênh Xả
     private var tokenAndChannelCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "person.3.fill").foregroundStyle(.red)
-                Text("Trận Pháp Đạo Hữu").font(.headline)
+        studioCard {
+            HStack(spacing: 10) {
+                iconSquircle(systemName: "person.3.fill", colors: [Color.red, Color.orange])
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Trận Pháp & Kênh Xả")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text(musicStream.multiTokenMode ? "Chạy đồng loạt \(activeTokens.count) token" : "Chạy đơn 1 token chỉ định")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
-                Text(musicStream.multiTokenMode ? "⚔️ Toàn Bộ Dàn (\(activeTokens.count))" : "Chỉ 1 Token")
-                    .font(.caption2.bold())
-                    .foregroundColor(.red)
             }
 
-            Picker("Chế độ Token", selection: $musicStream.multiTokenMode) {
-                Text("⚔️ Xả Cả Dàn Token (\(activeTokens.count))").tag(true)
-                Text("Chỉ 1 Token").tag(false)
+            HStack(spacing: 8) {
+                tactileOptionPill(
+                    title: "Cả Dàn (\(activeTokens.count))",
+                    icon: "person.3.fill",
+                    isSelected: musicStream.multiTokenMode,
+                    accent: .red
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) { musicStream.multiTokenMode = true }
+                }
+
+                tactileOptionPill(
+                    title: "1 Token",
+                    icon: "person.fill",
+                    isSelected: !musicStream.multiTokenMode,
+                    accent: .red
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) { musicStream.multiTokenMode = false }
+                }
             }
-            .pickerStyle(.segmented)
 
             if !musicStream.multiTokenMode {
-                HStack {
-                    Text("Token xuất thủ:").font(.subheadline.bold())
+                HStack(spacing: 10) {
+                    Text("Token xuất thủ")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
                     Spacer()
                     Menu {
                         ForEach(app.tokens) { t in
@@ -6891,84 +7493,119 @@ struct VoiceRoomTabView: View {
                             if let t = currentTok {
                                 if let url = t.avatarURL {
                                     AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                    placeholder: { Circle().fill(.gray) }
-                                    .frame(width: 22, height: 22).clipShape(Circle())
+                                    placeholder: { Circle().fill(.gray.opacity(0.4)) }
+                                    .frame(width: 22, height: 22)
+                                    .clipShape(Circle())
                                 }
-                                Text(t.username).font(.subheadline.bold())
+                                Text(t.username)
+                                    .font(.subheadline.bold())
+                                    .foregroundColor(.primary)
+                                    .lineLimit(1)
                             } else {
-                                Text("Chưa có token").font(.subheadline).foregroundStyle(.secondary)
+                                Text("Chưa có token")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
                             }
-                            Image(systemName: "chevron.up.chevron.down").font(.caption)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.secondary)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .clipShape(Capsule())
                     }
                 }
             }
 
-            Divider()
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Kênh Thoại (Channel ID):").font(.subheadline.bold())
+            VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    TextField("Dán ID Room Voice xả...", text: $musicStream.targetChannelId)
-                        .textFieldStyle(.plain)
-                        .padding(10)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                        .keyboardType(.numberPad)
+                    HStack(spacing: 6) {
+                        Image(systemName: "number")
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                        TextField("Dán ID phòng Voice...", text: $musicStream.targetChannelId)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 14, design: .monospaced))
+                            .keyboardType(.numberPad)
+                        if !musicStream.targetChannelId.isEmpty {
+                            Button {
+                                musicStream.targetChannelId = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(Color(UIColor.tertiarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
                     Button {
                         showGuildPicker = true
                     } label: {
-                        HStack(spacing: 4) {
+                        HStack(spacing: 5) {
                             Image(systemName: "speaker.wave.2.fill")
                             Text("Chọn Kênh")
                         }
-                        .font(.caption.bold())
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .background(Color.red)
-                        .cornerRadius(8)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 11)
+                        .background(LinearGradient(colors: [.red, .orange], startPoint: .leading, endPoint: .trailing))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                 }
 
                 if let g = musicStream.selectedGuild, let c = musicStream.selectedChannel {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption2)
-                        Text("\(g.name) > \(c.displayName)").font(.caption.bold()).foregroundStyle(.green)
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.caption)
+                        Text("\(g.name)  ›  \(c.displayName)")
+                            .font(.caption.bold())
+                            .foregroundColor(.green)
+                            .lineLimit(1)
+                        Spacer()
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(Color.green.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
             }
         }
-        .padding()
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(15)
     }
 
-    // Card 3: Linh Hồn Hàng Đợi (Queue Playlist)
+    // Card 3: Hàng Đợi Nhạc (Playlist Queue)
     private var playlistQueueCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(systemName: "music.note.list").foregroundStyle(.red)
-                Text("📜 Danh Sách Pháp Bảo (\(musicStream.playlist.count) bài)").font(.headline)
+        studioCard {
+            HStack(spacing: 10) {
+                iconSquircle(systemName: "music.note.list", colors: [Color.pink, Color.red])
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Danh Sách Nhạc")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text("\(musicStream.playlist.count) bài trong hàng đợi")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
 
                 Button {
                     showDocumentPicker = true
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: "folder.badge.plus")
-                        Text("➕ Nạp file")
+                        Text("Nạp File")
                     }
                     .font(.caption.bold())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.red.opacity(0.15))
-                    .cornerRadius(8)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(LinearGradient(colors: [.red, .orange], startPoint: .leading, endPoint: .trailing))
+                    .clipShape(Capsule())
                 }
             }
 
@@ -6976,84 +7613,88 @@ struct VoiceRoomTabView: View {
                 Button {
                     musicStream.addAllPresets()
                 } label: {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 5) {
                         Image(systemName: "star.fill").font(.caption2)
                         Text("Nạp Mẫu VIP").font(.caption.bold())
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color.orange.opacity(0.15))
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .background(Color.orange.opacity(0.14))
                     .foregroundColor(.orange)
-                    .cornerRadius(6)
+                    .clipShape(Capsule())
                 }
 
                 if !musicStream.playlist.isEmpty {
                     Button {
                         musicStream.clearPlaylist()
                     } label: {
-                        HStack(spacing: 4) {
+                        HStack(spacing: 5) {
                             Image(systemName: "trash").font(.caption2)
                             Text("Xóa Hết").font(.caption.bold())
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(Color.red.opacity(0.15))
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(Color.red.opacity(0.12))
                         .foregroundColor(.red)
-                        .cornerRadius(6)
+                        .clipShape(Capsule())
                     }
                 }
+                Spacer()
             }
 
             if musicStream.playlist.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "music.note")
-                        .font(.system(size: 32))
-                        .foregroundStyle(.secondary)
-                    Text("📭 Linh hồn hàng đợi đang trống rỗng.")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundStyle(.red.opacity(0.75))
+                    Text("Hàng đợi nhạc đang trống")
+                        .font(.subheadline.bold())
+                    Text("Bấm \"Nạp File\" để chọn nhiều file .mp3, .m4a, .wav cùng lúc.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("Bấm '➕ Nạp file' để chọn nhiều file .mp3, .m4a, .wav cùng lúc.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .background(Color(UIColor.tertiarySystemBackground))
-                .cornerRadius(10)
+                .padding(.vertical, 20)
+                .padding(.horizontal, 12)
+                .background(Color(UIColor.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 6) {
+                    LazyVStack(spacing: 8) {
                         ForEach(Array(musicStream.playlist.enumerated()), id: \.element.id) { index, item in
                             let isCurrent = (musicStream.currentTrackIndex == index)
                             Button {
                                 musicStream.selectTrack(index: index)
                             } label: {
                                 HStack(spacing: 10) {
-                                    if isCurrent && musicStream.isPlaying {
-                                        Text("▶️ [ĐANG XẢ]")
-                                            .font(.caption2.bold())
-                                            .foregroundColor(.red)
-                                    } else {
-                                        Text("⏳ #\(index + 1)")
-                                            .font(.caption.bold())
-                                            .foregroundColor(isCurrent ? .red : .secondary)
-                                            .frame(width: 48, alignment: .leading)
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .fill(isCurrent ? Color.red.opacity(0.18) : Color(UIColor.secondarySystemGroupedBackground))
+                                            .frame(width: 34, height: 34)
+                                        if isCurrent && musicStream.isPlaying {
+                                            Image(systemName: "waveform")
+                                                .font(.system(size: 13, weight: .bold))
+                                                .foregroundColor(.red)
+                                        } else {
+                                            Text("#\(index + 1)")
+                                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                                .foregroundColor(isCurrent ? .red : .secondary)
+                                        }
                                     }
 
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(item.title)
-                                            .font(.subheadline.bold())
+                                            .font(.system(size: 14, weight: .semibold))
                                             .foregroundColor(isCurrent ? .red : .primary)
                                             .lineLimit(1)
                                         HStack(spacing: 6) {
                                             if item.isPreset {
-                                                Text("Pháp Bảo VIP")
-                                                    .font(.caption2.bold())
-                                                    .foregroundColor(.orange)
+                                                microBadge("VIP", bg: Color.orange.opacity(0.18), fg: .orange)
                                             }
                                             Text(item.durationFormatted)
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundStyle(.secondary)
                                         }
                                     }
 
@@ -7064,17 +7705,18 @@ struct VoiceRoomTabView: View {
                                     } label: {
                                         Image(systemName: "trash")
                                             .font(.caption)
-                                            .foregroundColor(.secondary)
-                                            .padding(6)
+                                            .foregroundStyle(.secondary)
+                                            .padding(7)
+                                            .background(Color(UIColor.secondarySystemGroupedBackground))
+                                            .clipShape(Circle())
                                     }
                                 }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 8)
-                                .background(isCurrent ? Color.red.opacity(0.1) : Color(UIColor.tertiarySystemBackground))
-                                .cornerRadius(8)
+                                .padding(9)
+                                .background(isCurrent ? Color.red.opacity(0.09) : Color(UIColor.tertiarySystemGroupedBackground))
+                                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
                                 .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(isCurrent ? Color.red.opacity(0.4) : Color.clear, lineWidth: 1)
+                                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                                        .stroke(isCurrent ? Color.red.opacity(0.35) : Color.clear, lineWidth: 1)
                                 )
                             }
                             .buttonStyle(.plain)
@@ -7084,390 +7726,793 @@ struct VoiceRoomTabView: View {
                 .frame(maxHeight: 220)
             }
         }
-        .padding()
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(15)
     }
 
-    // Card 4: Sát Chiêu Thực Địa & Cấu Hình Âm Thanh
+    // Card 4: Bộ Xử Lý DSP & Sát Chiêu Âm Thanh
     private var combatEffectsCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Image(systemName: "flame.fill").foregroundStyle(.red)
-                Text("Sát Chiêu Chiến Đấu Thực Địa").font(.headline)
+        studioCard {
+            HStack(spacing: 10) {
+                iconSquircle(systemName: "slider.horizontal.3", colors: [Color.orange, Color.red])
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Bộ Xử Lý Âm Thanh & DSP")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text("Tinh chỉnh trực tiếp theo thời gian thực")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
             }
 
-            Toggle(isOn: $musicStream.isMaxMode) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Text("🔴")
-                        Text("CHIẾN ĐẤU V9 TỐI THƯỢNG (MAX GAIN)").font(.subheadline.bold()).foregroundColor(.red)
+            HStack(spacing: 10) {
+                tactileFeatureTile(
+                    title: "MAX GAIN V9",
+                    subtitle: "EQ + 2.5x Boost",
+                    icon: "bolt.fill",
+                    isOn: musicStream.isMaxMode,
+                    activeColor: .red
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        musicStream.isMaxMode.toggle()
                     }
-                    Text("Khai mở cực hạn hỏa lực: EQ 80Hz + 3500Hz + Volume 2.5x vượt bậc!")
-                        .font(.caption2).foregroundStyle(.secondary)
+                }
+
+                tactileFeatureTile(
+                    title: "LỌC ỒN DSP",
+                    subtitle: "150Hz – 10kHz",
+                    icon: "sparkles",
+                    isOn: musicStream.isCleanMode,
+                    activeColor: .teal
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        musicStream.isCleanMode.toggle()
+                    }
                 }
             }
 
-            Divider()
+            // Horizontal Scrollable Audio FX Chips (không bao giờ bị cắt chữ)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Hiệu ứng âm thanh")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
 
-            Toggle(isOn: $musicStream.isCleanMode) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Text("🧹")
-                        Text("LỌC ỒN CHỦ ĐỘNG (LỌC TẠP ÂM)").font(.subheadline.bold()).foregroundColor(.teal)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(SpamAudioFX.allCases) { fx in
+                            let selected = (musicStream.audioFX == fx)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    musicStream.audioFX = fx
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: fxSymbol(for: fx))
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text(fx.rawValue)
+                                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                                }
+                                .padding(.horizontal, 13)
+                                .padding(.vertical, 8)
+                                .background(
+                                    Group {
+                                        if selected {
+                                            LinearGradient(colors: [.red, .orange], startPoint: .leading, endPoint: .trailing)
+                                        } else {
+                                            Color(UIColor.tertiarySystemGroupedBackground)
+                                        }
+                                    }
+                                )
+                                .foregroundColor(selected ? .white : .primary)
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
-                    Text("Lọc tạp âm, chống rè nhiễu dải tần Highpass 150Hz & Lowpass 10kHz.")
-                        .font(.caption2).foregroundStyle(.secondary)
                 }
             }
 
-            Divider()
-
+            // Volume Slider
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("🔊 Âm Lượng (Volume):").font(.subheadline.bold())
+                    Label("Âm lượng (Volume)", systemImage: "speaker.wave.2.fill")
+                        .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text("\(Int(musicStream.volume * 100))%")
-                        .font(.subheadline.bold())
+                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
                         .foregroundColor(.red)
                 }
                 Slider(value: $musicStream.volume, in: 0.0...2.0, step: 0.05).tint(.red)
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach([0.5, 1.0, 1.5, 2.0], id: \.self) { v in
-                        Button {
-                            musicStream.volume = Float(v)
-                        } label: {
-                            Text(v == 2.0 ? "200% MAX" : "\(Int(v * 100))%")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(musicStream.volume == Float(v) ? Color.red : Color(UIColor.tertiarySystemBackground))
-                                .foregroundColor(musicStream.volume == Float(v) ? .white : .primary)
-                                .cornerRadius(6)
-                        }
+                        presetChip(
+                            label: v == 2.0 ? "200% MAX" : "\(Int(v * 100))%",
+                            isSelected: musicStream.volume == Float(v),
+                            color: .red
+                        ) { musicStream.volume = Float(v) }
                     }
                 }
             }
+            .padding(12)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            Divider()
-
+            // Boost Slider
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("🚀 Ép Xung Khuếch Đại (Boost):").font(.subheadline.bold())
+                    Label("Ép xung khuếch đại (Boost)", systemImage: "bolt.circle.fill")
+                        .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text("\(Int(musicStream.boostMultiplier * 100))%")
-                        .font(.subheadline.bold())
+                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
                         .foregroundColor(.orange)
                 }
                 Slider(value: $musicStream.boostMultiplier, in: 1.0...5.0, step: 0.25).tint(.orange)
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach([1.0, 2.0, 3.0, 5.0], id: \.self) { b in
-                        Button {
-                            musicStream.boostMultiplier = Float(b)
-                        } label: {
-                            Text(b == 5.0 ? "500% CỰC HẠN" : "\(Int(b * 100))%")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(musicStream.boostMultiplier == Float(b) ? Color.orange : Color(UIColor.tertiarySystemBackground))
-                                .foregroundColor(musicStream.boostMultiplier == Float(b) ? .white : .primary)
-                                .cornerRadius(6)
-                        }
+                        presetChip(
+                            label: b == 5.0 ? "500% MAX" : "\(Int(b * 100))%",
+                            isSelected: musicStream.boostMultiplier == Float(b),
+                            color: .orange
+                        ) { musicStream.boostMultiplier = Float(b) }
                     }
                 }
             }
+            .padding(12)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            Divider()
-
+            // Bass Slider
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("💣 Tăng Cường Âm Trầm (Bass):").font(.subheadline.bold())
+                    Label("Tăng cường âm trầm (Bass)", systemImage: "waveform")
+                        .font(.subheadline.weight(.semibold))
                     Spacer()
                     Text("+\(Int(musicStream.bassAmount))")
-                        .font(.subheadline.bold())
+                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
                         .foregroundColor(.purple)
                 }
                 Slider(value: $musicStream.bassAmount, in: 0...100, step: 5).tint(.purple)
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     ForEach([0, 25, 50, 100], id: \.self) { b in
-                        Button {
-                            musicStream.bassAmount = Float(b)
-                        } label: {
-                            Text(b == 0 ? "0 (Gốc)" : "+\(b)")
-                                .font(.caption.bold())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(musicStream.bassAmount == Float(b) ? Color.purple : Color(UIColor.tertiarySystemBackground))
-                                .foregroundColor(musicStream.bassAmount == Float(b) ? .white : .primary)
-                                .cornerRadius(6)
-                        }
+                        presetChip(
+                            label: b == 0 ? "Gốc" : "+\(b)",
+                            isSelected: musicStream.bassAmount == Float(b),
+                            color: .purple
+                        ) { musicStream.bassAmount = Float(b) }
                     }
                 }
             }
+            .padding(12)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            Divider()
+            // Local Monitor Row
+            HStack(spacing: 12) {
+                Image(systemName: "headphones")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.red)
+                    .frame(width: 32, height: 32)
+                    .background(Color.red.opacity(0.12))
+                    .clipShape(Circle())
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Chế độ âm thanh:").font(.subheadline)
-                Picker("Chế độ", selection: $musicStream.audioFX) {
-                    ForEach(SpamAudioFX.allCases) { fx in
-                        Text(fx.rawValue).tag(fx)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-
-            Toggle(isOn: $musicStream.playLocalSpeaker) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Label("Nghe loa ngoài điện thoại (Monitor)", systemImage: "speaker.badge.waveform.fill")
-                        .font(.subheadline)
-                    Text("Mặc định TẮT: Âm thanh xả trực tiếp vào Discord Voice, không phát ra điện thoại.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                    Text("Nghe loa ngoài (Monitor)")
+                        .font(.subheadline.weight(.semibold))
+                    Text("Mặc định TẮT để phát thẳng vào Discord Voice.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
+                Spacer()
+                Toggle("", isOn: $musicStream.playLocalSpeaker)
+                    .labelsHidden()
+                    .tint(.red)
             }
+            .padding(12)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .padding()
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(15)
     }
 
-    // Card 5: Nút Bắt Đầu / Dừng Xuất Thủ
+    // Card 5: Primary CTA Button (Xả Nhạc)
     private var mainActionCard: some View {
         Group {
             if musicStream.isPlaying {
                 Button {
                     musicStream.stopSpam()
                 } label: {
-                    HStack {
-                        Image(systemName: "stop.fill")
-                        Text("⛩️  BẾ QUAN (THU HỒI PHÂN THÂN)")
+                    HStack(spacing: 10) {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 20, weight: .bold))
+                        Text("DỪNG XẢ NHẠC & THU HỒI PHÂN THÂN")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
                     }
-                    .font(.headline.bold())
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(Color.red)
-                    .cornerRadius(12)
+                    .padding(.vertical, 16)
+                    .background(LinearGradient(colors: [Color(red: 0.90, green: 0.16, blue: 0.22), Color(red: 0.72, green: 0.10, blue: 0.16)], startPoint: .leading, endPoint: .trailing))
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: Color.red.opacity(0.35), radius: 10, y: 5)
                 }
             } else {
+                let canStart = (musicStream.currentDecoder != nil)
                 Button {
                     musicStream.startSpam(app: app)
                 } label: {
-                    HStack {
+                    HStack(spacing: 10) {
                         Image(systemName: "flame.fill")
-                        Text("⚡  XUẤT THỦ XẢ NHẠC BẤT TỬ")
+                            .font(.system(size: 18, weight: .bold))
+                        Text("XUẤT THỦ XẢ NHẠC BẤT TỬ")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
                     }
-                    .font(.headline.bold())
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
-                    .padding()
+                    .padding(.vertical, 16)
                     .background(
-                        (musicStream.currentDecoder != nil)
-                        ? LinearGradient(colors: [.red, Color(red: 0.8, green: 0.1, blue: 0.1), .orange], startPoint: .leading, endPoint: .trailing)
-                        : LinearGradient(colors: [.gray], startPoint: .leading, endPoint: .trailing)
+                        canStart
+                        ? LinearGradient(colors: [Color(red: 0.95, green: 0.22, blue: 0.26), Color(red: 1.0, green: 0.48, blue: 0.14)], startPoint: .leading, endPoint: .trailing)
+                        : LinearGradient(colors: [Color.gray.opacity(0.6), Color.gray.opacity(0.5)], startPoint: .leading, endPoint: .trailing)
                     )
-                    .cornerRadius(12)
-                    .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: canStart ? Color.red.opacity(0.38) : .clear, radius: 12, y: 6)
                 }
-                .disabled(musicStream.currentDecoder == nil)
+                .disabled(!canStart)
             }
         }
     }
 
-    // Card 6: Nhật Ký Xuất Thủ Tiên Nghịch
+    // Card 6: Nhật Ký Xuất Thủ
     private var battleLogsCard: some View {
         Group {
             if !musicStream.logs.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Image(systemName: "terminal.fill").foregroundStyle(.red)
-                        Text("Nhật Ký Xuất Thủ Tiên Nghịch").font(.headline)
-                        Spacer()
-                        Button("Xóa") { musicStream.logs.removeAll() }
-                            .font(.caption)
-                    }
-
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(musicStream.logs) { log in
-                                Text("[\(formatTime(log.timestamp))] \(log.message)")
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    .frame(height: 120)
-                }
-                .padding()
-                .background(Color(UIColor.secondarySystemBackground))
-                .cornerRadius(15)
+                studioTerminalCard(
+                    title: "Nhật Ký Xả Nhạc",
+                    accent: .red,
+                    logs: musicStream.logs,
+                    copied: $copiedMusicLog,
+                    onClear: { musicStream.logs.removeAll() }
+                )
             }
         }
     }
 
-    // MARK: - TREO ROOM SECTION (HANG VOICE 24/7)
+    // ==========================================================================
+    // MARK: - TAB 2: TREO ROOM 24/7 (MODERN STUDIO CONTROL DECK)
+    // ==========================================================================
     private var treoRoomSection: some View {
-        VStack(spacing: 14) {
-            // Card: Server & Channel
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Image(systemName: "server.rack").foregroundStyle(.indigo)
-                    Text("Server & Kênh Voice").font(.headline)
-                    Spacer()
-                    Button {
-                        showGuildPicker = true
-                    } label: {
-                        Text(voiceRoom.selectedGuild == nil ? "Chọn Kênh" : "Đổi Kênh")
-                            .font(.caption.bold())
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(Color.indigo.opacity(0.15))
-                            .cornerRadius(8)
-                    }
-                }
-
-                // Channel ID manual entry
-                HStack(spacing: 8) {
-                    TextField("Dán Channel ID treo...", text: $voiceRoom.targetChannelId)
-                        .textFieldStyle(.plain)
-                        .padding(10)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                        .keyboardType(.numberPad)
-                }
-
-                if let g = voiceRoom.selectedGuild, let c = voiceRoom.selectedChannel {
-                    HStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        Text("\(g.name) > \(c.displayName)").font(.subheadline.bold()).foregroundStyle(.green)
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.tertiarySystemBackground))
-                    .cornerRadius(8)
-                }
-            }
-            .padding()
-            .background(Color(UIColor.secondarySystemBackground))
-            .cornerRadius(15)
-
-            // Card: Cấu hình treo
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Image(systemName: "slider.horizontal.3").foregroundStyle(.indigo)
-                    Text("Cấu Hình Treo").font(.headline)
-                }
-
-                Picker("Chế độ Token", selection: $voiceRoom.multiTokenMode) {
-                    Text("Treo Cả Dàn (\(activeTokens.count))").tag(true)
-                    Text("Chỉ 1 Token Chính").tag(false)
-                }
-                .pickerStyle(.segmented)
-
-                Divider()
-
-                HStack(spacing: 12) {
-                    Toggle(isOn: Binding(
-                        get: { voiceRoom.selfMute },
-                        set: { on in
-                            voiceRoom.updateToggles(mute: on, deaf: voiceRoom.selfDeaf, video: voiceRoom.selfVideo)
-                        }
-                    )) {
-                        Label("Tắt Mic", systemImage: voiceRoom.selfMute ? "mic.slash.fill" : "mic.fill")
-                            .font(.subheadline)
-                    }
-
-                    Divider().frame(height: 20)
-
-                    Toggle(isOn: Binding(
-                        get: { voiceRoom.selfDeaf },
-                        set: { on in
-                            voiceRoom.updateToggles(mute: voiceRoom.selfMute, deaf: on, video: voiceRoom.selfVideo)
-                        }
-                    )) {
-                        Label("Điếc Tai", systemImage: voiceRoom.selfDeaf ? "headphones.slash" : "headphones")
-                            .font(.subheadline)
-                    }
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Label("Chất lượng Video / Stream", systemImage: "sparkles.tv")
-                            .font(.subheadline.bold())
-                        Spacer()
-                        Text(voiceRoom.activeProfile.label)
-                            .font(.caption2.bold())
-                            .foregroundStyle(.indigo)
-                    }
-                    Picker("Chất lượng", selection: Binding(
-                        get: { voiceRoom.videoQualityMode },
-                        set: { voiceRoom.updateQualityMode($0) }
-                    )) {
-                        ForEach(TreoVideoQualityMode.allCases) { q in
-                            Text(q.rawValue).tag(q)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-            }
-            .padding()
-            .background(Color(UIColor.secondarySystemBackground))
-            .cornerRadius(15)
-
-            // Card: Go Live Stream (từ room.js — đổi file / bật tắt trực tiếp real-time)
+        VStack(spacing: 16) {
+            treoHeroCard
+            treoChannelCard
+            treoConfigCard
             treoGoLiveCard
-
-            // Card: Fake Cam (từ room.js — chạy song song với Go Live Stream)
             treoFakeCamCard
+            treoActionButton
+            treoSessionsCard
+            treoLogsCard
+        }
+    }
 
-            // Nút Bắt Đầu / Dừng Treo
-            if voiceRoom.isRunning {
-                VStack(spacing: 12) {
-                    HStack {
-                        Circle().fill(.green).frame(width: 12, height: 12)
-                        Text("ĐANG TREO ROOM HOẠT ĐỘNG")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.green)
-                        Spacer()
-                        Text(voiceRoom.formatDuration(voiceRoom.elapsedSeconds))
-                            .font(.system(.subheadline, design: .monospaced).bold())
-                            .foregroundStyle(.primary)
+    // Card 1: Hero Live Telemetry Dashboard
+    private var treoHeroCard: some View {
+        let joinedCount = voiceRoom.sessions.filter { $0.isJoined }.count
+        let totalCount = voiceRoom.sessions.count
+
+        return studioCard(
+            borderColor: voiceRoom.isRunning ? Color.green.opacity(0.38) : Color.indigo.opacity(0.18),
+            borderWidth: voiceRoom.isRunning ? 1.5 : 1
+        ) {
+            HStack(spacing: 10) {
+                ZStack {
+                    if voiceRoom.isRunning {
+                        Circle()
+                            .fill(Color.green.opacity(0.28))
+                            .frame(width: 22, height: 22)
+                            .scaleEffect(pulseLive ? 1.3 : 0.8)
+                            .animation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true), value: pulseLive)
                     }
+                    Circle()
+                        .fill(voiceRoom.isRunning ? Color.green : Color.indigo.opacity(0.6))
+                        .frame(width: 10, height: 10)
+                }
 
-                    HStack(spacing: 12) {
-                        StatCard(
-                            title: "Đã vào phòng",
-                            value: "\(voiceRoom.sessions.filter { $0.isJoined }.count)/\(voiceRoom.sessions.count)",
-                            color: .green
-                        )
-                        StatCard(
-                            title: "Thời gian treo",
-                            value: voiceRoom.formatDuration(voiceRoom.elapsedSeconds),
-                            color: .indigo
-                        )
-                    }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(voiceRoom.isRunning ? "ĐANG TREO PHÒNG 24/7" : "Sẵn Sàng Treo Room")
+                        .font(.system(size: 15, weight: .heavy, design: .rounded))
+                        .foregroundColor(voiceRoom.isRunning ? .green : .primary)
+                    Text(voiceRoom.isRunning
+                         ? "Thoát app hoặc khóa màn hình vẫn giữ kết nối & stream"
+                         : "Hỗ trợ Go Live + Fake Cam song song • WebRTC DTLS-SRTP")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
 
-                    Button {
-                        voiceRoom.stopTreo()
-                    } label: {
-                        HStack {
-                            Image(systemName: "stop.fill")
-                            Text("RỜI PHÒNG / DỪNG TREO")
+                Spacer()
+
+                if voiceRoom.isRunning {
+                    HStack(spacing: 4) {
+                        if voiceRoom.isStreamEnabled {
+                            microBadge("LIVE", bg: .red)
                         }
-                        .font(.headline.bold())
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.red)
-                        .cornerRadius(12)
+                        if voiceRoom.isCamEnabled {
+                            microBadge("CAM", bg: .purple)
+                        }
                     }
                 }
-                .padding()
-                .background(Color(UIColor.secondarySystemBackground))
-                .cornerRadius(15)
+            }
+
+            if voiceRoom.isRunning {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("TRONG PHÒNG")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        Text("\(joinedCount) / \(totalCount)")
+                            .font(.system(size: 22, weight: .black, design: .rounded))
+                            .foregroundColor(.green)
+                            .monospacedDigit()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(Color.green.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("THỜI GIAN TREO")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.secondary)
+                        Text(voiceRoom.formatDuration(voiceRoom.elapsedSeconds))
+                            .font(.system(size: 22, weight: .black, design: .monospaced))
+                            .foregroundColor(.indigo)
+                            .monospacedDigit()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background(Color.indigo.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
             } else {
+                HStack(spacing: 8) {
+                    microBadge("\(activeTokens.count) TOKEN", bg: Color.indigo.opacity(0.14), fg: .indigo)
+                    microBadge(voiceRoom.activeProfile.label, bg: Color.purple.opacity(0.14), fg: .purple)
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Image(systemName: "moon.stars.fill")
+                            .font(.caption2)
+                        Text("Chạy nền 24/7")
+                            .font(.caption2.bold())
+                    }
+                    .foregroundColor(.teal)
+                }
+            }
+        }
+    }
+
+    // Card 2: Máy Chủ & Kênh Thoại
+    private var treoChannelCard: some View {
+        studioCard {
+            HStack(spacing: 10) {
+                iconSquircle(systemName: "antenna.radiowaves.left.and.right", colors: [Color.indigo, Color.blue])
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Máy Chủ & Kênh Thoại")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text("Dán Channel ID hoặc chọn trực tiếp từ Server")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    showGuildPicker = true
+                } label: {
+                    Text(voiceRoom.selectedGuild == nil ? "Chọn Kênh" : "Đổi Kênh")
+                        .font(.caption.bold())
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing))
+                        .clipShape(Capsule())
+                }
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "number")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                TextField("Dán Channel ID treo...", text: $voiceRoom.targetChannelId)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, design: .monospaced))
+                    .keyboardType(.numberPad)
+                if !voiceRoom.targetChannelId.isEmpty {
+                    Button {
+                        voiceRoom.targetChannelId = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            if let g = voiceRoom.selectedGuild, let c = voiceRoom.selectedChannel {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.caption)
+                    Text("\(g.name)  ›  \(c.displayName)")
+                        .font(.caption.bold())
+                        .foregroundColor(.green)
+                        .lineLimit(1)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.green.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+        }
+    }
+
+    // Card 3: Cấu Hình Phòng & Chất Lượng Video
+    private var treoConfigCard: some View {
+        studioCard {
+            HStack(spacing: 10) {
+                iconSquircle(systemName: "slider.horizontal.3", colors: [Color.indigo, Color.purple])
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Cấu Hình Phòng & Chất Lượng")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text(voiceRoom.activeProfile.label)
+                        .font(.caption.bold())
+                        .foregroundColor(.indigo)
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                tactileOptionPill(
+                    title: "Treo Cả Dàn (\(activeTokens.count))",
+                    icon: "person.3.fill",
+                    isSelected: voiceRoom.multiTokenMode,
+                    accent: .indigo
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) { voiceRoom.multiTokenMode = true }
+                }
+
+                tactileOptionPill(
+                    title: "1 Token Chính",
+                    icon: "person.fill",
+                    isSelected: !voiceRoom.multiTokenMode,
+                    accent: .indigo
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) { voiceRoom.multiTokenMode = false }
+                }
+            }
+
+            if !voiceRoom.multiTokenMode, let mainTok = singleTokenList.first {
+                HStack(spacing: 6) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .foregroundColor(.indigo)
+                        .font(.caption)
+                    Text("Token chính: \(mainTok.username)")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(UIColor.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            }
+
+            HStack(spacing: 10) {
+                tactileFeatureTile(
+                    title: "Tắt Mic",
+                    subtitle: voiceRoom.selfMute ? "Đang tắt tiếng" : "Mic đang mở",
+                    icon: voiceRoom.selfMute ? "mic.slash.fill" : "mic.fill",
+                    isOn: voiceRoom.selfMute,
+                    activeColor: .red
+                ) {
+                    voiceRoom.updateToggles(mute: !voiceRoom.selfMute, deaf: voiceRoom.selfDeaf, video: voiceRoom.selfVideo)
+                }
+
+                tactileFeatureTile(
+                    title: "Điếc Tai",
+                    subtitle: voiceRoom.selfDeaf ? "Đang tắt nghe" : "Đang nghe phòng",
+                    icon: voiceRoom.selfDeaf ? "speaker.slash.fill" : "headphones",
+                    isOn: voiceRoom.selfDeaf,
+                    activeColor: .indigo
+                ) {
+                    voiceRoom.updateToggles(mute: voiceRoom.selfMute, deaf: !voiceRoom.selfDeaf, video: voiceRoom.selfVideo)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Chất lượng Video / Stream")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(voiceRoom.activeProfile.label)
+                        .font(.caption2.bold())
+                        .foregroundColor(.purple)
+                }
+
+                HStack(spacing: 6) {
+                    ForEach(TreoVideoQualityMode.allCases) { q in
+                        let selected = (voiceRoom.videoQualityMode == q)
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                voiceRoom.updateQualityMode(q)
+                            }
+                        } label: {
+                            Text(shortQualityTitle(q))
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 9)
+                                .background(
+                                    Group {
+                                        if selected {
+                                            LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing)
+                                        } else {
+                                            Color(UIColor.tertiarySystemGroupedBackground)
+                                        }
+                                    }
+                                )
+                                .foregroundColor(selected ? .white : .primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    // Card 4: Go Live Stream Studio Deck
+    private var treoGoLiveCard: some View {
+        let isLiveActive = voiceRoom.isRunning && voiceRoom.isStreamEnabled
+        return studioCard(
+            borderColor: isLiveActive ? Color.red.opacity(0.45) : (voiceRoom.isStreamEnabled ? Color.red.opacity(0.22) : Color.primary.opacity(0.07)),
+            borderWidth: isLiveActive ? 1.5 : 1
+        ) {
+            HStack(spacing: 11) {
+                iconSquircle(systemName: "play.tv.fill", colors: [Color(red: 0.95, green: 0.20, blue: 0.30), Color.orange], size: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Go Live Stream")
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                        microBadge(isLiveActive ? "● ĐANG LIVE" : "LOOP ∞", bg: isLiveActive ? .red : Color.red.opacity(0.14), fg: isLiveActive ? .white : .red)
+                    }
+                    Text("Video .mp4/.mov (0% GPU nền) hoặc .mp3")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { voiceRoom.isStreamEnabled },
+                    set: { voiceRoom.setStreamEnabled($0) }
+                ))
+                .labelsHidden()
+                .tint(.red)
+            }
+
+            if let media = voiceRoom.streamMedia {
+                HStack(spacing: 10) {
+                    Image(systemName: media.isAudioOnly ? "music.note" : "film.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.red)
+                        .frame(width: 30, height: 30)
+                        .background(Color.red.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(media.title)
+                            .font(.caption.bold())
+                            .lineLimit(1)
+                        Text(media.isAudioOnly ? "Chế độ Nhạc + Màn hình đen" : "H.264 Loop ∞ • Chạy nền mượt")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        voiceRoom.clearStreamMedia()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(Color(UIColor.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                Text("Chưa chọn file Stream — bật nút để phát mẫu ảo hoặc chọn file bên dưới.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    showStreamMediaPicker = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder.badge.plus")
+                        Text("Chọn Video / MP3")
+                    }
+                    .font(.caption.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(Color.red.opacity(0.14))
+                    .foregroundColor(.red)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualCamPattern, forStream: true)
+                } label: {
+                    Text("🌈 Mẫu Ảo")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .foregroundColor(.primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualBlackScreen, forStream: true)
+                } label: {
+                    Text("⬛ Đen")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .foregroundColor(.primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+            }
+        }
+    }
+
+    // Card 5: Fake Cam Studio Deck
+    private var treoFakeCamCard: some View {
+        let isCamActive = voiceRoom.isRunning && voiceRoom.isCamEnabled
+        return studioCard(
+            borderColor: isCamActive ? Color.purple.opacity(0.45) : (voiceRoom.isCamEnabled ? Color.purple.opacity(0.22) : Color.primary.opacity(0.07)),
+            borderWidth: isCamActive ? 1.5 : 1
+        ) {
+            HStack(spacing: 11) {
+                iconSquircle(systemName: "video.fill", colors: [Color.purple, Color.pink], size: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Fake Cam")
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                        microBadge(isCamActive ? "● CAM ON" : "SONG SONG", bg: isCamActive ? .purple : Color.purple.opacity(0.14), fg: isCamActive ? .white : .purple)
+                    }
+                    Text("Camera ảo phát hình song song với Go Live")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { voiceRoom.isCamEnabled },
+                    set: { voiceRoom.setCamEnabled($0) }
+                ))
+                .labelsHidden()
+                .tint(.purple)
+            }
+
+            if let media = voiceRoom.camMedia {
+                HStack(spacing: 10) {
+                    Image(systemName: "camera.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.purple)
+                        .frame(width: 30, height: 30)
+                        .background(Color.purple.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(media.title)
+                            .font(.caption.bold())
+                            .lineLimit(1)
+                        Text("Camera Ảo Loop ∞ • Toàn bộ dàn Token")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        voiceRoom.clearCamMedia()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(Color(UIColor.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                Text("Chưa chọn file Fake Cam — có thể bật song song với Go Live Stream.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 2)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    showCamMediaPicker = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder.badge.plus")
+                        Text("Chọn Video Cam")
+                    }
+                    .font(.caption.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(Color.purple.opacity(0.14))
+                    .foregroundColor(.purple)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualCamPattern, forStream: false)
+                } label: {
+                    Text("🌈 Mẫu Ảo")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .foregroundColor(.primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+
+                Button {
+                    voiceRoom.selectVirtualMedia(.virtualBlackScreen, forStream: false)
+                } label: {
+                    Text("⬛ Đen")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 9)
+                        .background(Color(UIColor.tertiarySystemGroupedBackground))
+                        .foregroundColor(.primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+            }
+        }
+    }
+
+    // Card 6: Primary Action CTA Button (Treo Room)
+    private var treoActionButton: some View {
+        Group {
+            if voiceRoom.isRunning {
+                Button {
+                    voiceRoom.stopTreo()
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 20, weight: .bold))
+                        Text("RỜI PHÒNG / DỪNG TREO")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
+                    }
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .background(LinearGradient(colors: [Color(red: 0.90, green: 0.16, blue: 0.22), Color(red: 0.72, green: 0.10, blue: 0.16)], startPoint: .leading, endPoint: .trailing))
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: Color.red.opacity(0.35), radius: 10, y: 5)
+                }
+            } else {
+                let canStart = (!voiceRoom.targetChannelId.isEmpty || voiceRoom.selectedChannel != nil) && !activeTokens.isEmpty
                 Button {
                     let channelId = !voiceRoom.targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? voiceRoom.targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7487,313 +8532,219 @@ struct VoiceRoomTabView: View {
                         voiceRoom.startTreo(guildId: finalGid, channelId: channelId, channelName: cName, tokens: tokensToUse)
                     }
                 } label: {
-                    HStack {
+                    HStack(spacing: 10) {
                         Image(systemName: "play.fill")
+                            .font(.system(size: 17, weight: .bold))
                         Text("BẮT ĐẦU TREO ROOM 24/7")
+                            .font(.system(size: 15, weight: .heavy, design: .rounded))
                     }
-                    .font(.headline.bold())
                     .foregroundColor(.white)
                     .frame(maxWidth: .infinity)
-                    .padding()
+                    .padding(.vertical, 16)
                     .background(
-                        (!voiceRoom.targetChannelId.isEmpty || voiceRoom.selectedChannel != nil) && !activeTokens.isEmpty
-                        ? LinearGradient(colors: [.indigo, .purple], startPoint: .leading, endPoint: .trailing)
-                        : LinearGradient(colors: [.gray], startPoint: .leading, endPoint: .trailing)
+                        canStart
+                        ? LinearGradient(colors: [Color(red: 0.36, green: 0.34, blue: 0.96), Color(red: 0.62, green: 0.28, blue: 0.95)], startPoint: .leading, endPoint: .trailing)
+                        : LinearGradient(colors: [Color.gray.opacity(0.6), Color.gray.opacity(0.5)], startPoint: .leading, endPoint: .trailing)
                     )
-                    .cornerRadius(12)
-                    .shadow(color: .indigo.opacity(0.3), radius: 8, y: 4)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: canStart ? Color.indigo.opacity(0.38) : .clear, radius: 12, y: 6)
                 }
-                .disabled((voiceRoom.targetChannelId.isEmpty && voiceRoom.selectedChannel == nil) || activeTokens.isEmpty)
+                .disabled(!canStart)
             }
+        }
+    }
 
-            // Tài khoản trong Voice
+    // Card 7: Tài Khoản Trong Voice
+    private var treoSessionsCard: some View {
+        Group {
             if !voiceRoom.sessions.isEmpty {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Image(systemName: "person.2.fill").foregroundStyle(.indigo)
-                        Text("Tài Khoản Trong Voice (\(voiceRoom.sessions.count))").font(.headline)
-                    }
-
-                    ForEach(voiceRoom.sessions) { s in
-                        HStack(spacing: 10) {
-                            if let url = s.avatarURL {
-                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                placeholder: { Circle().fill(.gray) }
-                                .frame(width: 32, height: 32).clipShape(Circle())
-                            } else {
-                                Circle().fill(.gray.opacity(0.3)).frame(width: 32, height: 32)
-                            }
-
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 5) {
-                                    Text(s.username).font(.subheadline.bold()).lineLimit(1)
-                                    if s.premiumType == 1 || s.premiumType == 2 {
-                                        Text("NITRO")
-                                            .font(.system(size: 8, weight: .black))
-                                            .padding(.horizontal, 4)
-                                            .padding(.vertical, 1)
-                                            .background(Color.pink.opacity(0.2))
-                                            .foregroundStyle(.pink)
-                                            .cornerRadius(4)
-                                    }
-                                    if s.isGoLiveActive {
-                                        Text("LIVE")
-                                            .font(.system(size: 8, weight: .black))
-                                            .padding(.horizontal, 4)
-                                            .padding(.vertical, 1)
-                                            .background(Color.red)
-                                            .foregroundStyle(.white)
-                                            .cornerRadius(4)
-                                    }
-                                    if s.isFakeCamActive {
-                                        Text("CAM")
-                                            .font(.system(size: 8, weight: .black))
-                                            .padding(.horizontal, 4)
-                                            .padding(.vertical, 1)
-                                            .background(Color.purple)
-                                            .foregroundStyle(.white)
-                                            .cornerRadius(4)
-                                    }
-                                }
-                                Text(s.lastLog.isEmpty ? (s.isJoined ? "Đang trong phòng" : "Đang kết nối...") : s.lastLog)
-                                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                            }
-
-                            Spacer()
-
-                            Circle()
-                                .fill(s.isVoiceUDPReady ? Color.green : (s.isJoined ? Color.green.opacity(0.7) : (s.isConnected ? Color.yellow : Color.red)))
-                                .frame(width: 10, height: 10)
-                        }
-                        .padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                    }
-                }
-                .padding()
-                .background(Color(UIColor.secondarySystemBackground))
-                .cornerRadius(15)
-            }
-
-            // Nhật Ký Kết Nối
-            if !voiceRoom.logs.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Image(systemName: "terminal.fill").foregroundStyle(.indigo)
-                        Text("Nhật Ký Kết Nối").font(.headline)
+                studioCard {
+                    HStack(spacing: 10) {
+                        iconSquircle(systemName: "person.2.fill", colors: [Color.indigo, Color.cyan], size: 30)
+                        Text("Tài Khoản Trong Voice")
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
                         Spacer()
-                        Button("Xóa") { voiceRoom.logs.removeAll() }
-                            .font(.caption)
+                        microBadge("\(voiceRoom.sessions.filter { $0.isJoined }.count)/\(voiceRoom.sessions.count) ONLINE", bg: Color.green.opacity(0.14), fg: .green)
                     }
 
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(voiceRoom.logs) { log in
-                                Text("[\(formatTime(log.timestamp))] \(log.message)")
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .foregroundStyle(.secondary)
+                    VStack(spacing: 8) {
+                        ForEach(voiceRoom.sessions) { s in
+                            let dotColor: Color = s.isVoiceUDPReady ? .green : (s.isJoined ? .green.opacity(0.7) : (s.isConnected ? .orange : .red))
+                            HStack(spacing: 10) {
+                                ZStack(alignment: .bottomTrailing) {
+                                    if let url = s.avatarURL {
+                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                        placeholder: { Circle().fill(.gray.opacity(0.3)) }
+                                        .frame(width: 36, height: 36)
+                                        .clipShape(Circle())
+                                    } else {
+                                        Circle()
+                                            .fill(Color.indigo.opacity(0.2))
+                                            .frame(width: 36, height: 36)
+                                            .overlay(
+                                                Text(String(s.username.prefix(1)).uppercased())
+                                                    .font(.caption.bold())
+                                                    .foregroundColor(.indigo)
+                                            )
+                                    }
+                                    Circle()
+                                        .fill(dotColor)
+                                        .frame(width: 11, height: 11)
+                                        .overlay(Circle().stroke(Color(UIColor.secondarySystemGroupedBackground), lineWidth: 2))
+                                }
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 5) {
+                                        Text(s.username)
+                                            .font(.subheadline.bold())
+                                            .lineLimit(1)
+                                        if s.premiumType == 1 || s.premiumType == 2 {
+                                            microBadge("NITRO", bg: Color.pink.opacity(0.18), fg: .pink)
+                                        }
+                                        if s.isGoLiveActive {
+                                            microBadge("LIVE", bg: .red)
+                                        }
+                                        if s.isFakeCamActive {
+                                            microBadge("CAM", bg: .purple)
+                                        }
+                                    }
+                                    Text(s.lastLog.isEmpty ? (s.isJoined ? "Đang trong phòng" : "Đang kết nối...") : s.lastLog)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+
+                                Spacer()
                             }
+                            .padding(10)
+                            .background(Color(UIColor.tertiarySystemGroupedBackground))
+                            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
                         }
                     }
-                    .frame(height: 120)
                 }
-                .padding()
-                .background(Color(UIColor.secondarySystemBackground))
-                .cornerRadius(15)
             }
         }
     }
 
-    // MARK: - CARD GO LIVE STREAM (TỪ room.js)
-    private var treoGoLiveCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "play.tv.fill").foregroundStyle(.red)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Go Live Stream (Loop ∞)").font(.headline)
-                    Text("Phát Video (.mp4/.mov) hoặc Nhạc (.mp3 → Màn đen + Tiếng)")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { voiceRoom.isStreamEnabled },
-                    set: { voiceRoom.setStreamEnabled($0) }
-                ))
-                .labelsHidden()
-                .tint(.red)
-            }
-
-            if let media = voiceRoom.streamMedia {
-                HStack(spacing: 8) {
-                    Image(systemName: media.isAudioOnly ? "music.note" : "film.fill")
-                        .foregroundStyle(.red)
-                    Text(media.title)
-                        .font(.caption.bold())
-                        .lineLimit(1)
-                    Spacer()
-                    if voiceRoom.isRunning && voiceRoom.isStreamEnabled {
-                        Text("ĐANG LIVE")
-                            .font(.system(size: 9, weight: .black))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.red)
-                            .foregroundColor(.white)
-                            .cornerRadius(4)
-                    }
-                    Button {
-                        voiceRoom.clearStreamMedia()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(8)
-                .background(Color(UIColor.tertiarySystemBackground))
-                .cornerRadius(8)
-            } else {
-                Text("Chưa chọn file Stream (Bật nút để dùng mẫu ảo hoặc chọn file bên dưới)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 8) {
-                Button {
-                    showStreamMediaPicker = true
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "folder.badge.plus")
-                        Text("Chọn Video / MP3")
-                    }
-                    .font(.caption.bold())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(Color.red.opacity(0.15))
-                    .foregroundColor(.red)
-                    .cornerRadius(8)
-                }
-
-                Button {
-                    voiceRoom.selectVirtualMedia(.virtualCamPattern, forStream: true)
-                } label: {
-                    Text("🌈 Mẫu Ảo")
-                        .font(.caption.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                }
-
-                Button {
-                    voiceRoom.selectVirtualMedia(.virtualBlackScreen, forStream: true)
-                } label: {
-                    Text("⬛ Màn Đen")
-                        .font(.caption.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                }
+    // Card 8: Nhật Ký Treo Room
+    private var treoLogsCard: some View {
+        Group {
+            if !voiceRoom.logs.isEmpty {
+                studioTerminalCard(
+                    title: "Nhật Ký Kết Nối",
+                    accent: .indigo,
+                    logs: voiceRoom.logs,
+                    copied: $copiedRoomLog,
+                    onClear: { voiceRoom.logs.removeAll() }
+                )
             }
         }
-        .padding()
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(15)
     }
 
-    // MARK: - CARD FAKE CAM (TỪ room.js)
-    private var treoFakeCamCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Image(systemName: "video.fill").foregroundStyle(.purple)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Fake Cam (Camera Ảo • Loop ∞)").font(.headline)
-                    Text("Phát hình ảnh Video lên khung Camera của toàn bộ Token")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Toggle("", isOn: Binding(
-                    get: { voiceRoom.isCamEnabled },
-                    set: { voiceRoom.setCamEnabled($0) }
-                ))
-                .labelsHidden()
-                .tint(.purple)
+    // MARK: - TACTILE STUDIO CONTROLS
+    private func tactileOptionPill(
+        title: String,
+        icon: String,
+        isSelected: Bool,
+        accent: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .bold))
+                Text(title)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
             }
-
-            if let media = voiceRoom.camMedia {
-                HStack(spacing: 8) {
-                    Image(systemName: "video.badge.waveform.fill")
-                        .foregroundStyle(.purple)
-                    Text(media.title)
-                        .font(.caption.bold())
-                        .lineLimit(1)
-                    Spacer()
-                    if voiceRoom.isRunning && voiceRoom.isCamEnabled {
-                        Text("ĐANG BẬT CAM")
-                            .font(.system(size: 9, weight: .black))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.purple)
-                            .foregroundColor(.white)
-                            .cornerRadius(4)
-                    }
-                    Button {
-                        voiceRoom.clearCamMedia()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(8)
-                .background(Color(UIColor.tertiarySystemBackground))
-                .cornerRadius(8)
-            } else {
-                Text("Chưa chọn file Fake Cam (Có thể chạy song song với Go Live Stream)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            HStack(spacing: 8) {
-                Button {
-                    showCamMediaPicker = true
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "folder.badge.plus")
-                        Text("Chọn Video Cam")
-                    }
-                    .font(.caption.bold())
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(Color.purple.opacity(0.15))
-                    .foregroundColor(.purple)
-                    .cornerRadius(8)
-                }
-
-                Button {
-                    voiceRoom.selectVirtualMedia(.virtualCamPattern, forStream: false)
-                } label: {
-                    Text("🌈 Cam Ảo Mẫu")
-                        .font(.caption.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                }
-
-                Button {
-                    voiceRoom.selectVirtualMedia(.virtualBlackScreen, forStream: false)
-                } label: {
-                    Text("⬛ Cam Đen")
-                        .font(.caption.bold())
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .background(Color(UIColor.tertiarySystemBackground))
-                        .cornerRadius(8)
-                }
-            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(isSelected ? accent.opacity(0.16) : Color(UIColor.tertiarySystemGroupedBackground))
+            .foregroundColor(isSelected ? accent : .secondary)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(isSelected ? accent.opacity(0.45) : Color.clear, lineWidth: 1.2)
+            )
         }
-        .padding()
-        .background(Color(UIColor.secondarySystemBackground))
-        .cornerRadius(15)
+        .buttonStyle(.plain)
+    }
+
+    private func tactileFeatureTile(
+        title: String,
+        subtitle: String,
+        icon: String,
+        isOn: Bool,
+        activeColor: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Image(systemName: icon)
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(isOn ? .white : activeColor)
+                        .frame(width: 30, height: 30)
+                        .background(isOn ? activeColor : activeColor.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    Spacer()
+                    Text(isOn ? "BẬT" : "TẮT")
+                        .font(.system(size: 10, weight: .black, design: .rounded))
+                        .foregroundColor(isOn ? activeColor : .secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isOn ? activeColor.opacity(0.11) : Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(isOn ? activeColor.opacity(0.45) : Color.clear, lineWidth: 1.2)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func presetChip(label: String, isSelected: Bool, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background(isSelected ? color : Color(UIColor.secondarySystemGroupedBackground))
+                .foregroundColor(isSelected ? .white : .primary)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func shortQualityTitle(_ q: TreoVideoQualityMode) -> String {
+        switch q {
+        case .autoNitro: return "Tự động Nitro"
+        case .hd720p30: return "720p • 30fps"
+        case .fhd1080p60: return "1080p • 60fps"
+        }
+    }
+
+    private func fxSymbol(for fx: SpamAudioFX) -> String {
+        let lower = fx.rawValue.lowercased()
+        if lower.contains("bass") { return "speaker.wave.3.fill" }
+        if lower.contains("night") { return "bolt.fill" }
+        if lower.contains("slow") { return "moon.stars.fill" }
+        if lower.contains("ear") { return "flame.fill" }
+        return "waveform"
     }
 
     // MARK: - HELPERS

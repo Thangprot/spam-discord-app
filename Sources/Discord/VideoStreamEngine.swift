@@ -527,7 +527,22 @@ final class HardwareH264Encoder {
     private let fps: Int
     private let bitrateKbps: Int
     private let maxBitrateKbps: Int
+    private let stateLock = NSLock()
     private var hasLoggedEncodeErr = false
+    private var _needsRebuild = false
+
+    var needsRebuild: Bool {
+        stateLock.lock()
+        let v = _needsRebuild
+        stateLock.unlock()
+        return v
+    }
+
+    private func markNeedsRebuild() {
+        stateLock.lock()
+        _needsRebuild = true
+        stateLock.unlock()
+    }
 
     init?(width: Int, height: Int, fps: Int, bitrateKbps: Int, maxBitrateKbps: Int) {
         self.width = max(160, (width / 2) * 2)
@@ -602,6 +617,7 @@ final class HardwareH264Encoder {
             infoFlagsOut: nil
         ) { [weak self] status, _, sampleBuffer in
             if status != noErr {
+                self?.markNeedsRebuild()
                 if let self = self, !self.hasLoggedEncodeErr {
                     self.hasLoggedEncodeErr = true
                     onError?(status)
@@ -614,13 +630,16 @@ final class HardwareH264Encoder {
                   !annexB.isEmpty else { return }
             completion(annexB, isKey)
         }
-        if encStatus != noErr && !hasLoggedEncodeErr {
-            hasLoggedEncodeErr = true
-            onError?(encStatus)
+        if encStatus != noErr {
+            markNeedsRebuild()
+            if !hasLoggedEncodeErr {
+                hasLoggedEncodeErr = true
+                onError?(encStatus)
+            }
         }
     }
 
-    private static func isKeyFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+    static func isKeyFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false),
               CFArrayGetCount(attachments) > 0 else {
             return true
@@ -633,39 +652,46 @@ final class HardwareH264Encoder {
         return true
     }
 
-    private static func extractAnnexB(from sampleBuffer: CMSampleBuffer, includeParameterSets: Bool) -> Data? {
+    static func extractAnnexB(from sampleBuffer: CMSampleBuffer, includeParameterSets: Bool) -> Data? {
         let startCode: [UInt8] = [0x00, 0x00, 0x00, 0x01]
         var output = Data()
+        var naluHeaderLength: Int = 4
 
-        if includeParameterSets, let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
+        if let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
             var paramCount: Int = 0
+            var hdrLen: Int32 = 4
             let cntStatus = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
                 fmt,
                 parameterSetIndex: 0,
                 parameterSetPointerOut: nil,
                 parameterSetSizeOut: nil,
                 parameterSetCountOut: &paramCount,
-                nalUnitHeaderLengthOut: nil
+                nalUnitHeaderLengthOut: &hdrLen
             )
-            if cntStatus == noErr && paramCount > 0 {
-                for idx in 0..<paramCount {
-                    var ptr: UnsafePointer<UInt8>?
-                    var size: Int = 0
-                    let st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        fmt,
-                        parameterSetIndex: idx,
-                        parameterSetPointerOut: &ptr,
-                        parameterSetSizeOut: &size,
-                        parameterSetCountOut: nil,
-                        nalUnitHeaderLengthOut: nil
-                    )
-                    if st == noErr, let p = ptr, size > 0 {
-                        let rawParam = Data(bytes: p, count: size)
-                        // Viết lại SPS VUI (max_num_reorder_frames = 0) chuẩn WebRTC/Chrome
-                        let nalType = rawParam[rawParam.startIndex] & 0x1F
-                        let finalParam = (nalType == 7) ? H264AnnexBHelper.rewriteSPSVUI(rawParam) : rawParam
-                        output.append(contentsOf: startCode)
-                        output.append(finalParam)
+            if cntStatus == noErr {
+                if hdrLen == 1 || hdrLen == 2 || hdrLen == 4 {
+                    naluHeaderLength = Int(hdrLen)
+                }
+                if includeParameterSets && paramCount > 0 {
+                    for idx in 0..<paramCount {
+                        var ptr: UnsafePointer<UInt8>?
+                        var size: Int = 0
+                        let st = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                            fmt,
+                            parameterSetIndex: idx,
+                            parameterSetPointerOut: &ptr,
+                            parameterSetSizeOut: &size,
+                            parameterSetCountOut: nil,
+                            nalUnitHeaderLengthOut: nil
+                        )
+                        if st == noErr, let p = ptr, size > 0 {
+                            let rawParam = Data(bytes: p, count: size)
+                            // Viết lại SPS VUI (max_num_reorder_frames = 0) chuẩn WebRTC/Chrome
+                            let nalType = rawParam[rawParam.startIndex] & 0x1F
+                            let finalParam = (nalType == 7) ? H264AnnexBHelper.rewriteSPSVUI(rawParam) : rawParam
+                            output.append(contentsOf: startCode)
+                            output.append(finalParam)
+                        }
                     }
                 }
             }
@@ -676,7 +702,7 @@ final class HardwareH264Encoder {
         }
 
         let totalLength = CMBlockBufferGetDataLength(blockBuffer)
-        guard totalLength > 4 else {
+        guard totalLength > naluHeaderLength else {
             return output.isEmpty ? nil : output
         }
 
@@ -690,14 +716,12 @@ final class HardwareH264Encoder {
         }
 
         var offset = 0
-        while offset + 4 <= totalLength {
-            let naluLen = Int(
-                (UInt32(contiguousBytes[offset]) << 24)
-                | (UInt32(contiguousBytes[offset + 1]) << 16)
-                | (UInt32(contiguousBytes[offset + 2]) << 8)
-                | UInt32(contiguousBytes[offset + 3])
-            )
-            offset += 4
+        while offset + naluHeaderLength <= totalLength {
+            var naluLen = 0
+            for b in 0..<naluHeaderLength {
+                naluLen = (naluLen << 8) | Int(contiguousBytes[offset + b])
+            }
+            offset += naluHeaderLength
             guard naluLen > 0, offset + naluLen <= totalLength else { break }
 
             let nalType = contiguousBytes[offset] & 0x1F
@@ -1421,26 +1445,116 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 }
 
 // ==============================================================================
+// MARK: - BACKGROUND H.264 GOP CACHE (GIỮ VIDEO CHẠY MƯỢT 0% GPU KHI THOÁT APP)
+// ==============================================================================
+
+final class BackgroundH264LoopCache {
+    private let lock = NSLock()
+    private var committedGop: [Data] = []
+    private var currentGop: [Data] = []
+    private var currentBytes: Int = 0
+    private var lastKeyFrame: Data?
+    private var playIndex: Int = 0
+    private let maxFrames: Int = 180
+    private let maxBytes: Int = 6 * 1024 * 1024
+
+    func reset() {
+        lock.lock()
+        committedGop.removeAll()
+        currentGop.removeAll()
+        currentBytes = 0
+        lastKeyFrame = nil
+        playIndex = 0
+        lock.unlock()
+    }
+
+    func record(frame: Data, isKey: Bool) {
+        guard !frame.isEmpty else { return }
+        lock.lock()
+        if isKey {
+            lastKeyFrame = frame
+            if !currentGop.isEmpty {
+                committedGop = currentGop
+            }
+            currentGop = [frame]
+            currentBytes = frame.count
+        } else if !currentGop.isEmpty && currentGop.count < maxFrames && (currentBytes + frame.count) <= maxBytes {
+            currentGop.append(frame)
+            currentBytes += frame.count
+        }
+        lock.unlock()
+    }
+
+    func nextFrame(forceKey: Bool) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        let source: [Data]
+        if !committedGop.isEmpty {
+            source = committedGop
+        } else if !currentGop.isEmpty {
+            source = currentGop
+        } else if let kf = lastKeyFrame {
+            return kf
+        } else {
+            return nil
+        }
+
+        if forceKey || playIndex >= source.count {
+            playIndex = 0
+        }
+        let frame = source[playIndex]
+        playIndex = (playIndex + 1) % source.count
+        return frame
+    }
+
+    var hasCachedFrames: Bool {
+        lock.lock()
+        let ok = !committedGop.isEmpty || !currentGop.isEmpty || lastKeyFrame != nil
+        lock.unlock()
+        return ok
+    }
+}
+
+// ==============================================================================
 // MARK: - SHARED MEDIA BROADCAST ENGINE (LOOP ∞ VIDEO + AUDIO -> ALL TOKENS)
 // ==============================================================================
 
 final class TreoMediaBroadcastEngine {
     private var videoTask: Task<Void, Never>?
     private var audioTask: Task<Void, Never>?
-    private let keyFrameLock = NSLock()
+    private let stateLock = NSLock()
     private var pendingKeyFrame = true
+    private var _isBackgroundMode = false
+    private let bgLoopCache = BackgroundH264LoopCache()
+
+    func setBackgroundMode(_ inBackground: Bool) {
+        stateLock.lock()
+        let changed = (_isBackgroundMode != inBackground)
+        _isBackgroundMode = inBackground
+        if changed {
+            pendingKeyFrame = true
+        }
+        stateLock.unlock()
+    }
+
+    private var isBackgroundMode: Bool {
+        stateLock.lock()
+        let v = _isBackgroundMode
+        stateLock.unlock()
+        return v
+    }
 
     func requestKeyFrame() {
-        keyFrameLock.lock()
+        stateLock.lock()
         pendingKeyFrame = true
-        keyFrameLock.unlock()
+        stateLock.unlock()
     }
 
     private func consumeKeyFrameRequest() -> Bool {
-        keyFrameLock.lock()
+        stateLock.lock()
         let v = pendingKeyFrame
         pendingKeyFrame = false
-        keyFrameLock.unlock()
+        stateLock.unlock()
         return v
     }
 
@@ -1449,6 +1563,42 @@ final class TreoMediaBroadcastEngine {
         videoTask = nil
         audioTask?.cancel()
         audioTask = nil
+        bgLoopCache.reset()
+    }
+
+    /// Kiểm tra file .mp4/.mov có thể đọc H.264 trực tiếp không cần giải mã/mã hóa GPU (chạy nền 24/7 0% GPU!)
+    private static func canUseDirectH264Passthrough(asset: AVURLAsset, track: AVAssetTrack) -> Bool {
+        guard let fmtAny = track.formatDescriptions.first else { return false }
+        let fmt = fmtAny as! CMFormatDescription
+        guard CMFormatDescriptionGetMediaSubType(fmt) == kCMVideoCodecType_H264 else {
+            return false
+        }
+        guard let reader = try? AVAssetReader(asset: asset) else { return false }
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return false }
+        reader.add(output)
+        guard reader.startReading() else { return false }
+        defer { reader.cancelReading() }
+
+        var prevPts: Double = -Double.infinity
+        var sawKeyFrame = false
+        var checked = 0
+        while checked < 45, let sb = output.copyNextSampleBuffer() {
+            let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+            if pts.isFinite {
+                // Nếu có B-frame (PTS nhảy lùi so với frame trước) thì không passthrough để tránh giật hình WebRTC
+                if pts + 0.0005 < prevPts {
+                    return false
+                }
+                prevPts = pts
+            }
+            if HardwareH264Encoder.isKeyFrame(sb) {
+                sawKeyFrame = true
+            }
+            checked += 1
+        }
+        return sawKeyFrame && checked > 0
     }
 
     /// Tính kích thước chẵn vừa trong profile mà vẫn giữ đúng tỷ lệ gốc (không làm méo video hoặc lệch kích thước encoder)
@@ -1465,6 +1615,7 @@ final class TreoMediaBroadcastEngine {
     }
 
     /// Phát lặp vô hạn (Loop ∞) file Video (.mp4/.mov), Audio (.mp3/.m4a/.wav -> màn hình đen), hoặc mẫu ảo
+    /// Hỗ trợ chạy nền 24/7 khi thoát app / khóa màn hình (Passthrough 0% GPU + H.264 GOP Cache + Tự khôi phục VideoToolbox)
     func start(
         source: TreoMediaSource,
         profile: DiscordStreamProfile,
@@ -1475,8 +1626,9 @@ final class TreoMediaBroadcastEngine {
     ) {
         stop()
         requestKeyFrame()
+        bgLoopCache.reset()
 
-        // 1. Luồng Video (H.264 Hardware VideoToolbox)
+        // 1. Luồng Video (Direct H.264 Passthrough 0% GPU / Hardware VideoToolbox + Background GOP Cache)
         videoTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
 
@@ -1487,17 +1639,14 @@ final class TreoMediaBroadcastEngine {
                 let encBitrate = source.isAudioOnly ? 500 : profile.bitrateKbps
                 let encMaxBitrate = source.isAudioOnly ? 800 : profile.maxBitrateKbps
 
-                guard let encoder = HardwareH264Encoder(
+                var encoder: HardwareH264Encoder? = HardwareH264Encoder(
                     width: encW,
                     height: encH,
                     fps: encFps,
                     bitrateKbps: encBitrate,
                     maxBitrateKbps: encMaxBitrate
-                ) else {
-                    onLog?("❌ Không thể khởi tạo Hardware H.264 Encoder (\(encW)x\(encH))")
-                    return
-                }
-                defer { encoder.invalidate() }
+                )
+                defer { encoder?.invalidate() }
 
                 let frameDurationMs = 1000.0 / Double(encFps)
                 let frameDurationNs = UInt64(frameDurationMs * 1_000_000.0)
@@ -1505,6 +1654,7 @@ final class TreoMediaBroadcastEngine {
                 var frameIndex: Int64 = 0
                 var nextTick = DispatchTime.now().uptimeNanoseconds
                 var loggedFirst = false
+                var loggedBgFallback = false
 
                 let staticBlackPB = source.isAudioOnly
                     ? HardwareH264Encoder.makeSyntheticPixelBuffer(width: encW, height: encH, frameIndex: 0, blackOnly: true)
@@ -1512,30 +1662,64 @@ final class TreoMediaBroadcastEngine {
 
                 while !Task.isCancelled {
                     nextTick &+= frameDurationNs
-                    let pb = staticBlackPB ?? HardwareH264Encoder.makeSyntheticPixelBuffer(
-                        width: encW,
-                        height: encH,
-                        frameIndex: Int(frameIndex),
-                        blackOnly: false
-                    )
-                    if let pixelBuffer = pb {
-                        let forceKey = (frameIndex % Int64(encFps * 2) == 0) || self.consumeKeyFrameRequest()
-                        let pts = CMTime(value: frameIndex, timescale: CMTimeScale(encFps))
-                        encoder.encode(
-                            pixelBuffer: pixelBuffer,
-                            pts: pts,
-                            duration: cmDuration,
-                            forceKeyFrame: forceKey,
-                            onError: { st in onLog?("❌ Lỗi VideoToolbox H.264 (OSStatus \(st))") }
-                        ) { annexB, isKey in
-                            if !loggedFirst {
-                                loggedFirst = true
-                                onLog?("🎬 H.264 Encoder OK (\(encW)x\(encH)@\(encFps)fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
-                            }
-                            onVideoFrame(annexB, frameDurationMs)
+                    let wantKey = (frameIndex % Int64(encFps * 2) == 0) || self.consumeKeyFrameRequest()
+                    let inBg = self.isBackgroundMode
+
+                    // Khi thoát app hoặc VideoToolbox bị iOS thu hồi -> phát liên tục từ H.264 GOP Cache (0% GPU!)
+                    if (inBg || encoder == nil || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
+                        if !loggedBgFallback {
+                            loggedBgFallback = true
+                            onLog?("🌙 Đã chuyển video sang chế độ chạy nền (0% GPU) — stream tiếp tục mượt khi thoát app!")
                         }
+                        if let cached = self.bgLoopCache.nextFrame(forceKey: wantKey) {
+                            onVideoFrame(cached, frameDurationMs)
+                        }
+                        frameIndex += 1
+                    } else {
+                        if !inBg && (encoder == nil || encoder?.needsRebuild == true) {
+                            encoder?.invalidate()
+                            encoder = HardwareH264Encoder(
+                                width: encW,
+                                height: encH,
+                                fps: encFps,
+                                bitrateKbps: encBitrate,
+                                maxBitrateKbps: encMaxBitrate
+                            )
+                            if encoder != nil && loggedBgFallback {
+                                loggedBgFallback = false
+                                onLog?("☀️ Đã khôi phục Hardware H.264 Encoder khi mở lại app.")
+                            }
+                        }
+
+                        let pb = staticBlackPB ?? HardwareH264Encoder.makeSyntheticPixelBuffer(
+                            width: encW,
+                            height: encH,
+                            frameIndex: Int(frameIndex),
+                            blackOnly: false
+                        )
+                        if let pixelBuffer = pb, let enc = encoder {
+                            let pts = CMTime(value: frameIndex, timescale: CMTimeScale(encFps))
+                            enc.encode(
+                                pixelBuffer: pixelBuffer,
+                                pts: pts,
+                                duration: cmDuration,
+                                forceKeyFrame: wantKey,
+                                onError: { st in
+                                    if !self.bgLoopCache.hasCachedFrames {
+                                        onLog?("⚠️ VideoToolbox tạm ngưng (OSStatus \(st)), tự động chuyển chạy nền...")
+                                    }
+                                }
+                            ) { annexB, isKey in
+                                self.bgLoopCache.record(frame: annexB, isKey: isKey)
+                                if !loggedFirst {
+                                    loggedFirst = true
+                                    onLog?("🎬 H.264 Encoder OK (\(encW)x\(encH)@\(encFps)fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
+                                }
+                                onVideoFrame(annexB, frameDurationMs)
+                            }
+                        }
+                        frameIndex += 1
                     }
-                    frameIndex += 1
 
                     let now = DispatchTime.now().uptimeNanoseconds
                     if nextTick > now {
@@ -1545,37 +1729,148 @@ final class TreoMediaBroadcastEngine {
                     }
                 }
             } else if let url = source.url {
-                // File Video thật (.mp4, .mov, .m4v): Khớp đúng kích thước AVAssetReaderTrackOutput == VTCompressionSession
                 let probeAsset = AVURLAsset(url: url)
                 guard let probeTrack = probeAsset.tracks(withMediaType: .video).first else {
                     onLog?("⚠️ File \(source.title) không có track video")
                     return
                 }
+
+                // NHÁNH A: DIRECT H.264 PASSTHROUGH (0% GPU — đọc thẳng khung H.264 từ file MP4/MOV, chạy nền 24/7 cực mượt!)
+                if TreoMediaBroadcastEngine.canUseDirectH264Passthrough(asset: probeAsset, track: probeTrack) {
+                    onLog?("⚡ H.264 Direct Passthrough (0% GPU — chạy mượt kể cả khi thoát app/khóa màn hình): \(source.title)")
+                    var loggedFirst = false
+
+                    while !Task.isCancelled {
+                        let asset = AVURLAsset(url: url)
+                        guard let videoTrack = asset.tracks(withMediaType: .video).first,
+                              let reader = try? AVAssetReader(asset: asset) else {
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            continue
+                        }
+                        let output = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+                        output.alwaysCopiesSampleData = false
+                        guard reader.canAdd(output) else { break }
+                        reader.add(output)
+                        guard reader.startReading() else {
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            continue
+                        }
+
+                        let nominalFps = Double(videoTrack.nominalFrameRate)
+                        let effFps = (nominalFps >= 5 && nominalFps <= 60) ? nominalFps : 30.0
+                        let defaultStepMs = 1000.0 / effFps
+                        var prevPtsSec: Double = -1.0
+                        var nextTick = DispatchTime.now().uptimeNanoseconds
+
+                        while !Task.isCancelled && reader.status == .reading {
+                            guard let sb = output.copyNextSampleBuffer() else { break }
+                            let isKey = HardwareH264Encoder.isKeyFrame(sb)
+                            let curPts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
+                            let deltaMs: Double
+                            if prevPtsSec >= 0 && curPts.isFinite && curPts > prevPtsSec && (curPts - prevPtsSec) < 0.5 {
+                                deltaMs = (curPts - prevPtsSec) * 1000.0
+                            } else {
+                                deltaMs = defaultStepMs
+                            }
+                            if curPts.isFinite { prevPtsSec = curPts }
+
+                            let stepNs = UInt64(max(8.0, min(200.0, deltaMs)) * 1_000_000.0)
+                            nextTick &+= stepNs
+
+                            if let annexB = HardwareH264Encoder.extractAnnexB(from: sb, includeParameterSets: isKey),
+                               !annexB.isEmpty {
+                                self.bgLoopCache.record(frame: annexB, isKey: isKey)
+                                if !loggedFirst {
+                                    loggedFirst = true
+                                    onLog?("🎬 H.264 Passthrough OK (\(Int(effFps))fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
+                                }
+                                onVideoFrame(annexB, deltaMs)
+                            }
+
+                            let now = DispatchTime.now().uptimeNanoseconds
+                            if nextTick > now {
+                                try? await Task.sleep(nanoseconds: nextTick - now)
+                            } else if now - nextTick > 250_000_000 {
+                                nextTick = now
+                            }
+                        }
+
+                        reader.cancelReading()
+                        self.requestKeyFrame()
+                    }
+                    return
+                }
+
+                // NHÁNH B: TRANSCODE VIDEOTOOLBOX + BACKGROUND H.264 GOP CACHE (cho HEVC .mov / MP4 có B-frame)
                 let (encW, encH) = TreoMediaBroadcastEngine.computeTargetSize(
                     naturalSize: probeTrack.naturalSize,
                     maxWidth: profile.width,
                     maxHeight: profile.height
                 )
 
-                guard let encoder = HardwareH264Encoder(
+                var encoder: HardwareH264Encoder? = HardwareH264Encoder(
                     width: encW,
                     height: encH,
                     fps: profile.fps,
                     bitrateKbps: profile.bitrateKbps,
                     maxBitrateKbps: profile.maxBitrateKbps
-                ) else {
-                    onLog?("❌ Không thể khởi tạo Hardware H.264 Encoder (\(encW)x\(encH)) cho \(source.title)")
-                    return
-                }
-                defer { encoder.invalidate() }
+                )
+                defer { encoder?.invalidate() }
 
                 let targetFps = Double(profile.fps)
                 let minFrameMs = 1000.0 / targetFps
                 let minFrameNs = UInt64(minFrameMs * 1_000_000.0)
                 var globalFrameIndex: Int64 = 0
                 var loggedFirst = false
+                var loggedBgFallback = false
 
                 while !Task.isCancelled {
+                    // Nếu đang ở nền và đã có GOP cache -> phát vòng lặp GOP 0% GPU cho đến khi mở lại app!
+                    if (self.isBackgroundMode || encoder == nil || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
+                        if !loggedBgFallback {
+                            loggedBgFallback = true
+                            onLog?("🌙 Video chuyển chế độ chạy nền (0% GPU GOP Cache) — giữ stream sống 24/7 khi thoát app!")
+                        }
+                        var bgTick = DispatchTime.now().uptimeNanoseconds
+                        let bgStepMs = max(minFrameMs, 1000.0 / min(30.0, targetFps))
+                        let bgStepNs = UInt64(bgStepMs * 1_000_000.0)
+                        while !Task.isCancelled && (self.isBackgroundMode || encoder == nil || encoder?.needsRebuild == true) {
+                            bgTick &+= bgStepNs
+                            let wantKey = self.consumeKeyFrameRequest()
+                            if let cached = self.bgLoopCache.nextFrame(forceKey: wantKey) {
+                                onVideoFrame(cached, bgStepMs)
+                            }
+                            // Khi người dùng mở lại app -> tái tạo encoder và thoát vòng nền ngay
+                            if !self.isBackgroundMode {
+                                if encoder == nil || encoder?.needsRebuild == true {
+                                    encoder?.invalidate()
+                                    encoder = HardwareH264Encoder(
+                                        width: encW,
+                                        height: encH,
+                                        fps: profile.fps,
+                                        bitrateKbps: profile.bitrateKbps,
+                                        maxBitrateKbps: profile.maxBitrateKbps
+                                    )
+                                }
+                                if encoder != nil {
+                                    loggedBgFallback = false
+                                    onLog?("☀️ Đã khôi phục phát video gốc khi quay lại app.")
+                                    break
+                                }
+                            }
+                            let now = DispatchTime.now().uptimeNanoseconds
+                            if bgTick > now {
+                                try? await Task.sleep(nanoseconds: bgTick - now)
+                            } else if now - bgTick > 250_000_000 {
+                                bgTick = now
+                            }
+                        }
+                        if !self.isBackgroundMode && loggedBgFallback {
+                            loggedBgFallback = false
+                        }
+                        continue
+                    }
+
                     let asset = AVURLAsset(url: url)
                     guard let videoTrack = asset.tracks(withMediaType: .video).first,
                           let reader = try? AVAssetReader(asset: asset) else {
@@ -1583,7 +1878,6 @@ final class TreoMediaBroadcastEngine {
                         continue
                     }
 
-                    // Ép AVAssetReader xuất NV12 đúng kích thước encW x encH để khớp 100% với HardwareH264Encoder
                     let outputSettings: [String: Any] = [
                         kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
                         kCVPixelBufferWidthKey as String: encW,
@@ -1595,6 +1889,10 @@ final class TreoMediaBroadcastEngine {
                     guard reader.canAdd(trackOutput) else { break }
                     reader.add(trackOutput)
                     guard reader.startReading() else {
+                        if self.bgLoopCache.hasCachedFrames {
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                            continue
+                        }
                         onLog?("❌ AVAssetReader lỗi mở video: \(reader.error?.localizedDescription ?? "unknown")")
                         try? await Task.sleep(nanoseconds: 500_000_000)
                         continue
@@ -1610,6 +1908,9 @@ final class TreoMediaBroadcastEngine {
                     var lastEmittedPtsSec: Double = -1.0
 
                     while !Task.isCancelled && reader.status == .reading {
+                        if (self.isBackgroundMode || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
+                            break
+                        }
                         guard let sb = trackOutput.copyNextSampleBuffer() else { break }
                         guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
 
@@ -1622,13 +1923,18 @@ final class TreoMediaBroadcastEngine {
 
                         let forceKey = (globalFrameIndex % Int64(max(15, Int(effFps * 2))) == 0) || self.consumeKeyFrameRequest()
                         let outPts = CMTime(value: globalFrameIndex * Int64(90_000.0 / effFps), timescale: 90_000)
-                        encoder.encode(
+                        encoder?.encode(
                             pixelBuffer: pb,
                             pts: outPts,
                             duration: cmDur,
                             forceKeyFrame: forceKey,
-                            onError: { st in onLog?("❌ Lỗi VideoToolbox H.264 (OSStatus \(st))") }
+                            onError: { st in
+                                if !self.bgLoopCache.hasCachedFrames {
+                                    onLog?("⚠️ VideoToolbox tạm ngưng (OSStatus \(st)), chuyển sang nền...")
+                                }
+                            }
                         ) { annexB, isKey in
+                            self.bgLoopCache.record(frame: annexB, isKey: isKey)
                             if !loggedFirst {
                                 loggedFirst = true
                                 onLog?("🎬 H.264 Encoder OK (\(encW)x\(encH)@\(Int(effFps))fps | Frame đầu: \(annexB.count)B, Key=\(isKey))")
