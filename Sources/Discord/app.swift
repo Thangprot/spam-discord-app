@@ -164,6 +164,7 @@ final class SecurityGuard: @unchecked Sendable {
 
     private(set) var isCompromised = false
     private var sessionToken: String? = nil
+    private var sessionExp: Double = 0
     private let lock = NSLock()
 
     private init() {}
@@ -172,6 +173,7 @@ final class SecurityGuard: @unchecked Sendable {
         lock.lock()
         isCompromised = true
         sessionToken = nil
+        sessionExp = 0
         lock.unlock()
         AppEndpoints.clear()
         PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
@@ -180,15 +182,17 @@ final class SecurityGuard: @unchecked Sendable {
     func clearSession() {
         lock.lock()
         sessionToken = nil
+        sessionExp = 0
         isCompromised = false
         lock.unlock()
         PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
     }
 
-    func loadCachedSessionToken() {
-        if let token = PersistentStorage.shared.readString(forKey: "QT_CachedSessionToken") {
-            _ = updateSessionToken(token, persist: false)
-        }
+    /// Không nạp phiên từ ổ đĩa (RAM-only — bắt buộc xác thực live với Cloudflare)
+    func purgeLegacyDiskCache() {
+        PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
+        UserDefaults.standard.removeObject(forKey: "QT_CachedRemoteConfig")
+        UserDefaults.standard.synchronize()
     }
 
     private static func decodeBase64Flexible(_ str: String) -> Data? {
@@ -203,8 +207,8 @@ final class SecurityGuard: @unchecked Sendable {
         return Data(base64Encoded: normalized)
     }
 
-    /// Xác thực và lưu Session Token từ server
-    func updateSessionToken(_ token: String, persist: Bool = true) -> Bool {
+    /// Xác thực và lưu Session Token từ server (CHỈ LƯU TRONG RAM)
+    func updateSessionToken(_ token: String) -> Bool {
         let parts = token.components(separatedBy: ".")
         guard parts.count == 2,
               let payloadData = Self.decodeBase64Flexible(parts[0]),
@@ -231,22 +235,24 @@ final class SecurityGuard: @unchecked Sendable {
 
         lock.lock()
         sessionToken = token
+        sessionExp = expSec
         isCompromised = false
         lock.unlock()
-
-        if persist {
-            PersistentStorage.shared.saveString(token, forKey: "QT_CachedSessionToken")
-        }
         return true
     }
 
-    /// Kiểm tra quyền thực thi lõi (gắn sâu vào spam/nuke)
+    /// Kiểm tra quyền thực thi lõi (RAM-only + Anti-Debug)
     func verifyExecutionPermit() -> Bool {
+        if AppIntegrityAuditor.shared.isDebuggerAttached() {
+            markCompromised(reason: "debugger_attached")
+            return false
+        }
+
         lock.lock()
         defer { lock.unlock() }
 
         if isCompromised { return false }
-        guard let token = sessionToken else { return false }
+        guard let token = sessionToken, sessionExp > Date().timeIntervalSince1970 else { return false }
 
         let parts = token.components(separatedBy: ".")
         guard parts.count == 2 else { return false }
@@ -374,27 +380,13 @@ final class SecureAPIClient {
 }
 
 // ==========================================
-// MARK: - REMOTE CONFIG (từ Cloudflare Worker)
+// MARK: - REMOTE CONFIG (từ Cloudflare Worker — RAM-ONLY, ZERO DISCORD API TRONG APP)
 // ==========================================
-struct RemoteConfigDTO: Codable {
-    let api_base: String
-    let gateway_url: String
-    let cdn_avatars: String
-    let cdn_icons: String
-    let user_agent_desktop: String
-    let user_agent_mobile: String
-    let user_agent_bot: String
-    let super_properties_desktop: String
-    let super_properties_mobile: String
-    let origin: String
-    let referer: String
-    let everyone_allow: String
-}
-
 struct ConfigResponse: Codable {
     let valid: Bool?
     let createdAt: Int64?
     let expiresAt: Int64?
+    let assets: RemoteAssetsDTO?
     let config: RemoteConfigDTO?
     let sessionToken: String?
     let error: String?
@@ -402,66 +394,33 @@ struct ConfigResponse: Codable {
     let expired: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case valid, config, error, cracked, expired
+        case valid, assets, config, error, cracked, expired
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
     }
 }
 
-/// Toàn bộ endpoint Discord được NẠP TỪ SERVER — không hard-code trong app.
+/// Chỉ giữ CDN hiển thị ảnh trong RAM khi key đã xác thực; toàn bộ API chức năng nằm tách biệt trong RemoteFeatureVault theo từng chức năng.
 struct AppEndpoints {
-    static var apiBase = ""
-    static var gatewayURL = ""
     static var cdnAvatars = ""
     static var cdnIcons = ""
-    static var userAgentDesktop = ""
-    static var userAgentMobile = ""
-    static var userAgentBot = ""
-    static var superPropertiesDesktop = ""
-    static var superPropertiesMobile = ""
-    static var origin = ""
-    static var referer = ""
-    static var everyoneAllow: UInt64 = 0
-    static var isLoaded = false
 
-    static func apply(_ dto: RemoteConfigDTO) {
-        apiBase = dto.api_base
-        gatewayURL = dto.gateway_url
-        cdnAvatars = dto.cdn_avatars
-        cdnIcons = dto.cdn_icons
-        userAgentDesktop = dto.user_agent_desktop
-        userAgentMobile = dto.user_agent_mobile
-        userAgentBot = dto.user_agent_bot
-        superPropertiesDesktop = dto.super_properties_desktop
-        superPropertiesMobile = dto.super_properties_mobile
-        origin = dto.origin
-        referer = dto.referer
-        everyoneAllow = UInt64(dto.everyone_allow) ?? 0
-        isLoaded = true
-
-        if let data = try? JSONEncoder().encode(dto) {
-            UserDefaults.standard.set(data, forKey: "QT_CachedRemoteConfig")
-            UserDefaults.standard.synchronize()
-        }
+    static func applyAssets(_ assets: RemoteAssetsDTO?) {
+        guard let a = assets else { return }
+        if let av = a.cdn_avatars, !av.isEmpty { cdnAvatars = av }
+        if let ic = a.cdn_icons, !ic.isEmpty { cdnIcons = ic }
     }
 
-    @discardableResult
-    static func loadFromCache() -> Bool {
-        if isLoaded { return true }
-        if let data = UserDefaults.standard.data(forKey: "QT_CachedRemoteConfig"),
-           let dto = try? JSONDecoder().decode(RemoteConfigDTO.self, from: data) {
-            apply(dto)
-            return true
-        }
-        return false
+    static func applyCDN(avatars: String?, icons: String?) {
+        if let av = avatars, !av.isEmpty { cdnAvatars = av }
+        if let ic = icons, !ic.isEmpty { cdnIcons = ic }
     }
 
     static func clear() {
-        apiBase = ""; gatewayURL = ""; cdnAvatars = ""; cdnIcons = ""
-        userAgentDesktop = ""; userAgentMobile = ""; userAgentBot = ""
-        superPropertiesDesktop = ""; superPropertiesMobile = ""
-        origin = ""; referer = ""; everyoneAllow = 0; isLoaded = false
+        cdnAvatars = ""
+        cdnIcons = ""
+        RemoteFeatureVault.shared.clearAllFunctionalData()
         UserDefaults.standard.removeObject(forKey: "QT_CachedRemoteConfig")
         UserDefaults.standard.synchronize()
     }
@@ -495,11 +454,26 @@ final class ConfigAPIClient {
     var baseURL: String { SecureAPIClient.shared.baseURL }
 
     func fetchConfig(key: String) async throws -> ConfigResponse {
+        let report = AppIntegrityAuditor.shared.collectReport()
         return try await SecureAPIClient.shared.sendEncryptedRequest(
             endpoint: "/config",
             bodyDict: [
                 "license_key": key,
-                "machine_id": MachineID.get()
+                "machine_id": MachineID.get(),
+                "integrity": report.payload
+            ]
+        )
+    }
+
+    func authorizeFeature(key: String, feature: FeatureScope) async throws -> FeatureAuthResponse {
+        let report = AppIntegrityAuditor.shared.collectReport()
+        return try await SecureAPIClient.shared.sendEncryptedRequest(
+            endpoint: "/feature-auth",
+            bodyDict: [
+                "license_key": key,
+                "machine_id": MachineID.get(),
+                "feature": feature.rawValue,
+                "integrity": report.payload
             ]
         )
     }
@@ -1268,49 +1242,50 @@ final class BackgroundManager {
 // MARK: - DISCORD CLIENT (SPAM)
 // ==========================================
 class DiscordClient {
-    let token: String; let session: URLSession
-    init(token: String) {
+    let token: String
+    let scope: FeatureScope
+    let session: URLSession
+
+    init(token: String, scope: FeatureScope = .spam) {
         self.token = token
+        self.scope = scope
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 20
         cfg.timeoutIntervalForResource = 30
-        cfg.httpAdditionalHeaders = [
-            "Authorization": token,
-            "Content-Type": "application/json",
-            "User-Agent": AppEndpoints.userAgentDesktop,
-            "X-Super-Properties": AppEndpoints.superPropertiesDesktop,
-            "X-Discord-Locale": "en-US"
-        ]
+        cfg.httpAdditionalHeaders = RemoteFeatureVault.shared.desktopHeaders(scope: scope, token: token)
         session = URLSession(configuration: cfg)
     }
     private func check(_ res: URLResponse, _ data: Data) throws {
         guard let h = res as? HTTPURLResponse, (200...299).contains(h.statusCode) else {
-            throw NSError(domain: "Discord", code: (res as? HTTPURLResponse)?.statusCode ?? 0,
+            throw NSError(domain: "Remote", code: (res as? HTTPURLResponse)?.statusCode ?? 0,
                           userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? ""])
         }
     }
-    func validateToken() async throws -> DiscordUser {
-        guard SecurityGuard.shared.verifyExecutionPermit() else {
-            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+    private func requireURL(_ route: KeyPath<RemoteRoutesDTO, String?>, replacements: [String: String] = [:]) throws -> URL {
+        guard SecurityGuard.shared.verifyExecutionPermit(),
+              let url = RemoteFeatureVault.shared.makeURL(scope: scope, route: route, replacements: replacements) else {
+            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Chưa xác thực chức năng từ máy chủ."])
         }
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me")!)
+        return url
+    }
+    func validateToken() async throws -> DiscordUser {
+        let url = try requireURL(\.me)
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
     func getAllGuilds() async throws -> [Guild] {
-        guard SecurityGuard.shared.verifyExecutionPermit() else { return [] }
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me/guilds")!)
+        let url = try requireURL(\.me_guilds)
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([Guild].self, from: d)
     }
     func getAllChannels(guildId: String) async throws -> [Channel] {
-        guard SecurityGuard.shared.verifyExecutionPermit() else { return [] }
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(guildId)/channels")!)
+        let url = try requireURL(\.guild_channels, replacements: ["guild_id": guildId])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
     func sendMessage(channelId: String, content: String) async throws {
-        guard SecurityGuard.shared.verifyExecutionPermit() else {
-            throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
-        }
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(channelId)/messages")!)
+        let url = try requireURL(\.channel_messages, replacements: ["channel_id": channelId])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 20
         req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
@@ -1328,7 +1303,7 @@ class DiscordClient {
             try check(r, d)
             return
         }
-        throw NSError(domain: "Discord", code: 429,
+        throw NSError(domain: "Remote", code: 429,
                       userInfo: [NSLocalizedDescriptionKey: "Rate limit kéo dài"])
     }
 }
@@ -1376,16 +1351,21 @@ class AppState: ObservableObject {
             if let a = s.first(where: { $0.isValid }) {
                 activeToken = a
                 selectedTokenIds = [a.id]
-                Task { await recomputeMultiGuilds() }
             }
         }
     }
-    func addToken(_ s: String) async {
+    func addToken(_ s: String, skipAuthCheck: Bool = false) async {
         let c = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !c.isEmpty, !tokens.contains(where: { $0.token == c }) else { return }
+        if !skipAuthCheck {
+            guard await LicenseManager.shared.authorizeFeature(.tokens) else {
+                lastError = "Xác thực bản quyền thất bại."
+                return
+            }
+        }
         isCheckingToken = true
         do {
-            let u = try await DiscordClient(token: c).validateToken()
+            let u = try await DiscordClient(token: c, scope: .tokens).validateToken()
             let t = TokenInfo(token: c, userId: u.id, username: u.globalName ?? u.username, avatarHash: u.avatar, isValid: true)
             tokens.append(t)
             if activeToken == nil {
@@ -1417,6 +1397,11 @@ class AppState: ObservableObject {
         let lines = clean.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return }
+        guard await LicenseManager.shared.authorizeFeature(.tokens) else {
+            lastError = "Xác thực bản quyền thất bại."
+            return
+        }
         if lines.count > 1 {
             BackgroundManager.shared.start(tag: "tokenCheck")
             NowPlayingHelper.shared.registerSession(
@@ -1440,7 +1425,7 @@ class AppState: ObservableObject {
             }
         }
         for (idx, l) in lines.enumerated() {
-            await addToken(l)
+            await addToken(l, skipAuthCheck: true)
             if lines.count > 1 {
                 NowPlayingHelper.shared.updateSession(
                     .tokenCheck,
@@ -1505,13 +1490,17 @@ class AppState: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
+        guard await LicenseManager.shared.authorizeFeature(.spam) else {
+            multiGuilds = []; guilds = []; return
+        }
+
         var sets: [Set<String>] = []
         var guildMap: [String: Guild] = [:]
 
         await withTaskGroup(of: [Guild]?.self) { group in
             for t in selected {
                 group.addTask {
-                    do { return try await DiscordClient(token: t.token).getAllGuilds() }
+                    do { return try await DiscordClient(token: t.token, scope: .spam).getAllGuilds() }
                     catch { return nil }
                 }
             }
@@ -1540,8 +1529,12 @@ class AppState: ObservableObject {
         let selected = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
         guard let first = selected.first else { return }
         isLoading = true
+        guard await LicenseManager.shared.authorizeFeature(.spam) else {
+            isLoading = false
+            return
+        }
         do {
-            let all = try await DiscordClient(token: first.token).getAllChannels(guildId: g.id)
+            let all = try await DiscordClient(token: first.token, scope: .spam).getAllChannels(guildId: g.id)
             channels = all.filter { $0.isSendableText || $0.isCategory }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
         } catch { lastError = error.localizedDescription }
         isLoading = false
@@ -1620,6 +1613,15 @@ class AppState: ObservableObject {
 
         sendTask = Task { [weak self] in
             guard let self = self else { return }
+            let ok = await LicenseManager.shared.authorizeFeature(.spam)
+            guard ok else {
+                self.lastError = "Xác thực key thất bại — không thể bắt đầu gửi tin."
+                self.isSending = false
+                self.isPausedSending = false
+                BackgroundManager.shared.stop(tag: "spam")
+                NowPlayingHelper.shared.endSession(.spam)
+                return
+            }
             await withTaskGroup(of: Void.self) { group in
                 for (index, token) in selectedTokens.enumerated() {
                     group.addTask { [weak self] in
@@ -1637,7 +1639,7 @@ class AppState: ObservableObject {
     }
 
     private func spamLoop(token: TokenInfo, channelId: String, startIndex: Int, step: Int) async {
-        var client = DiscordClient(token: token.token)
+        var client = DiscordClient(token: token.token, scope: .spam)
         var i = startIndex
         var consecutiveErrors = 0
         var perTokenTotal = 0
@@ -1666,8 +1668,8 @@ class AppState: ObservableObject {
                 consecutiveErrors += 1
                 if consecutiveErrors >= 2 {
                     do {
-                        _ = try await DiscordClient(token: token.token).validateToken()
-                        client = DiscordClient(token: token.token)
+                        _ = try await DiscordClient(token: token.token, scope: .spam).validateToken()
+                        client = DiscordClient(token: token.token, scope: .spam)
                         consecutiveErrors = 0
                         try? await Task.sleep(nanoseconds: 800_000_000)
                     } catch {
@@ -1733,18 +1735,12 @@ class AppState: ObservableObject {
 // MARK: - BOT CLIENT
 // ==========================================
 class BotClient {
-    let auth: String; let session: URLSession
-    static var EVERYONE_ALLOW: UInt64 { AppEndpoints.everyoneAllow }
+    let session: URLSession
+    static var EVERYONE_ALLOW: UInt64 { RemoteFeatureVault.shared.everyoneAllow(scope: .botNuke) }
     init(token: String) {
-        let c = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        auth = c.lowercased().hasPrefix("bot ") ? c : "Bot \(c)"
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 30
-        cfg.httpAdditionalHeaders = [
-            "Authorization": auth,
-            "Content-Type": "application/json",
-            "User-Agent": AppEndpoints.userAgentBot
-        ]
+        cfg.httpAdditionalHeaders = RemoteFeatureVault.shared.botHeaders(scope: .botNuke, rawToken: token)
         session = URLSession(configuration: cfg)
     }
     private func check(_ res: URLResponse, _ data: Data) throws {
@@ -1754,46 +1750,57 @@ class BotClient {
                 "HTTP \(h.statusCode): \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")"])
         }
     }
-    func validate() async throws -> BotInfo {
-        guard SecurityGuard.shared.verifyExecutionPermit() else {
-            throw NSError(domain: "B", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+    private func requireURL(_ route: KeyPath<RemoteRoutesDTO, String?>, replacements: [String: String] = [:]) throws -> URL {
+        guard SecurityGuard.shared.verifyExecutionPermit(),
+              let url = RemoteFeatureVault.shared.makeURL(scope: .botNuke, route: route, replacements: replacements) else {
+            throw NSError(domain: "B", code: 403, userInfo: [NSLocalizedDescriptionKey: "Chưa xác thực chức năng từ máy chủ."])
         }
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me")!)
+        return url
+    }
+    func validate() async throws -> BotInfo {
+        let url = try requireURL(\.me)
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode(BotInfo.self, from: d)
     }
     func getGuilds() async throws -> [Guild] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me/guilds")!)
+        let url = try requireURL(\.me_guilds)
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([Guild].self, from: d)
     }
     func getGuildDetail(_ g: String) async throws -> [String: Any] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)")!)
+        let url = try requireURL(\.guild, replacements: ["guild_id": g])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return (try JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
     }
     func getRoles(_ g: String) async throws -> [GuildRole] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/roles")!)
+        let url = try requireURL(\.guild_roles, replacements: ["guild_id": g])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([GuildRole].self, from: d)
     }
     func getMember(_ g: String, userId: String) async throws -> BotMember {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/members/\(userId)")!)
+        let url = try requireURL(\.guild_member, replacements: ["guild_id": g, "user_id": userId])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode(BotMember.self, from: d)
     }
     func getMembers(_ g: String, after: String = "0") async throws -> [BotMember] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/members?limit=1000&after=\(after)")!)
+        let url = try requireURL(\.guild_members, replacements: ["guild_id": g, "after": after])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([BotMember].self, from: d)
     }
     func getChannels(_ g: String) async throws -> [Channel] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/channels")!)
+        let url = try requireURL(\.guild_channels, replacements: ["guild_id": g])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
     func deleteChannel(_ c: String) async throws {
-        guard SecurityGuard.shared.verifyExecutionPermit() else { return }
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(c)")!)
+        let url = try requireURL(\.channel, replacements: ["channel_id": c])
+        var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func createChannel(_ g: String, name: String, openEveryone: Bool) async throws -> String? {
-        guard SecurityGuard.shared.verifyExecutionPermit() else { return nil }
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/channels")!)
+        let url = try requireURL(\.guild_channels, replacements: ["guild_id": g])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         var p: [String: Any] = ["name": name, "type": 0]
         if openEveryone { p["permission_overwrites"] = [["id": g, "type": 0, "allow": String(BotClient.EVERYONE_ALLOW), "deny": "0"]] }
@@ -1802,22 +1809,26 @@ class BotClient {
         return (try? JSONSerialization.jsonObject(with: d) as? [String: Any])?["id"] as? String
     }
     func sendMessage(_ c: String, content: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(c)/messages")!)
+        let url = try requireURL(\.channel_messages, replacements: ["channel_id": c])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func createRole(_ g: String, name: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/roles")!)
+        let url = try requireURL(\.guild_roles, replacements: ["guild_id": g])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func renameGuild(_ g: String, newName: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)")!)
+        let url = try requireURL(\.guild, replacements: ["guild_id": g])
+        var req = URLRequest(url: url)
         req.httpMethod = "PATCH"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func banMember(_ g: String, userId: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/bans/\(userId)")!)
+        let url = try requireURL(\.guild_ban, replacements: ["guild_id": g, "user_id": userId])
+        var req = URLRequest(url: url)
         req.httpMethod = "PUT"; req.httpBody = try JSONSerialization.data(withJSONObject: ["delete_message_seconds": 0])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
@@ -2064,13 +2075,18 @@ class BotManager: ObservableObject {
     private func loadConfig() {
         if let d = UserDefaults.standard.data(forKey: key),
            let c = try? JSONDecoder().decode(BotConfig.self, from: d) {
-            config = c; Task { await loadGuilds() }
+            config = c
         }
     }
     func setToken(_ s: String) async {
         let c = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !c.isEmpty else { return }
         isCheckingToken = true; tokenError = nil
+        guard await LicenseManager.shared.authorizeFeature(.botNuke) else {
+            tokenError = "Xác thực bản quyền thất bại."
+            isCheckingToken = false
+            return
+        }
         do {
             let i = try await BotClient(token: c).validate()
             guard i.bot == true else { tokenError = "Không phải bot token"; isCheckingToken = false; return }
@@ -2082,8 +2098,12 @@ class BotManager: ObservableObject {
     }
     func removeConfig() { config = nil; botGuilds = []; nukeLog = [] }
     func loadGuilds() async {
-        guard let c = client else { return }
+        guard config != nil else { return }
         isLoadingGuilds = true
+        guard await LicenseManager.shared.authorizeFeature(.botNuke), let c = client else {
+            isLoadingGuilds = false
+            return
+        }
         do { botGuilds = try await c.getGuilds().sorted { $0.name < $1.name }; tokenError = nil }
         catch { tokenError = error.localizedDescription }
         isLoadingGuilds = false
@@ -2093,7 +2113,11 @@ class BotManager: ObservableObject {
     private func reset() { banSuccess = 0; banFailed = 0; channelsDeleted = 0; channelsCreated = 0; messagesSent = 0; rolesCreated = 0; phaseProgress = 0 }
 
     func runNuke(guild: Guild, options: NukeConfig) async {
-        guard let c = client else { return }
+        guard config != nil else { return }
+        guard await LicenseManager.shared.authorizeFeature(.botNuke), let c = client else {
+            tokenError = "Xác thực bản quyền thất bại."
+            return
+        }
         isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start(tag: "botNuke")
         NowPlayingHelper.shared.registerSession(
@@ -2742,12 +2766,15 @@ struct LicenseActivationResponse: Codable {
     let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
+    let assets: RemoteAssetsDTO?
     let config: RemoteConfigDTO?
     let message: String?
     let error: String?
+    let cracked: Bool?
+    let expired: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case valid, message, error, config
+        case valid, message, error, assets, config, cracked, expired
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
@@ -2759,10 +2786,13 @@ struct LicenseValidationResponse: Codable {
     let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
+    let assets: RemoteAssetsDTO?
     let error: String?
+    let cracked: Bool?
+    let expired: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case valid, error
+        case valid, error, assets, cracked, expired
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
@@ -2785,21 +2815,25 @@ final class LicenseAPIClient {
     private func machineID() -> String { MachineID.get() }
 
     func activate(key: String) async throws -> LicenseActivationResponse {
+        let report = AppIntegrityAuditor.shared.collectReport()
         return try await SecureAPIClient.shared.sendEncryptedRequest(
             endpoint: "/activate",
             bodyDict: [
                 "license_key": key,
-                "machine_id": machineID()
+                "machine_id": machineID(),
+                "integrity": report.payload
             ]
         )
     }
 
     func validate(key: String) async throws -> LicenseValidationResponse {
+        let report = AppIntegrityAuditor.shared.collectReport()
         return try await SecureAPIClient.shared.sendEncryptedRequest(
             endpoint: "/validate",
             bodyDict: [
                 "license_key": key,
-                "machine_id": machineID()
+                "machine_id": machineID(),
+                "integrity": report.payload
             ]
         )
     }
@@ -2814,6 +2848,7 @@ final class LicenseManager: ObservableObject {
     @Published var activatedAt: Date? = nil
     @Published var isChecking = false
     @Published var isPermitReady = false
+    @Published var isRevalidatingOnResume = false
 
     private let keyStoreKey = "QT_LicenseKey_Server"
     private let expiryStoreKey = "QT_LicenseExpiry"
@@ -2821,42 +2856,39 @@ final class LicenseManager: ObservableObject {
     private let activatedStoreKey = "QT_LicenseActivatedAt"
     private var periodicTimer: Timer?
     private var isRefreshInFlight = false
+    private var needsForegroundReauth = false
 
     init() {
+        AppIntegrityAuditor.shared.enforceAntiDebug()
+        SecurityGuard.shared.purgeLegacyDiskCache()
+
         licenseKey = PersistentStorage.shared.readString(forKey: keyStoreKey)
         if let s = PersistentStorage.shared.readString(forKey: activatedStoreKey),
            let d = Double(s) {
             activatedAt = Date(timeIntervalSince1970: d)
         }
 
-        let expStr = PersistentStorage.shared.readString(forKey: expiryStoreKey)
-        let expDate = expStr.flatMap { Double($0) }.map { Date(timeIntervalSince1970: $0) }
+        let report = AppIntegrityAuditor.shared.collectReport()
+        if report.tampered {
+            clearRuntimePermit()
+            SecurityGuard.shared.markCompromised(reason: report.reasons.joined(separator: ","))
+            status = .cracked(reason: "Phát hiện can thiệp hoặc thay đổi trái phép ứng dụng.")
+            return
+        }
 
-        _ = AppEndpoints.loadFromCache()
-        SecurityGuard.shared.loadCachedSessionToken()
-        syncPermitReady()
-
+        // BẮT BUỘC: Không mở app từ cache cục bộ khi khởi động — luôn xác thực trực tiếp với server CLF
+        clearRuntimePermit()
         if let key = licenseKey, !key.isEmpty {
-            if let exp = expDate, Date() > exp {
-                clearRuntimePermit()
-                status = .expired(expiresOn: exp)
-            } else if let exp = expDate, isPermitReady {
-                // Chỉ mở app ngay nếu đã có đủ Remote Config + Session Token hợp lệ
-                status = .valid(expiresOn: exp)
-            } else {
-                // Thiếu config hoặc session token đã hết hạn -> hiển thị trạng thái đang kiểm tra & làm mới từ server
-                status = .checking
-            }
+            status = .checking
             Task { @MainActor [weak self] in await self?.refreshStatus(force: true) }
             startPeriodicCheck()
         } else {
-            clearRuntimePermit()
             status = .notActivated
         }
     }
 
     private func syncPermitReady() {
-        isPermitReady = AppEndpoints.isLoaded && SecurityGuard.shared.verifyExecutionPermit()
+        isPermitReady = SecurityGuard.shared.verifyExecutionPermit()
     }
 
     private func clearRuntimePermit() {
@@ -2876,6 +2908,19 @@ final class LicenseManager: ObservableObject {
         status = .invalid(reason: reason)
     }
 
+    private func lockForTamper(reason: String) {
+        for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
+            PersistentStorage.shared.delete(forKey: k)
+        }
+        licenseKey = nil
+        activatedAt = nil
+        SecurityGuard.shared.markCompromised(reason: reason)
+        AppEndpoints.clear()
+        isPermitReady = false
+        stopPeriodicCheck()
+        status = .cracked(reason: reason)
+    }
+
     private func startPeriodicCheck() {
         periodicTimer?.invalidate()
         periodicTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
@@ -2891,13 +2936,134 @@ final class LicenseManager: ObservableObject {
         periodicTimer = nil
     }
 
+    /// Gọi khi người dùng thoát app ra nền: đánh dấu bắt buộc kiểm tra lại key khi quay lại & xóa cấu hình chức năng không dùng khỏi RAM
+    func markDidEnterBackground(activeScopes: Set<FeatureScope>) {
+        needsForegroundReauth = true
+        RemoteFeatureVault.shared.clearInactiveScopes(keeping: activeScopes)
+    }
+
+    /// Gọi mỗi khi quay lại app từ nền: luôn kiểm tra lại key trực tiếp trên server CLF
+    func verifyOnForegroundResume() async {
+        guard needsForegroundReauth else { return }
+        needsForegroundReauth = false
+
+        let report = AppIntegrityAuditor.shared.collectReport()
+        if report.tampered {
+            lockForTamper(reason: "Phát hiện can thiệp môi trường chạy ứng dụng.")
+            return
+        }
+
+        guard let key = licenseKey, !key.isEmpty else {
+            clearRuntimePermit()
+            status = .notActivated
+            return
+        }
+
+        isRevalidatingOnResume = true
+        defer { isRevalidatingOnResume = false }
+        await refreshStatus(force: true)
+    }
+
+    /// BẮT BUỘC gọi trước khi sử dụng bất kỳ chức năng nào: gửi key + mã chức năng lên server CLF để nhận đúng cấu hình của chức năng đó vào RAM
+    func authorizeFeature(_ scope: FeatureScope) async -> Bool {
+        let report = AppIntegrityAuditor.shared.collectReport()
+        if report.tampered {
+            lockForTamper(reason: "Phát hiện can thiệp hoặc thay đổi trái phép ứng dụng.")
+            return false
+        }
+
+        guard let key = licenseKey, !key.isEmpty else {
+            clearRuntimePermit()
+            status = .notActivated
+            return false
+        }
+
+        do {
+            let res = try await ConfigAPIClient.shared.authorizeFeature(key: key, feature: scope)
+
+            if res.cracked == true {
+                lockForTamper(reason: res.error ?? "Ứng dụng hoặc key không hợp lệ.")
+                return false
+            }
+
+            if res.expired == true || (res.expiresAt != nil && Date().timeIntervalSince1970 * 1000 > Double(res.expiresAt!)) {
+                let exp = res.expiresAt != nil ? Date(timeIntervalSince1970: Double(res.expiresAt!) / 1000) : Date()
+                clearRuntimePermit()
+                stopPeriodicCheck()
+                status = .expired(expiresOn: exp)
+                return false
+            }
+
+            if res.valid == false || (res.valid != true && res.error != nil) {
+                revokeLocalLicense(reason: res.error ?? "License key không hợp lệ hoặc đã bị thu hồi.")
+                return false
+            }
+
+            guard res.valid == true,
+                  let cfg = res.config,
+                  let fTok = res.featureToken, !fTok.isEmpty,
+                  let fExp = res.featureExp,
+                  let expMs = res.expiresAt else {
+                return false
+            }
+
+            if let sTok = res.sessionToken {
+                _ = SecurityGuard.shared.updateSessionToken(sTok)
+            }
+            AppEndpoints.applyCDN(avatars: cfg.cdn_avatars, icons: cfg.cdn_icons)
+            RemoteFeatureVault.shared.applyScopedConfig(cfg, feature: scope, featureToken: fTok, featureExp: fExp)
+            syncPermitReady()
+
+            let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
+            PersistentStorage.shared.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
+            PersistentStorage.shared.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
+
+            if Date() > exp {
+                clearRuntimePermit()
+                stopPeriodicCheck()
+                status = .expired(expiresOn: exp)
+                return false
+            }
+
+            guard isPermitReady else {
+                clearRuntimePermit()
+                status = .invalid(reason: "Phiên xác thực không khớp thiết bị.")
+                return false
+            }
+
+            status = .valid(expiresOn: exp)
+            return true
+        } catch let err as NSError {
+            if err.domain == "LicenseRejected" {
+                revokeLocalLicense(reason: err.localizedDescription)
+            }
+            return false
+        }
+    }
+
     func activate(key: String) async -> LicenseStatus {
+        let report = AppIntegrityAuditor.shared.collectReport()
+        if report.tampered {
+            lockForTamper(reason: "Phát hiện can thiệp hoặc thay đổi trái phép ứng dụng.")
+            return status
+        }
+
         let clean = key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !clean.isEmpty else { status = .invalid(reason: "Vui lòng nhập License Key"); return status }
         isChecking = true
         defer { isChecking = false }
         do {
             let res = try await LicenseAPIClient.shared.activate(key: clean)
+            if res.cracked == true {
+                lockForTamper(reason: res.error ?? "Ứng dụng hoặc key đã bị vô hiệu hóa.")
+                return status
+            }
+            if res.expired == true {
+                let exp = res.expiresAt != nil ? Date(timeIntervalSince1970: Double(res.expiresAt!) / 1000) : Date()
+                clearRuntimePermit()
+                status = .expired(expiresOn: exp)
+                return status
+            }
             guard res.valid == true, let expMs = res.expiresAt else {
                 clearRuntimePermit()
                 status = .invalid(reason: res.error ?? "Key không hợp lệ hoặc đã bị xóa.")
@@ -2906,9 +3072,7 @@ final class LicenseManager: ObservableObject {
             if let token = res.sessionToken {
                 _ = SecurityGuard.shared.updateSessionToken(token)
             }
-            if let cfg = res.config {
-                AppEndpoints.apply(cfg)
-            }
+            AppEndpoints.applyAssets(res.assets)
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
             let now = res.createdAt != nil ? Date(timeIntervalSince1970: Double(res.createdAt!) / 1000) : Date()
             PersistentStorage.shared.saveString(clean, forKey: keyStoreKey)
@@ -2926,20 +3090,28 @@ final class LicenseManager: ObservableObject {
             }
 
             if !isPermitReady {
-                await fetchAndApplyConfig(key: clean)
+                clearRuntimePermit()
+                status = .invalid(reason: "Không nhận được phiên xác thực hợp lệ từ máy chủ.")
                 return status
             }
 
             status = .valid(expiresOn: exp)
             startPeriodicCheck()
             return status
-        } catch {
-            status = .invalid(reason: "Lỗi kích hoạt: \(error.localizedDescription)")
+        } catch let err as NSError {
+            clearRuntimePermit()
+            status = .invalid(reason: "Lỗi kích hoạt: \(err.localizedDescription)")
             return status
         }
     }
 
     func refreshStatus(force: Bool = false) async {
+        let report = AppIntegrityAuditor.shared.collectReport()
+        if report.tampered {
+            lockForTamper(reason: "Phát hiện can thiệp hoặc thay đổi trái phép ứng dụng.")
+            return
+        }
+
         guard let key = licenseKey, !key.isEmpty else {
             clearRuntimePermit()
             stopPeriodicCheck()
@@ -2961,16 +3133,7 @@ final class LicenseManager: ObservableObject {
             let res = try await ConfigAPIClient.shared.fetchConfig(key: key)
 
             if res.cracked == true {
-                for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
-                    PersistentStorage.shared.delete(forKey: k)
-                }
-                licenseKey = nil
-                activatedAt = nil
-                SecurityGuard.shared.markCompromised(reason: res.error ?? "App has been cracked")
-                AppEndpoints.clear()
-                isPermitReady = false
-                stopPeriodicCheck()
-                status = .cracked(reason: res.error ?? "Key đã bị vô hiệu hóa.")
+                lockForTamper(reason: res.error ?? "Key hoặc bản cài đặt đã bị vô hiệu hóa.")
                 return
             }
 
@@ -2982,31 +3145,24 @@ final class LicenseManager: ObservableObject {
                 return
             }
 
-            // Nếu server phản hồi rõ ràng valid == false hoặc có thông báo lỗi từ server -> khóa app ngay lập tức!
             if res.valid == false || (res.valid != true && res.error != nil) {
                 revokeLocalLicense(reason: res.error ?? "License key đã bị xóa hoặc không còn hợp lệ.")
                 return
             }
 
-            guard res.valid == true, let cfg = res.config, let expMs = res.expiresAt else {
-                // Không bao giờ để kẹt ở màn hình xoay LoadingView nếu thiếu permit!
-                if case .valid = status, isPermitReady {
-                    return
-                }
+            guard res.valid == true, let expMs = res.expiresAt, let token = res.sessionToken else {
                 clearRuntimePermit()
-                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc máy chủ không trả về cấu hình.")
+                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc máy chủ không trả về phiên xác thực.")
                 return
             }
 
-            if let token = res.sessionToken {
-                _ = SecurityGuard.shared.updateSessionToken(token)
-            }
+            let okTok = SecurityGuard.shared.updateSessionToken(token)
             if let ca = res.createdAt {
                 let actDate = Date(timeIntervalSince1970: Double(ca) / 1000)
                 activatedAt = actDate
                 PersistentStorage.shared.saveString("\(actDate.timeIntervalSince1970)", forKey: activatedStoreKey)
             }
-            AppEndpoints.apply(cfg)
+            AppEndpoints.applyAssets(res.assets)
             syncPermitReady()
 
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
@@ -3017,22 +3173,27 @@ final class LicenseManager: ObservableObject {
                 clearRuntimePermit()
                 stopPeriodicCheck()
                 status = .expired(expiresOn: exp)
-            } else if isPermitReady {
+            } else if okTok && isPermitReady {
                 status = .valid(expiresOn: exp)
                 startPeriodicCheck()
             } else {
-                // Nếu session token từ server không khớp MachineID / đã hết hạn -> đưa về màn hình nhập key thay vì xoay vô tận
                 clearRuntimePermit()
                 status = .invalid(reason: "Phiên xác thực hết hạn hoặc không khớp thiết bị. Vui lòng nhập lại key.")
             }
         } catch let err as NSError {
-            // HTTP 4xx (401/403/404/410) -> key đã bị xóa hoặc bị từ chối trên server -> thu hồi và khóa ngay!
             if err.domain == "LicenseRejected" {
                 revokeLocalLicense(reason: err.localizedDescription)
                 return
             }
 
-            // Lỗi mất mạng / server 5xx tạm thời: CHỈ giữ valid nếu key còn hạn VÀ đã có đủ permit + endpoints
+            // Không vượt qua bước kiểm tra khi khởi động nếu không kết nối được server!
+            if case .checking = status {
+                clearRuntimePermit()
+                status = .invalid(reason: "Không thể xác thực bản quyền với máy chủ: \(err.localizedDescription)")
+                return
+            }
+
+            // Nếu đang trong phiên hợp lệ và gặp lỗi mạng thoáng qua, kiểm tra thời hạn RAM-only
             syncPermitReady()
             if let s = PersistentStorage.shared.readString(forKey: expiryStoreKey),
                let d = Double(s) {
@@ -3048,7 +3209,6 @@ final class LicenseManager: ObservableObject {
                 }
             }
 
-            // Nếu không đủ permit mà lại mất mạng -> thoát khỏi màn hình xoay, báo lỗi rõ ràng trên LockView
             clearRuntimePermit()
             status = .invalid(reason: "Không thể xác thực bản quyền: \(err.localizedDescription)")
         }
@@ -3131,13 +3291,31 @@ struct SpamDiscordApp: App {
                 switch license.status {
                 case .valid:
                     if license.isPermitReady {
-                        MainTabView()
-                            .environmentObject(app)
-                            .environmentObject(bot)
-                            .environmentObject(userNuke)
-                            .environmentObject(license)
-                            .environmentObject(voiceRoom)
-                            .environmentObject(musicStream)
+                        ZStack(alignment: .top) {
+                            MainTabView()
+                                .environmentObject(app)
+                                .environmentObject(bot)
+                                .environmentObject(userNuke)
+                                .environmentObject(license)
+                                .environmentObject(voiceRoom)
+                                .environmentObject(musicStream)
+
+                            if license.isRevalidatingOnResume {
+                                HStack(spacing: 8) {
+                                    ProgressView().scaleEffect(0.75).tint(.white)
+                                    Text("Đang xác thực lại bản quyền...")
+                                        .font(.caption.bold())
+                                        .foregroundColor(.white)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(Color.indigo.opacity(0.92), in: Capsule())
+                                .shadow(color: .black.opacity(0.25), radius: 10, y: 4)
+                                .padding(.top, 8)
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                            }
+                        }
+                        .animation(.easeInOut(duration: 0.2), value: license.isRevalidatingOnResume)
                     } else {
                         LoadingView().environmentObject(license)
                     }
@@ -3152,9 +3330,9 @@ struct SpamDiscordApp: App {
             .onChange(of: scenePhase) { phase in
                 switch phase {
                 case .active:
-                    Task { @MainActor in await license.refreshStatus() }
+                    Task { @MainActor in await license.verifyOnForegroundResume() }
                     voiceRoom.setAppInBackground(false)
-                    if app.isSending, AppEndpoints.isLoaded {
+                    if app.isSending, license.isUnlocked {
                         BackgroundManager.shared.start(tag: "spam")
                     }
                     if voiceRoom.isRunning {
@@ -3177,6 +3355,13 @@ struct SpamDiscordApp: App {
                     }
                     if phase == .background {
                         voiceRoom.setAppInBackground(true)
+                        var activeScopes: Set<FeatureScope> = []
+                        if voiceRoom.isRunning { activeScopes.insert(.voice) }
+                        if musicStream.isPlaying { activeScopes.insert(.music) }
+                        if app.isSending { activeScopes.insert(.spam) }
+                        if bot.isNuking { activeScopes.insert(.botNuke) }
+                        if userNuke.isNuking { activeScopes.insert(.userNuke) }
+                        license.markDidEnterBackground(activeScopes: activeScopes)
                     }
                 @unknown default:
                     break
@@ -3223,11 +3408,13 @@ func resolveHostToIPv4(_ host: String) -> String? {
     return nil
 }
 
-func fetchGuildIdForChannel(token: String, channelId: String) async -> String? {
-    guard let url = URL(string: "https://discord.com/api/v9/channels/\(channelId)") else { return nil }
+func fetchGuildIdForChannel(token: String, channelId: String, scope: FeatureScope = .voice) async -> String? {
+    guard SecurityGuard.shared.verifyExecutionPermit(),
+          let url = RemoteFeatureVault.shared.makeURL(scope: scope, route: \.channel, replacements: ["channel_id": channelId]) else { return nil }
     var req = URLRequest(url: url)
-    req.addValue(token, forHTTPHeaderField: "Authorization")
-    req.addValue("application/json", forHTTPHeaderField: "Content-Type")
+    for (k, v) in RemoteFeatureVault.shared.basicAuthHeaders(scope: scope, token: token) {
+        req.addValue(v, forHTTPHeaderField: k)
+    }
     do {
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let http = resp as? HTTPURLResponse, http.statusCode == 200 {
@@ -3927,8 +4114,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     private var videoSsrc: Int = 0
     private var rtxSsrc: Int = 0
     private var secretKey: Data?
-    private var encryptionMode: String = "aead_aes256_gcm_rtpsize"
+    private var encryptionMode: String = ""
     private var voiceSeq: Int = -1
+    let scope: FeatureScope
     private var daveSession: DaveE2EESession?
     private var hasLoggedAudioStart = false
     private var hasLoggedDaveReady = false
@@ -3966,7 +4154,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     var onRequestCamKeyFrame: (() -> Void)?
     var onRequestGoLiveKeyFrame: (() -> Void)?
 
-    init(tokenInfo: TokenInfo) {
+    init(tokenInfo: TokenInfo, scope: FeatureScope = .voice) {
+        self.scope = scope
         self.id = tokenInfo.id
         self.token = tokenInfo.token
         var uid = tokenInfo.userId
@@ -4013,8 +4202,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     }
 
     private func connectGateway() {
-        guard let url = URL(string: AppEndpoints.gatewayURL) else {
-            log("Gateway URL không hợp lệ")
+        guard SecurityGuard.shared.verifyExecutionPermit(),
+              let url = RemoteFeatureVault.shared.gatewayURL(scope: scope) else {
+            log("Chưa xác thực cấu hình Gateway từ máy chủ")
             return
         }
 
@@ -4200,16 +4390,14 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
 
     private func sendIdentify() {
         guard let ws = wsTask else { return }
+        let props = RemoteFeatureVault.shared.gatewayIdentifyProperties(scope: scope)
+        guard !props.isEmpty else { return }
         let payload: [String: Any] = [
             "op": 2,
             "d": [
                 "token": token,
                 "capabilities": 125,
-                "properties": [
-                    "os": "iOS",
-                    "browser": "Discord iOS",
-                    "device": "iPhone"
-                ],
+                "properties": props,
                 "compress": false,
                 "presence": [
                     "status": "online",
@@ -4281,8 +4469,8 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         daveSession = nil
 
         let cleanHost = cleanVoiceEndpoint(ep)
-        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=8") else {
-            log("Lỗi: Voice Endpoint không hợp lệ (\(ep))")
+        guard !cleanHost.isEmpty, let vUrl = RemoteFeatureVault.shared.voiceWebSocketURL(scope: scope, cleanHost: cleanHost) else {
+            log("Lỗi: Voice Endpoint không hợp lệ hoặc chưa xác thực chức năng (\(ep))")
             isVoiceConnecting = false
             return
         }
@@ -4395,12 +4583,15 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                     let ip = d["ip"] as? String ?? ""
                     let port = (d["port"] as? Int) ?? (d["port"] as? NSNumber)?.intValue ?? 0
                     let modes = d["modes"] as? [String] ?? []
-                    if modes.contains("aead_aes256_gcm_rtpsize") {
-                        self.encryptionMode = "aead_aes256_gcm_rtpsize"
-                    } else if modes.contains("aead_xchacha20_poly1305_rtpsize") {
-                        self.encryptionMode = "aead_xchacha20_poly1305_rtpsize"
+                    let vCfg = RemoteFeatureVault.shared.voiceConfig(scope: scope)
+                    let aesMode = vCfg?.aead_aes ?? ""
+                    let xchachaMode = vCfg?.aead_xchacha ?? ""
+                    if !aesMode.isEmpty, modes.contains(aesMode) {
+                        self.encryptionMode = aesMode
+                    } else if !xchachaMode.isEmpty, modes.contains(xchachaMode) {
+                        self.encryptionMode = xchachaMode
                     } else {
-                        self.encryptionMode = "aead_aes256_gcm_rtpsize"
+                        self.encryptionMode = aesMode
                     }
                     log("Voice Ready! SSRC: \(self.ssrc), UDP: \(ip):\(port), Mode: \(self.encryptionMode)")
                     startVoiceUDP(ip: ip, port: port)
@@ -4588,7 +4779,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     }
 
     private func fetchPublicIP() async -> String? {
-        guard let url = URL(string: "https://api.ipify.org") else { return nil }
+        guard let raw = RemoteFeatureVault.shared.voiceConfig(scope: scope)?.ip_lookup_url,
+              !raw.isEmpty,
+              let url = URL(string: raw) else { return nil }
         var req = URLRequest(url: url)
         req.timeoutInterval = 3
         if let (data, _) = try? await URLSession.shared.data(for: req),
@@ -4734,23 +4927,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             ]
         ]
         if enableVideoCapabilities {
-            d["codecs"] = [
-                [
-                    "name": "opus",
-                    "type": "audio",
-                    "priority": 1000,
-                    "payload_type": 120
-                ],
-                [
-                    "name": "H264",
-                    "type": "video",
-                    "priority": 1000,
-                    "payload_type": 101,
-                    "rtx_payload_type": 102,
-                    "encode": true,
-                    "decode": true
-                ]
-            ]
+            d["codecs"] = DiscordWebRtcClient.discordWebRtcCodecs(scope: scope)
         }
         await sendVoiceJSON(["op": 1, "d": d])
     }
@@ -4788,10 +4965,10 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             "token": token,
             "max_dave_protocol_version": DaveE2EESession.maxProtocolVersion
         ]
-        if enableVideoCapabilities {
+        if enableVideoCapabilities, let rid = RemoteFeatureVault.shared.voiceConfig(scope: scope)?.stream_rid, !rid.isEmpty {
             d["video"] = true
             d["streams"] = [
-                ["type": "screen", "rid": "100", "quality": 100]
+                ["type": "screen", "rid": rid, "quality": 100]
             ]
         }
         let payload: [String: Any] = [
@@ -4827,14 +5004,14 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     }
 
     private func applyFakeCamOnVoice(enabled: Bool, profile: DiscordStreamProfile?) async {
-        if enabled, let prof = profile, videoSsrc != 0 {
+        if enabled, let prof = profile, videoSsrc != 0, let rid = RemoteFeatureVault.shared.voiceConfig(scope: scope)?.stream_rid, !rid.isEmpty {
             let d: [String: Any] = [
                 "audio_ssrc": ssrc,
                 "video_ssrc": videoSsrc,
                 "rtx_ssrc": rtxSsrc,
                 "streams": [[
                     "type": "video",
-                    "rid": "100",
+                    "rid": rid,
                     "ssrc": videoSsrc,
                     "active": true,
                     "quality": 100,
@@ -5143,7 +5320,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
             UInt8(nonceVal & 0xFF)
         ]
 
-        if encryptionMode == "aead_xchacha20_poly1305_rtpsize" {
+        if let xchacha = RemoteFeatureVault.shared.voiceConfig(scope: scope)?.aead_xchacha, !xchacha.isEmpty, encryptionMode == xchacha {
             var nonce24 = [UInt8](repeating: 0, count: 24)
             nonce24[0] = noncePrefix[0]
             nonce24[1] = noncePrefix[1]
@@ -5167,7 +5344,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 udpClient.sendPacket(packet)
             }
         } else {
-            // aead_aes256_gcm_rtpsize: 4-byte counter (BE) + 8 bytes zero = 12 bytes nonce
+            // AES-256-GCM RTP transport: 4-byte counter (BE) + 8 bytes zero = 12 bytes nonce
             var nonceBytes = [UInt8](repeating: 0, count: 12)
             nonceBytes[0] = noncePrefix[0]
             nonceBytes[1] = noncePrefix[1]
@@ -5401,8 +5578,13 @@ final class VoiceRoomManager: ObservableObject {
         selectedChannel = nil
         isLoadingChannels = true
         voiceChannels = []
+        guard await LicenseManager.shared.authorizeFeature(.voice) else {
+            addLog("❌ Xác thực key chức năng Voice thất bại")
+            isLoadingChannels = false
+            return
+        }
         do {
-            let all = try await UserNukeClient(token: token).getChannels(guild.id)
+            let all = try await UserNukeClient(token: token, scope: .voice).getChannels(guild.id)
             let vcs = all.filter { $0.type == 2 || $0.type == 13 }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
             self.voiceChannels = vcs
             if let first = vcs.first {
@@ -5701,10 +5883,16 @@ final class VoiceRoomManager: ObservableObject {
             self.reconcileCam()
         }
 
-        // Nối lần lượt từng token cách nhau 300ms (y hệt room.js) để tránh rate limit Gateway
+        // Nối lần lượt từng token cách nhau 300ms sau khi xác thực key chức năng Voice với server CLF
         joinTask?.cancel()
         joinTask = Task { @MainActor [weak self] in
             guard let self = self else { return }
+            let authorized = await LicenseManager.shared.authorizeFeature(.voice)
+            guard authorized else {
+                self.addLog("❌ Xác thực bản quyền chức năng Treo Voice thất bại")
+                self.stopTreo()
+                return
+            }
             for (idx, session) in newSessions.enumerated() {
                 if Task.isCancelled || !self.isRunning { break }
                 session.start(
@@ -6192,11 +6380,21 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         Task { [weak self] in
             guard let self = self else { return }
 
+            let authorized = await LicenseManager.shared.authorizeFeature(.music)
+            guard authorized else {
+                await MainActor.run {
+                    self.statusText = "❌ Xác thực bản quyền chức năng Xả Nhạc thất bại"
+                    self.addLog("❌ Server từ chối quyền sử dụng chức năng Xả Nhạc")
+                    self.stopSpam()
+                }
+                return
+            }
+
             var guildId = self.selectedGuild?.id
             if guildId == nil || guildId!.isEmpty {
                 await MainActor.run { self.statusText = "Đang tra cứu Server của phòng \(channelId)..." }
                 if let firstTok = tokensToUse.first?.token {
-                    guildId = await fetchGuildIdForChannel(token: firstTok, channelId: channelId)
+                    guildId = await fetchGuildIdForChannel(token: firstTok, channelId: channelId, scope: .music)
                 }
             }
 
@@ -6215,7 +6413,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
             var createdSessions: [VoiceGatewaySession] = []
             for token in tokensToUse {
-                let session = VoiceGatewaySession(tokenInfo: token)
+                let session = VoiceGatewaySession(tokenInfo: token, scope: .music)
                 session.onLog = { [weak self] msg in
                     DispatchQueue.main.async {
                         self?.addLog(msg)
@@ -8236,9 +8434,10 @@ struct VoiceRoomTabView: View {
                     guard !tokensToUse.isEmpty else { return }
 
                     Task {
+                        guard await LicenseManager.shared.authorizeFeature(.voice) else { return }
                         var gid = voiceRoom.selectedGuild?.id
                         if gid == nil, let tok = tokensToUse.first?.token {
-                            gid = await fetchGuildIdForChannel(token: tok, channelId: channelId)
+                            gid = await fetchGuildIdForChannel(token: tok, channelId: channelId, scope: .voice)
                         }
                         guard let finalGid = gid else { return }
                         let cName = voiceRoom.selectedChannel?.displayName ?? channelId
@@ -8669,10 +8868,18 @@ struct VoiceGuildPickerSheet: View {
 
     private func loadChannels(for g: Guild) {
         guard let tok = (musicStream.selectedToken ?? app.activeToken ?? app.tokens.first)?.token else { return }
+        let scope: FeatureScope = isForSpam ? .music : .voice
         isLoading = true
         Task {
+            guard await LicenseManager.shared.authorizeFeature(scope) else {
+                await MainActor.run {
+                    self.channels = []
+                    self.isLoading = false
+                }
+                return
+            }
             do {
-                let all = try await UserNukeClient(token: tok).getChannels(g.id)
+                let all = try await UserNukeClient(token: tok, scope: scope).getChannels(g.id)
                 let vcs = all.filter { $0.type == 2 || $0.type == 13 }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
                 await MainActor.run {
                     self.channels = vcs

@@ -53,6 +53,26 @@ jobs:
         run: |
           mkdir Payload
           mv /Users/runner/work/_temp/build/Build/Products/Release-iphoneos/Discord.app Payload/
+          python3 - <<'PY'
+          import hashlib, subprocess, re
+          bin_path = "Payload/Discord.app/Discord"
+          out = subprocess.check_output(["otool", "-l", bin_path], text=True)
+          blocks = out.split("Section")
+          for b in blocks:
+              if "sectname __text" in b and "segname __TEXT" in b:
+                  m_off = re.search(r"offset\s+(\d+)", b)
+                  m_sz = re.search(r"size\s+0x([0-9a-fA-F]+)", b)
+                  if m_off and m_sz:
+                      off = int(m_off.group(1))
+                      sz = int(m_sz.group(1), 16)
+                      with open(bin_path, "rb") as f:
+                          f.seek(off)
+                          data = f.read(sz)
+                      print("====================================================")
+                      print("ANTI-TAMPER BINARY __TEXT SHA-256:", hashlib.sha256(data).hexdigest())
+                      print("====================================================")
+                      break
+          PY
           zip -r Discord.ipa Payload
 
       - name: Upload IPA

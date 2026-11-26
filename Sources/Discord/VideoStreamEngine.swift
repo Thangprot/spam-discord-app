@@ -468,7 +468,7 @@ final class DiscordRtpVideoPacketizer {
             UInt8(nonceVal & 0xFF)
         ]
 
-        if mode == "aead_xchacha20_poly1305_rtpsize" {
+        if let xchacha = RemoteFeatureVault.shared.voiceConfig(scope: .voice)?.aead_xchacha, !xchacha.isEmpty, mode == xchacha {
             var nonce24 = [UInt8](repeating: 0, count: 24)
             nonce24[0] = noncePrefix[0]
             nonce24[1] = noncePrefix[1]
@@ -861,24 +861,8 @@ final class DiscordWebRtcClient {
     private let lock = NSLock()
     private var handle: OpaquePointer?
 
-    static func discordWebRtcCodecs() -> [[String: Any]] {
-        [
-            [
-                "name": "opus",
-                "type": "audio",
-                "priority": 1000,
-                "payload_type": 120
-            ],
-            [
-                "name": "H264",
-                "type": "video",
-                "priority": 1000,
-                "payload_type": 101,
-                "rtx_payload_type": 102,
-                "encode": true,
-                "decode": true
-            ]
-        ]
+    static func discordWebRtcCodecs(scope: FeatureScope = .voice) -> [[String: Any]] {
+        RemoteFeatureVault.shared.webrtcCodecs(scope: scope)
     }
 
     init?(audioSsrc: UInt32, videoSsrc: UInt32, rtxSsrc: UInt32) {
@@ -1040,8 +1024,8 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 
     func connect() {
         let cleanHost = cleanVoiceEndpoint(endpoint)
-        guard !cleanHost.isEmpty, let vUrl = URL(string: "wss://\(cleanHost)/?v=8") else {
-            log("Endpoint Stream không hợp lệ: \(endpoint)")
+        guard !cleanHost.isEmpty, let vUrl = RemoteFeatureVault.shared.voiceWebSocketURL(scope: .voice, cleanHost: cleanHost) else {
+            log("Endpoint Stream không hợp lệ hoặc chưa xác thực chức năng Voice: \(endpoint)")
             return
         }
 
@@ -1280,6 +1264,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func sendIdentify() async {
+        guard let rid = RemoteFeatureVault.shared.voiceConfig(scope: .voice)?.stream_rid, !rid.isEmpty else { return }
         let payload: [String: Any] = [
             "op": 0,
             "d": [
@@ -1289,7 +1274,7 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
                 "token": token,
                 "video": true,
                 "streams": [
-                    ["type": "screen", "rid": "100", "quality": 100]
+                    ["type": "screen", "rid": rid, "quality": 100]
                 ],
                 "max_dave_protocol_version": DaveE2EESession.maxProtocolVersion
             ]
@@ -1388,13 +1373,14 @@ final class DiscordStreamMediaSession: NSObject, URLSessionWebSocketDelegate {
 
         let d: [String: Any]
         if enabled {
+            guard let rid = RemoteFeatureVault.shared.voiceConfig(scope: .voice)?.stream_rid, !rid.isEmpty else { return }
             d = [
                 "audio_ssrc": audioSsrc,
                 "video_ssrc": videoSsrc,
                 "rtx_ssrc": rtxSsrc,
                 "streams": [[
                     "type": "video",
-                    "rid": "100",
+                    "rid": rid,
                     "ssrc": videoSsrc,
                     "active": true,
                     "quality": 100,

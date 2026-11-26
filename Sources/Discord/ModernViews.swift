@@ -456,11 +456,18 @@ struct LicenseAdminInfoView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("API ENDPOINT")
+                            Text("INTEGRITY (__TEXT SHA-256)")
                                 .font(.caption2.bold())
                                 .foregroundStyle(.secondary)
-                            Text(LicenseAPIClient.shared.baseURL)
-                                .font(.system(.caption, design: .monospaced))
+                            Text(AppIntegrityAuditor.shared.computeTextSectionHash())
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text("SOURCE SIG")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 4)
+                            Text(AppIntegrityAuditor.shared.computeSourceSignature())
+                                .font(.system(.caption2, design: .monospaced))
                                 .textSelection(.enabled)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1245,6 +1252,11 @@ struct SpamView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: Guild.self) { ChannelListView(guild: $0) }
+            .task {
+                if app.multiGuilds.isEmpty && !app.selectedTokenIds.isEmpty {
+                    await app.recomputeMultiGuilds()
+                }
+            }
         }
     }
 }
@@ -1893,6 +1905,11 @@ struct BotNukeView: View {
                         await bot.runNuke(guild: g, options: nukeConfig)
                     }
                 }
+            }
+        }
+        .task {
+            if bot.config != nil && bot.botGuilds.isEmpty {
+                await bot.loadGuilds()
             }
         }
     }
