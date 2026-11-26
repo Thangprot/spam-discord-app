@@ -575,88 +575,366 @@ struct NukeConfig {
 }
 
 // ==========================================
-// MARK: - NOW PLAYING HELPER (LOCK SCREEN)
+// MARK: - NOW PLAYING HELPER (MULTI-FEATURE iPHONE LOCK SCREEN / CONTROL CENTER / DYNAMIC ISLAND)
 // ==========================================
-final class NowPlayingHelper {
+@MainActor
+final class NowPlayingHelper: ObservableObject {
     static let shared = NowPlayingHelper()
-    private init() {}
-    private var isActive = false
-    private var onStopCB: (() -> Void)?
 
-    private lazy var defaultArtwork: MPMediaItemArtwork? = {
-        let size = CGSize(width: 512, height: 512)
-        let renderer = UIGraphicsImageRenderer(size: size)
-        let image = renderer.image { ctx in
-            UIColor(red: 0.08, green: 0.08, blue: 0.16, alpha: 1.0).setFill()
-            ctx.fill(CGRect(origin: .zero, size: size))
-            let config = UIImage.SymbolConfiguration(pointSize: 300, weight: .bold)
-            if let symbol = UIImage(systemName: "flame.fill", withConfiguration: config)?.withTintColor(.red, renderingMode: .alwaysOriginal) {
-                let symbolSize = symbol.size
-                let origin = CGPoint(x: (size.width - symbolSize.width) / 2, y: (size.height - symbolSize.height) / 2)
-                symbol.draw(at: origin)
+    @Published private(set) var currentSession: NowPlayingSessionState? = nil
+    @Published private(set) var activeCount: Int = 0
+    @Published private(set) var activeIndex: Int = 0
+    @Published var claimExclusiveNowPlaying: Bool {
+        didSet {
+            UserDefaults.standard.set(claimExclusiveNowPlaying, forKey: "QT_ExclusiveNowPlaying")
+            if BackgroundManager.shared.isKeepAliveActive {
+                BackgroundManager.shared.reconfigureAudioSession()
             }
-        }
-        return MPMediaItemArtwork(boundsSize: size) { _ in image }
-    }()
-
-    func start(onStop: (() -> Void)? = nil) {
-        isActive = true
-        onStopCB = onStop
-
-        UIApplication.shared.beginReceivingRemoteControlEvents()
-
-        let cc = MPRemoteCommandCenter.shared()
-        cc.playCommand.isEnabled = false
-        cc.nextTrackCommand.isEnabled = false
-        cc.previousTrackCommand.isEnabled = false
-        cc.togglePlayPauseCommand.isEnabled = false
-        cc.pauseCommand.removeTarget(nil)
-        cc.stopCommand.removeTarget(nil)
-
-        if onStop != nil {
-            cc.pauseCommand.isEnabled = true
-            cc.stopCommand.isEnabled = true
-            let handler: (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus = { [weak self] _ in
-                DispatchQueue.main.async { self?.onStopCB?() }
-                return .success
-            }
-            cc.pauseCommand.addTarget(handler: handler)
-            cc.stopCommand.addTarget(handler: handler)
-        } else {
-            cc.pauseCommand.isEnabled = false
-            cc.stopCommand.isEnabled = false
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.update(title: "Quoc Thang Tools", detail: "Đang chuẩn bị...")
         }
     }
 
-    func update(title: String, detail: String) {
-        guard isActive else { return }
-        var info: [String: Any] = [:]
-        info[MPMediaItemPropertyTitle] = title
-        info[MPMediaItemPropertyArtist] = detail
-        info[MPMediaItemPropertyAlbumTitle] = "Quoc Thang Tools"
-        info[MPMediaItemPropertyPlaybackDuration] = 0
-        info[MPMediaItemPropertyArtwork] = defaultArtwork
-        info[MPNowPlayingInfoPropertyIsLiveStream] = true
-        info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
-        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
-        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+    private var sessions: [NowPlayingFeature: NowPlayingSessionState] = [:]
+    private var focusedFeature: NowPlayingFeature? = nil
+    private var commandsInstalled = false
 
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-        if #available(iOS 16.0, *) {
-            MPNowPlayingInfoCenter.default().playbackState = .playing
+    private init() {
+        let ud = UserDefaults.standard
+        if ud.object(forKey: "QT_ExclusiveNowPlaying") == nil {
+            self.claimExclusiveNowPlaying = true
+        } else {
+            self.claimExclusiveNowPlaying = ud.bool(forKey: "QT_ExclusiveNowPlaying")
+        }
+    }
+
+    private var orderedFeatures: [NowPlayingFeature] {
+        sessions.keys.sorted { lhs, rhs in
+            if lhs.priority != rhs.priority { return lhs.priority > rhs.priority }
+            return lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    private func installRemoteCommandsIfNeeded() {
+        guard !commandsInstalled else { return }
+        commandsInstalled = true
+        let cc = MPRemoteCommandCenter.shared()
+
+        cc.playCommand.removeTarget(nil)
+        cc.pauseCommand.removeTarget(nil)
+        cc.togglePlayPauseCommand.removeTarget(nil)
+        cc.stopCommand.removeTarget(nil)
+        cc.nextTrackCommand.removeTarget(nil)
+        cc.previousTrackCommand.removeTarget(nil)
+        cc.changePlaybackPositionCommand.removeTarget(nil)
+
+        cc.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.triggerPlay() }
+            return .success
+        }
+        cc.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.triggerPause() }
+            return .success
+        }
+        cc.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.triggerPlayPause() }
+            return .success
+        }
+        cc.stopCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.triggerStopCurrent() }
+            return .success
+        }
+        cc.nextTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.triggerNext() }
+            return .success
+        }
+        cc.previousTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.triggerPrevious() }
+            return .success
+        }
+        cc.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let posEvent = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            let pos = posEvent.positionTime
+            Task { @MainActor in self?.triggerSeek(to: pos) }
+            return .success
+        }
+    }
+
+    // MARK: Multi-Feature Session Registry
+
+    func registerSession(_ state: NowPlayingSessionState, focus: Bool = true) {
+        installRemoteCommandsIfNeeded()
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        sessions[state.feature] = state
+        if focus || focusedFeature == nil || sessions[focusedFeature!] == nil {
+            focusedFeature = state.feature
+        }
+        refreshPublishedAndSystem()
+    }
+
+    func updateSession(
+        _ feature: NowPlayingFeature,
+        title: String? = nil,
+        detail: String? = nil,
+        controlsHint: String? = nil,
+        isPaused: Bool? = nil,
+        elapsedTime: Double? = nil,
+        duration: Double? = nil,
+        isLiveStream: Bool? = nil
+    ) {
+        guard var s = sessions[feature] else { return }
+        if let t = title { s.title = t }
+        if let d = detail { s.detail = d }
+        if let h = controlsHint { s.controlsHint = h }
+        if let p = isPaused { s.isPaused = p }
+        if let e = elapsedTime { s.elapsedTime = e }
+        if let dur = duration { s.duration = dur }
+        if let live = isLiveStream { s.isLiveStream = live }
+        sessions[feature] = s
+        if focusedFeature == feature {
+            refreshPublishedAndSystem()
+        }
+    }
+
+    func endSession(_ feature: NowPlayingFeature) {
+        sessions.removeValue(forKey: feature)
+        if focusedFeature == feature {
+            focusedFeature = orderedFeatures.first
+        }
+        if sessions.isEmpty {
+            clearSystemNowPlaying()
+        } else {
+            refreshPublishedAndSystem()
+        }
+    }
+
+    func cycleNextSession() {
+        let list = orderedFeatures
+        guard list.count > 1 else { return }
+        if let cur = focusedFeature, let idx = list.firstIndex(of: cur) {
+            focusedFeature = list[(idx + 1) % list.count]
+        } else {
+            focusedFeature = list.first
+        }
+        refreshPublishedAndSystem()
+    }
+
+    func cyclePreviousSession() {
+        let list = orderedFeatures
+        guard list.count > 1 else { return }
+        if let cur = focusedFeature, let idx = list.firstIndex(of: cur) {
+            focusedFeature = list[(idx - 1 + list.count) % list.count]
+        } else {
+            focusedFeature = list.first
+        }
+        refreshPublishedAndSystem()
+    }
+
+    func focusSession(_ feature: NowPlayingFeature) {
+        guard sessions[feature] != nil else { return }
+        focusedFeature = feature
+        refreshPublishedAndSystem()
+    }
+
+    func refreshNowPlaying() {
+        guard !sessions.isEmpty else { return }
+        refreshPublishedAndSystem()
+    }
+
+    func startPreviewSession() {
+        BackgroundManager.shared.start(tag: "preview")
+        registerSession(
+            NowPlayingSessionState(
+                feature: .preview,
+                title: "Quoc Thang Tools • Đã kết nối",
+                detail: "Widget màn hình khóa iPhone hoạt động 100%",
+                controlsHint: "⏸ Tạm dừng • ◀◀/▶▶ Tương tác • Nhấn ■ để tắt",
+                isPaused: false,
+                elapsedTime: 0,
+                duration: 0,
+                isLiveStream: true,
+                onPlay: { [weak self] in
+                    self?.updateSession(.preview, title: "Quoc Thang Tools • Đang chạy", isPaused: false)
+                },
+                onPause: { [weak self] in
+                    self?.updateSession(.preview, title: "Quoc Thang Tools • Tạm dừng", isPaused: true)
+                },
+                onStop: { [weak self] in
+                    self?.stopPreviewSession()
+                }
+            ),
+            focus: true
+        )
+    }
+
+    func stopPreviewSession() {
+        endSession(.preview)
+        BackgroundManager.shared.stop(tag: "preview")
+    }
+
+    // MARK: Remote & Floating Bar Actions
+
+    func triggerPlay() {
+        guard let active = currentSession else { return }
+        if let play = active.onPlay {
+            play()
+        } else if !active.isPaused {
+            refreshPublishedAndSystem()
+        }
+    }
+
+    func triggerPause() {
+        guard let active = currentSession else { return }
+        if let pause = active.onPause {
+            pause()
+        } else if let stop = active.onStop {
+            stop()
+        }
+    }
+
+    func triggerPlayPause() {
+        guard let active = currentSession else { return }
+        if active.isPaused {
+            triggerPlay()
+        } else {
+            triggerPause()
+        }
+    }
+
+    func triggerStopCurrent() {
+        guard let active = currentSession else { return }
+        if let stop = active.onStop {
+            stop()
+        } else {
+            endSession(active.feature)
+        }
+    }
+
+    func triggerNext() {
+        guard let active = currentSession else { return }
+        if let next = active.onNext {
+            next()
+        } else if orderedFeatures.count > 1 {
+            cycleNextSession()
+        }
+    }
+
+    func triggerPrevious() {
+        guard let active = currentSession else { return }
+        if let prev = active.onPrevious {
+            prev()
+        } else if orderedFeatures.count > 1 {
+            cyclePreviousSession()
+        }
+    }
+
+    func triggerSeek(to seconds: Double) {
+        guard let active = currentSession else { return }
+        active.onSeek?(seconds)
+    }
+
+    // MARK: Legacy Compatibility Helpers
+
+    func start(onStop: (@MainActor () -> Void)? = nil) {
+        registerSession(
+            NowPlayingSessionState(
+                feature: .preview,
+                title: "Quoc Thang Tools",
+                detail: "Đang hoạt động nền 24/7",
+                controlsHint: "Quoc Thang Tools",
+                onStop: onStop
+            ),
+            focus: false
+        )
+    }
+
+    func update(title: String, detail: String) {
+        if let f = focusedFeature {
+            updateSession(f, title: title, detail: detail)
         }
     }
 
     func stop() {
-        isActive = false
-        onStopCB = nil
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        sessions.removeAll()
+        focusedFeature = nil
+        clearSystemNowPlaying()
+    }
+
+    // MARK: System Sync (MPNowPlayingInfoCenter + MPRemoteCommandCenter)
+
+    private func refreshPublishedAndSystem() {
+        let list = orderedFeatures
+        if focusedFeature == nil || sessions[focusedFeature!] == nil {
+            focusedFeature = list.first
+        }
+        activeCount = list.count
+        if let f = focusedFeature, let idx = list.firstIndex(of: f), let state = sessions[f] {
+            activeIndex = idx
+            currentSession = state
+            pushToSystem(state: state, index: idx, total: list.count)
+        } else {
+            activeIndex = 0
+            currentSession = nil
+            clearSystemNowPlaying()
+        }
+    }
+
+    private func pushToSystem(state: NowPlayingSessionState, index: Int, total: Int) {
+        let cc = MPRemoteCommandCenter.shared()
+        let hasPlayPause = state.supportsPauseResume || state.onStop != nil
+        cc.playCommand.isEnabled = state.onPlay != nil || state.isPaused
+        cc.pauseCommand.isEnabled = hasPlayPause
+        cc.togglePlayPauseCommand.isEnabled = hasPlayPause
+        cc.stopCommand.isEnabled = state.onStop != nil
+        cc.nextTrackCommand.isEnabled = state.onNext != nil || total > 1
+        cc.previousTrackCommand.isEnabled = state.onPrevious != nil || total > 1
+        cc.changePlaybackPositionCommand.isEnabled = state.onSeek != nil && state.duration > 0
+
+        let albumPrefix = total > 1 ? "[\(index + 1)/\(total)] " : ""
+        let albumText = "\(albumPrefix)\(state.controlsHint)"
+
+        var info: [String: Any] = [:]
+        info[MPMediaItemPropertyTitle] = state.title
+        info[MPMediaItemPropertyArtist] = state.detail
+        info[MPMediaItemPropertyAlbumTitle] = albumText
+        info[MPMediaItemPropertyArtwork] = NowPlayingArtworkFactory.artwork(for: state.feature)
+        info[MPNowPlayingInfoPropertyIsLiveStream] = state.isLiveStream
+        info[MPNowPlayingInfoPropertyPlaybackRate] = state.isPaused ? 0.0 : 1.0
+        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+
+        if state.duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = state.duration
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = min(max(0, state.elapsedTime), state.duration)
+        } else {
+            info[MPMediaItemPropertyPlaybackDuration] = 0
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = max(0, state.elapsedTime)
+        }
+
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = info
         if #available(iOS 16.0, *) {
-            MPNowPlayingInfoCenter.default().playbackState = .stopped
+            center.playbackState = state.isPaused ? .paused : .playing
+        }
+    }
+
+    private func clearSystemNowPlaying() {
+        currentSession = nil
+        activeCount = 0
+        activeIndex = 0
+        let cc = MPRemoteCommandCenter.shared()
+        cc.playCommand.isEnabled = false
+        cc.pauseCommand.isEnabled = false
+        cc.togglePlayPauseCommand.isEnabled = false
+        cc.stopCommand.isEnabled = false
+        cc.nextTrackCommand.isEnabled = false
+        cc.previousTrackCommand.isEnabled = false
+        cc.changePlaybackPositionCommand.isEnabled = false
+
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = nil
+        if #available(iOS 16.0, *) {
+            center.playbackState = .stopped
         }
         UIApplication.shared.endReceivingRemoteControlEvents()
     }
@@ -797,6 +1075,42 @@ final class BackgroundManager {
         }
     }
 
+    func audioSessionOptions() -> AVAudioSession.CategoryOptions {
+        let exclusive = UserDefaults.standard.object(forKey: "QT_ExclusiveNowPlaying") == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: "QT_ExclusiveNowPlaying")
+        if exclusive {
+            // Không dùng .mixWithOthers để iOS luôn cấp quyền hiển thị Widget Phát Nhạc trên Màn hình khóa & Dynamic Island
+            return [.allowAirPlay, .allowBluetoothA2DP]
+        }
+        return [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP]
+    }
+
+    func applyAudioSessionCategory() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: audioSessionOptions())
+            try session.setActive(true, options: [])
+        } catch {
+            print("[BG] AVAudioSession WARN: \(error)")
+        }
+    }
+
+    func reconfigureAudioSession() {
+        DispatchQueue.main.async {
+            self.applyAudioSessionCategory()
+            if self.isKeepAliveActive {
+                self.silentPlayer?.play()
+                if let eng = self.engine, !eng.isRunning {
+                    try? eng.start()
+                }
+                Task { @MainActor in
+                    NowPlayingHelper.shared.refreshNowPlaying()
+                }
+            }
+        }
+    }
+
     func start(tag: String = "default") {
         lock.lock()
         activeTags.insert(tag)
@@ -809,17 +1123,7 @@ final class BackgroundManager {
         let work = {
             guard self.isKeepAliveActive else { return }
 
-            do {
-                let session = AVAudioSession.sharedInstance()
-                try session.setCategory(
-                    .playback,
-                    mode: .default,
-                    options: [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP]
-                )
-                try session.setActive(true, options: [])
-            } catch {
-                print("[BG] AVAudioSession WARN: \(error)")
-            }
+            self.applyAudioSessionCategory()
 
             if self.silentPlayer == nil {
                 if let player = try? AVAudioPlayer(data: BackgroundManager.makeSilentWavData()) {
@@ -1010,6 +1314,7 @@ class AppState: ObservableObject {
     @Published var inputText = ""
     @Published var messages: [ParsedMessage] = []
     @Published var isSending = false
+    @Published var isPausedSending = false
     @Published var totalSent = 0
     @Published var currentMessageStr = ""
     @Published var tokenSendCount: [UUID: Int] = [:]
@@ -1018,6 +1323,7 @@ class AppState: ObservableObject {
     private var isCancelled = false
     private var sendTask: Task<Void, Never>?
     private var lastNPUpdate = Date.distantPast
+    private var activeSpamChannelName = ""
 
     init() { loadTokens() }
     private func saveTokens() {
@@ -1068,10 +1374,61 @@ class AppState: ObservableObject {
         if text == nil { text = String(decoding: d, as: UTF8.self) }
         guard let t = text else { lastError = "File rỗng"; return }
         let clean = t.replacingOccurrences(of: "\u{FEFF}", with: "")
-        for l in clean.components(separatedBy: .newlines) where !l.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let lines = clean.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if lines.count > 1 {
+            BackgroundManager.shared.start(tag: "tokenCheck")
+            NowPlayingHelper.shared.registerSession(
+                NowPlayingSessionState(
+                    feature: .tokenCheck,
+                    title: "Kiểm tra \(lines.count) Token",
+                    detail: "0/\(lines.count) đã kiểm tra",
+                    controlsHint: "Đang import & check danh sách Token",
+                    isPaused: false,
+                    elapsedTime: 0,
+                    duration: Double(lines.count),
+                    isLiveStream: false
+                ),
+                focus: true
+            )
+        }
+        defer {
+            if lines.count > 1 {
+                NowPlayingHelper.shared.endSession(.tokenCheck)
+                BackgroundManager.shared.stop(tag: "tokenCheck")
+            }
+        }
+        for (idx, l) in lines.enumerated() {
             await addToken(l)
+            if lines.count > 1 {
+                NowPlayingHelper.shared.updateSession(
+                    .tokenCheck,
+                    detail: "\(idx + 1)/\(lines.count) token đã kiểm tra",
+                    elapsedTime: Double(idx + 1),
+                    duration: Double(lines.count),
+                    isLiveStream: false
+                )
+            }
         }
         lastError = nil
+    }
+    func selectAllValidTokens() {
+        let validIds = tokens.filter { $0.isValid }.map { $0.id }
+        selectedTokenIds = Set(validIds)
+        activeToken = tokens.first(where: { $0.isValid })
+        Task { await recomputeMultiGuilds() }
+    }
+    func clearTokenSelection() {
+        selectedTokenIds.removeAll()
+        activeToken = nil
+        guilds = []
+        multiGuilds = []
+    }
+    func removeToken(id: UUID) {
+        if let idx = tokens.firstIndex(where: { $0.id == id }) {
+            deleteToken(at: IndexSet(integer: idx))
+        }
     }
     func setActiveToken(_ t: TokenInfo) {
         guard t.isValid else { return }
@@ -1192,18 +1549,34 @@ class AppState: ObservableObject {
         if useTag && targetUserId.isEmpty { return }
 
         isSending = true
+        isPausedSending = false
         isCancelled = false
         totalSent = 0
         lastError = nil
+        activeSpamChannelName = channel.displayName
         tokenSendCount = Dictionary(uniqueKeysWithValues: selectedTokens.map { ($0.id, 0) })
         let channelId = channel.id
         let totalTokens = selectedTokens.count
 
-        BackgroundManager.shared.start()
-        NowPlayingHelper.shared.start(onStop: { [weak self] in
-            Task { @MainActor in self?.stopSending() }
-        })
-        updateNowPlaying(force: true)
+        BackgroundManager.shared.start(tag: "spam")
+        NowPlayingHelper.shared.registerSession(
+            NowPlayingSessionState(
+                feature: .spam,
+                title: "Spam • #\(channel.displayName)",
+                detail: "0 tin • \(totalTokens) token • Delay \(String(format: "%.1fs", delaySeconds))",
+                controlsHint: "⏸ Tạm dừng/Tiếp tục • ◀◀/▶▶ Chỉnh Delay",
+                isPaused: false,
+                elapsedTime: 0,
+                duration: 0,
+                isLiveStream: true,
+                onPlay: { [weak self] in self?.resumeSending() },
+                onPause: { [weak self] in self?.pauseSending() },
+                onStop: { [weak self] in self?.stopSending() },
+                onNext: { [weak self] in self?.adjustDelay(delta: -0.2) },
+                onPrevious: { [weak self] in self?.adjustDelay(delta: 0.2) }
+            ),
+            focus: true
+        )
 
         sendTask = Task { [weak self] in
             guard let self = self else { return }
@@ -1216,9 +1589,10 @@ class AppState: ObservableObject {
                 }
             }
             self.isSending = false
+            self.isPausedSending = false
             self.currentMessageStr = ""
-            BackgroundManager.shared.stop()
-            NowPlayingHelper.shared.stop()
+            BackgroundManager.shared.stop(tag: "spam")
+            NowPlayingHelper.shared.endSession(.spam)
         }
     }
 
@@ -1229,6 +1603,10 @@ class AppState: ObservableObject {
         var perTokenTotal = 0
 
         while !isCancelled && !Task.isCancelled {
+            if isPausedSending {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                continue
+            }
             let m = messages[i % messages.count]
             var p = ""
             if addPrefix { p += "> " }
@@ -1267,22 +1645,44 @@ class AppState: ObservableObject {
         }
     }
 
+    func pauseSending() {
+        guard isSending else { return }
+        isPausedSending = true
+        updateNowPlaying(force: true)
+    }
+
+    func resumeSending() {
+        guard isSending else { return }
+        isPausedSending = false
+        updateNowPlaying(force: true)
+    }
+
+    func adjustDelay(delta: Double) {
+        let rounded = ((delaySeconds + delta) * 10.0).rounded() / 10.0
+        delaySeconds = min(5.0, max(0.1, rounded))
+        updateNowPlaying(force: true)
+    }
+
     func stopSending() {
         isCancelled = true
+        isPausedSending = false
         sendTask?.cancel()
         sendTask = nil
         isSending = false
-        BackgroundManager.shared.stop()
-        NowPlayingHelper.shared.stop()
+        BackgroundManager.shared.stop(tag: "spam")
+        NowPlayingHelper.shared.endSession(.spam)
     }
 
     private func updateNowPlaying(force: Bool = false) {
         let now = Date()
         guard force || now.timeIntervalSince(lastNPUpdate) >= 0.5 else { return }
         lastNPUpdate = now
-        NowPlayingHelper.shared.update(
-            title: "Quoc Thang Spam",
-            detail: "\(totalSent) tin | \(selectedTokenIds.count) token"
+        let titlePrefix = isPausedSending ? "Tạm dừng" : "Spam"
+        NowPlayingHelper.shared.updateSession(
+            .spam,
+            title: "\(titlePrefix) • #\(activeSpamChannelName)",
+            detail: "\(totalSent) tin • \(selectedTokenIds.count) token • Delay \(String(format: "%.1fs", delaySeconds))",
+            isPaused: isPausedSending
         )
     }
 
@@ -1655,10 +2055,22 @@ class BotManager: ObservableObject {
     func runNuke(guild: Guild, options: NukeConfig) async {
         guard let c = client else { return }
         isNuking = true; isCancelled = false; nukeLog = []; reset()
-        BackgroundManager.shared.start()
-        NowPlayingHelper.shared.start(onStop: { [weak self] in
-            Task { @MainActor in self?.stopNuke() }
-        })
+        BackgroundManager.shared.start(tag: "botNuke")
+        NowPlayingHelper.shared.registerSession(
+            NowPlayingSessionState(
+                feature: .botNuke,
+                title: "Bot Nuke • \(guild.name)",
+                detail: "Đang khởi chạy...",
+                controlsHint: "⏸ Dừng Bot Nuke • ◀◀/▶▶ Chuyển tác vụ",
+                isPaused: false,
+                elapsedTime: 0,
+                duration: 100,
+                isLiveStream: false,
+                onPause: { [weak self] in self?.stopNuke() },
+                onStop: { [weak self] in self?.stopNuke() }
+            ),
+            focus: true
+        )
         let gid = guild.id
         log("Bắt đầu nuke: \(guild.name)")
         let totalSteps = options.stepOrder.filter { options.enabledSteps.contains($0) }.count
@@ -1670,9 +2082,13 @@ class BotManager: ObservableObject {
             currentPhase = step.rawValue
             phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
             log("--- \(step.rawValue) ---")
-            NowPlayingHelper.shared.update(
-                title: "Bot Nuke · \(step.rawValue)",
-                detail: "\(banSuccess) ban | \(channelsDeleted) xoá | \(channelsCreated) tạo"
+            NowPlayingHelper.shared.updateSession(
+                .botNuke,
+                title: "Bot Nuke • \(step.rawValue)",
+                detail: "\(banSuccess) ban • \(channelsDeleted) xoá • \(channelsCreated) tạo",
+                elapsedTime: phaseProgress * 100.0,
+                duration: 100.0,
+                isLiveStream: false
             )
             switch step {
             case .massBan: await doMassBan(c, gid, options: options)
@@ -1702,8 +2118,8 @@ class BotManager: ObservableObject {
         log("Tin nhắn: \(messagesSent)")
         log("Role: \(rolesCreated)")
         isNuking = false
-        BackgroundManager.shared.stop()
-        NowPlayingHelper.shared.stop()
+        BackgroundManager.shared.stop(tag: "botNuke")
+        NowPlayingHelper.shared.endSession(.botNuke)
     }
 
     private func doMassBan(_ c: BotClient, _ gid: String, options: NukeConfig) async {
@@ -1902,13 +2318,45 @@ class UserNukeManager: ObservableObject {
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { importError = "Không có token"; return }
         isImporting = true; importError = nil
-        for line in lines {
-            if tokens.contains(where: { $0.token == line }) { continue }
-            do {
-                let u = try await UserNukeClient(token: line).validate()
-                tokens.append(TokenInfo(token: line, userId: u.id, username: u.globalName ?? u.username, avatarHash: u.avatar, isValid: true))
-            } catch {
-                tokens.append(TokenInfo(token: line, userId: "0", username: "Token chết", avatarHash: nil, isValid: false))
+        if lines.count > 1 {
+            BackgroundManager.shared.start(tag: "tokenCheck")
+            NowPlayingHelper.shared.registerSession(
+                NowPlayingSessionState(
+                    feature: .tokenCheck,
+                    title: "Check \(lines.count) Token (Nuke)",
+                    detail: "0/\(lines.count) đã kiểm tra",
+                    controlsHint: "Đang import & check danh sách Token",
+                    isPaused: false,
+                    elapsedTime: 0,
+                    duration: Double(lines.count),
+                    isLiveStream: false
+                ),
+                focus: true
+            )
+        }
+        defer {
+            if lines.count > 1 {
+                NowPlayingHelper.shared.endSession(.tokenCheck)
+                BackgroundManager.shared.stop(tag: "tokenCheck")
+            }
+        }
+        for (idx, line) in lines.enumerated() {
+            if !tokens.contains(where: { $0.token == line }) {
+                do {
+                    let u = try await UserNukeClient(token: line).validate()
+                    tokens.append(TokenInfo(token: line, userId: u.id, username: u.globalName ?? u.username, avatarHash: u.avatar, isValid: true))
+                } catch {
+                    tokens.append(TokenInfo(token: line, userId: "0", username: "Token chết", avatarHash: nil, isValid: false))
+                }
+            }
+            if lines.count > 1 {
+                NowPlayingHelper.shared.updateSession(
+                    .tokenCheck,
+                    detail: "\(idx + 1)/\(lines.count) token đã kiểm tra",
+                    elapsedTime: Double(idx + 1),
+                    duration: Double(lines.count),
+                    isLiveStream: false
+                )
             }
         }
         isImporting = false
@@ -1992,10 +2440,22 @@ class UserNukeManager: ObservableObject {
         guard !sel.isEmpty else { return }
 
         isNuking = true; isCancelled = false; nukeLog = []; reset()
-        BackgroundManager.shared.start()
-        NowPlayingHelper.shared.start(onStop: { [weak self] in
-            Task { @MainActor in self?.stop() }
-        })
+        BackgroundManager.shared.start(tag: "userNuke")
+        NowPlayingHelper.shared.registerSession(
+            NowPlayingSessionState(
+                feature: .userNuke,
+                title: "User Nuke • \(guild.name)",
+                detail: "Đang khởi chạy (\(sel.count) token)...",
+                controlsHint: "⏸ Dừng User Nuke • ◀◀/▶▶ Chuyển tác vụ",
+                isPaused: false,
+                elapsedTime: 0,
+                duration: 100,
+                isLiveStream: false,
+                onPause: { [weak self] in self?.stop() },
+                onStop: { [weak self] in self?.stop() }
+            ),
+            focus: true
+        )
         let gid = guild.id
         let allClients: [(UUID, UserNukeClient)] = sel.map { ($0.id, UserNukeClient(token: $0.token)) }
         guard let scan = allClients.first?.1 else { return }
@@ -2011,9 +2471,13 @@ class UserNukeManager: ObservableObject {
             currentPhase = step.rawValue
             phaseProgress = totalSteps > 0 ? Double(stepDone) / Double(totalSteps) : 0
             log("--- \(step.rawValue) ---")
-            NowPlayingHelper.shared.update(
-                title: "User Nuke · \(step.rawValue)",
-                detail: "\(banSuccess) ban | \(channelsDeleted) xoá | \(channelsCreated) tạo"
+            NowPlayingHelper.shared.updateSession(
+                .userNuke,
+                title: "User Nuke • \(step.rawValue)",
+                detail: "\(banSuccess) ban • \(channelsDeleted) xoá • \(channelsCreated) tạo",
+                elapsedTime: phaseProgress * 100.0,
+                duration: 100.0,
+                isLiveStream: false
             )
             switch step {
             case .massBan:
@@ -2055,8 +2519,8 @@ class UserNukeManager: ObservableObject {
         log("Tin nhắn: \(messagesSent)")
         log("Role: \(rolesCreated)")
         isNuking = false
-        BackgroundManager.shared.stop()
-        NowPlayingHelper.shared.stop()
+        BackgroundManager.shared.stop(tag: "userNuke")
+        NowPlayingHelper.shared.endSession(.userNuke)
     }
 
     private func doMassBanScan(_ scan: UserNukeClient, clients: [UserNukeClient], gid: String, options: NukeConfig) async {
@@ -2503,329 +2967,7 @@ final class LicenseManager: ObservableObject {
     }
 }
 
-// ==========================================
-// MARK: - CRACKED VIEW
-// ==========================================
-struct CrackedView: View {
-    @EnvironmentObject var license: LicenseManager
-    let message: String
-    @State private var showInput = false
-    @State private var input = ""
-    @State private var error: String?
-
-    var body: some View {
-        ZStack {
-            LinearGradient(colors: [.black, Color(red: 0.25, green: 0, blue: 0)],
-                           startPoint: .top, endPoint: .bottom).ignoresSafeArea()
-            ScrollView {
-                VStack(spacing: 22) {
-                    Spacer(minLength: 40)
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 85)).foregroundStyle(.red)
-                        .shadow(color: .red.opacity(0.5), radius: 20)
-                    Text("APP HAS BEEN CRACKED")
-                        .font(.system(size: 22, weight: .black))
-                        .foregroundStyle(.white).tracking(1.5)
-                    Text(message)
-                        .font(.subheadline).foregroundStyle(.gray)
-                        .multilineTextAlignment(.center).padding(.horizontal, 24)
-
-                    if showInput {
-                        VStack(spacing: 12) {
-                            TextField("Enter license key...", text: $input)
-                                .textInputAutocapitalization(.characters).autocorrectionDisabled()
-                                .font(.system(.body, design: .monospaced))
-                                .padding(14).background(Color.white.opacity(0.08))
-                                .foregroundStyle(.white).cornerRadius(10)
-                                .overlay(RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.white.opacity(0.15), lineWidth: 1))
-                            if let e = error {
-                                Text(e).font(.caption).foregroundStyle(.red)
-                                    .multilineTextAlignment(.center)
-                            }
-                            Button {
-                                Task {
-                                    error = nil
-                                    let st = await license.activate(key: input)
-                                    switch st {
-                                    case .valid: break
-                                    case .cracked(let r): error = r
-                                    case .invalid(let r): error = r
-                                    case .expired(let d): error = "Key expired on \(license.formatDate(d))"
-                                    default: error = "Unable to activate"
-                                    }
-                                }
-                            } label: {
-                                HStack {
-                                    if license.isChecking { ProgressView().tint(.white) }
-                                    Text(license.isChecking ? "VERIFYING..." : "ACTIVATE").bold()
-                                }.frame(maxWidth: .infinity).padding()
-                            }
-                            .background(Color.red).foregroundStyle(.white).cornerRadius(10)
-                            .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || license.isChecking)
-                        }.padding(.horizontal, 30)
-                    } else {
-                        Button("Enter License Key") { showInput = true }
-                            .foregroundStyle(.red).font(.subheadline.bold())
-                    }
-
-                    Button("Retry Verification") {
-                        Task { await license.refreshStatus() }
-                    }
-                    .foregroundStyle(.gray).font(.caption)
-
-                    Spacer(minLength: 20)
-                    Text("v1.0").font(.caption2).foregroundStyle(.gray.opacity(0.4))
-                }
-            }
-        }
-    }
-}
-
-struct LoadingView: View {
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            VStack(spacing: 18) {
-                ProgressView().tint(.white).scaleEffect(1.5)
-                Text("Verifying license...").foregroundStyle(.white)
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - LOCK VIEW (khi có key nhưng activate lỗi)
-// ==========================================
-struct LockView: View {
-    @EnvironmentObject var license: LicenseManager
-    @State private var input = ""
-    @State private var error: String? = nil
-    @State private var showAdminInfo = false
-    @State private var logoTapCount = 0
-
-    var body: some View {
-        ZStack {
-            LinearGradient(colors: [Color(red: 0.08, green: 0.08, blue: 0.16), Color.black],
-                           startPoint: .top, endPoint: .bottom).ignoresSafeArea()
-            ScrollView {
-                VStack(spacing: 24) {
-                    Spacer(minLength: 40)
-                    VStack(spacing: 14) {
-                        Image(systemName: "lock.shield.fill").font(.system(size: 80))
-                            .foregroundStyle(.red).shadow(color: .red.opacity(0.4), radius: 20)
-                            .onTapGesture {
-                                logoTapCount += 1
-                                if logoTapCount >= 7 { logoTapCount = 0; showAdminInfo = true }
-                            }
-                        Text("QUOC THANG TOOLS").font(.system(size: 22, weight: .heavy))
-                            .foregroundStyle(.white).tracking(1.5)
-                        Text("LICENSE REQUIRED").font(.caption.bold())
-                            .foregroundStyle(.red.opacity(0.8)).tracking(3)
-                    }
-                    VStack(spacing: 14) {
-                        TextField("Nhập license key...", text: $input)
-                            .textInputAutocapitalization(.characters).autocorrectionDisabled()
-                            .font(.system(.body, design: .monospaced)).padding(14)
-                            .background(Color.white.opacity(0.08)).foregroundStyle(.white)
-                            .cornerRadius(10)
-                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.15), lineWidth: 1))
-                            .onChange(of: input) { _ in error = nil }
-                        if let e = error {
-                            Text(e).font(.caption).foregroundStyle(.red)
-                                .multilineTextAlignment(.center).padding(.horizontal)
-                        }
-                        Button {
-                            Task {
-                                error = nil
-                                let st = await license.activate(key: input)
-                                switch st {
-                                case .valid: error = nil
-                                case .invalid(let r): error = r
-                                case .cracked(let r): error = r
-                                case .expired(let d): error = "Key đã hết hạn lúc \(fmt(d))"
-                                default: error = "Không thể kích hoạt"
-                                }
-                            }
-                        } label: {
-                            HStack {
-                                if license.isChecking { ProgressView().tint(.white) }
-                                Text(license.isChecking ? "ĐANG KIỂM TRA..." : "KÍCH HOẠT").bold()
-                            }.frame(maxWidth: .infinity).padding()
-                        }
-                        .background(input.trimmingCharacters(in: .whitespaces).isEmpty ? Color.gray : Color.indigo)
-                        .foregroundStyle(.white).cornerRadius(10)
-                        .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || license.isChecking)
-                    }.padding(.horizontal, 30)
-
-                    if case .expired(let d) = license.status {
-                        Text("⚠️ Key trước đó đã hết hạn lúc: \(fmt(d))")
-                            .font(.caption).foregroundStyle(.orange)
-                            .multilineTextAlignment(.center).padding(.horizontal)
-                    }
-                    Spacer(minLength: 20)
-                    Text("v1.0").font(.caption2).foregroundStyle(.gray.opacity(0.4))
-                }.padding(.vertical, 20)
-            }
-        }
-        .sheet(isPresented: $showAdminInfo) {
-            LicenseAdminInfoView().environmentObject(license)
-        }
-    }
-
-    private func fmt(_ d: Date) -> String {
-        let df = DateFormatter()
-        df.dateFormat = "dd/MM/yyyy HH:mm:ss"
-        df.locale = Locale(identifier: "vi_VN")
-        return df.string(from: d)
-    }
-}
-
-// ==========================================
-// MARK: - ADMIN INFO VIEW
-// ==========================================
-struct LicenseAdminInfoView: View {
-    @EnvironmentObject var license: LicenseManager
-    @Environment(\.dismiss) var dismiss
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("THÔNG TIN ADMIN").font(.headline)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("API Endpoint").font(.caption.bold()).foregroundStyle(.secondary)
-                        Text(LicenseAPIClient.shared.baseURL)
-                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                    }
-                    .padding().frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
-
-                    if let k = license.licenseKey {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("KEY HIỆN TẠI").font(.caption.bold()).foregroundStyle(.secondary)
-                            Text(k).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                            Text(license.statusText).font(.caption2).foregroundStyle(.green)
-                        }
-                        .padding().frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(UIColor.secondarySystemBackground)).cornerRadius(10)
-                    }
-
-                    Button(role: .destructive) {
-                        license.deactivate(); dismiss()
-                    } label: {
-                        Label("Xoá key hiện tại", systemImage: "trash").frame(maxWidth: .infinity).padding(10)
-                    }
-                    .background(Color.red.opacity(0.15)).foregroundStyle(.red).cornerRadius(8)
-                }.padding()
-            }
-            .navigationTitle("Admin Info").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Đóng") { dismiss() } }
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - ABOUT / INFO VIEW
-// ==========================================
-struct AboutView: View {
-    @EnvironmentObject var license: LicenseManager
-    @State private var showFullKey = false
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 20) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("LICENSE INFORMATION").font(.caption.bold()).foregroundStyle(.secondary)
-                        HStack {
-                            Text("License Key").font(.subheadline)
-                            Spacer()
-                            Text(maskedKey).font(.system(.subheadline, design: .monospaced)).foregroundStyle(.indigo)
-                            Toggle("", isOn: $showFullKey).labelsHidden().tint(.indigo).scaleEffect(0.8)
-                        }
-                        Divider()
-                        HStack {
-                            Text("Ngày giờ kích hoạt").font(.subheadline)
-                            Spacer()
-                            Text(license.activatedAt != nil ? license.formatDateTime(license.activatedAt!) : "N/A")
-                                .font(.subheadline.bold()).foregroundStyle(.secondary)
-                        }
-                        Divider()
-                        HStack {
-                            Text("Ngày giờ hết hạn").font(.subheadline)
-                            Spacer()
-                            if case .valid(let exp) = license.status {
-                                Text(license.formatDateTime(exp)).font(.subheadline.bold()).foregroundStyle(.green)
-                            } else if case .expired(let exp) = license.status {
-                                Text(license.formatDateTime(exp)).font(.subheadline.bold()).foregroundStyle(.red)
-                            } else {
-                                Text("N/A").font(.subheadline.bold()).foregroundStyle(.secondary)
-                            }
-                        }
-                        if case .valid(let exp) = license.status {
-                            Divider()
-                            HStack {
-                                Text("Thời gian còn lại").font(.subheadline)
-                                Spacer()
-                                Text(license.timeRemaining(until: exp))
-                                    .font(.subheadline.bold()).foregroundStyle(.indigo)
-                            }
-                        }
-                    }
-                    .padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Image(systemName: "info.circle.fill").foregroundStyle(.blue)
-                            Text("About This App").font(.headline)
-                        }
-                        Text("Quoc Thang Tools is a comprehensive utility suite designed for Discord power users. It provides advanced features such as Mass Spamming, Server Nuking, Mass Banning, and Voice Room integration. Our tools are optimized for both iOS and Android platforms, ensuring smooth and efficient performance.")
-                            .font(.subheadline).foregroundStyle(.secondary)
-                    }
-                    .padding().frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Image(systemName: "crown.fill").foregroundStyle(.yellow)
-                            Text("Admin Services").font(.headline)
-                        }
-                        Text("The administrator specializes in developing and providing custom tools for both Discord PC and Mobile. Whether you need account registration tools, server nukers, mass DM tools, or any other automation, we can build it for you.")
-                            .font(.subheadline).foregroundStyle(.secondary)
-                        Divider()
-                        HStack {
-                            Image(systemName: "message.fill").foregroundStyle(.indigo)
-                            Text("Contact Admin (Discord):").font(.subheadline.bold())
-                            Spacer()
-                            Text("@thaitu.thanhhoa")
-                                .font(.system(.subheadline, design: .monospaced))
-                                .foregroundStyle(.indigo).textSelection(.enabled)
-                        }
-                        .padding().background(Color.indigo.opacity(0.1)).cornerRadius(10)
-                    }
-                    .padding().frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-
-                    Text("Version 1.0.0").font(.caption).foregroundStyle(.tertiary).padding(.top)
-                }.padding()
-            }
-            .background(Color(UIColor.systemGroupedBackground))
-            .navigationTitle("Information").navigationBarTitleDisplayMode(.inline)
-        }
-    }
-
-    private var maskedKey: String {
-        guard let key = license.licenseKey else { return "No Key" }
-        if showFullKey { return key }
-        let parts = key.split(separator: "-")
-        if parts.count == 3 { return "\(parts[0])-***-\(parts[2])" }
-        return "\(key.prefix(4))***\(key.suffix(4))"
-    }
-}
+// (CrackedView, LoadingView, LockView, LicenseAdminInfoView, AboutView -> ModernViews.swift)
 
 // ==========================================
 // MARK: - APP ENTRY
@@ -2870,10 +3012,7 @@ struct SpamDiscordApp: App {
                     Task { @MainActor in await license.refreshStatus() }
                     voiceRoom.setAppInBackground(false)
                     if app.isSending, AppEndpoints.isLoaded {
-                        BackgroundManager.shared.start()
-                        NowPlayingHelper.shared.update(
-                            title: "Quoc Thang Spam",
-                            detail: "\(app.totalSent) tin | \(app.selectedTokenIds.count) token")
+                        BackgroundManager.shared.start(tag: "spam")
                     }
                     if voiceRoom.isRunning {
                         BackgroundManager.shared.start(tag: "treo")
@@ -2881,9 +3020,17 @@ struct SpamDiscordApp: App {
                     if musicStream.isPlaying {
                         BackgroundManager.shared.start(tag: "music")
                     }
+                    if bot.isNuking {
+                        BackgroundManager.shared.start(tag: "botNuke")
+                    }
+                    if userNuke.isNuking {
+                        BackgroundManager.shared.start(tag: "userNuke")
+                    }
+                    NowPlayingHelper.shared.refreshNowPlaying()
                 case .background, .inactive:
-                    if voiceRoom.isRunning || musicStream.isPlaying || app.isSending || BackgroundManager.shared.isKeepAliveActive {
+                    if voiceRoom.isRunning || musicStream.isPlaying || app.isSending || bot.isNuking || userNuke.isNuking || BackgroundManager.shared.isKeepAliveActive {
                         BackgroundManager.shared.ensureRunning()
+                        NowPlayingHelper.shared.refreshNowPlaying()
                     }
                     if phase == .background {
                         voiceRoom.setAppInBackground(true)
@@ -2907,751 +3054,7 @@ struct SpamDiscordApp: App {
     }
 }
 
-struct MainTabView: View {
-    var body: some View {
-        TabView {
-            SpamView().tabItem { Label("Spam", systemImage: "paperplane.fill") }
-            TokenListView().tabItem { Label("Tokens", systemImage: "person.2.fill") }
-            VoiceRoomTabView().tabItem { Label("Treo Voice", systemImage: "waveform.circle.fill") }
-            NukeTabView().tabItem { Label("Nuke", systemImage: "flame.fill") }
-            AboutView().tabItem { Label("Info", systemImage: "info.circle.fill") }
-        }.tint(.indigo)
-    }
-}
-
-struct NukeTabView: View {
-    @State private var mode: Mode = .bot
-    enum Mode { case bot, user }
-    var body: some View {
-        VStack(spacing: 0) {
-            Picker("", selection: $mode) {
-                Text("Bot").tag(Mode.bot)
-                Text("User Token").tag(Mode.user)
-            }.pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 6)
-            if mode == .bot { BotNukeView() } else { UserNukeView() }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - EMPTY STATE
-// ==========================================
-struct EmptyStateView: View {
-    let title, systemImage, description: String
-    var body: some View {
-        VStack(spacing: 15) {
-            Image(systemName: systemImage).font(.system(size: 50)).foregroundStyle(.secondary)
-            Text(title).font(.title2).bold()
-            Text(description).font(.subheadline).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).padding(.horizontal)
-        }.frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(UIColor.systemGroupedBackground))
-    }
-}
-
-// ==========================================
-// MARK: - TOKEN VIEWS
-// ==========================================
-struct TokenListView: View {
-    @EnvironmentObject var app: AppState
-    @State private var showAdd = false
-    @State private var showImport = false
-
-    var body: some View {
-        NavigationStack {
-            Group {
-                if app.tokens.isEmpty {
-                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash",
-                                   description: "Thêm token để bắt đầu.")
-                } else {
-                    List {
-                        Section("Danh sách (\(app.selectedTokenIds.count) đã chọn)") {
-                            ForEach(app.tokens) { t in
-                                HStack(spacing: 12) {
-                                    if let url = t.avatarURL {
-                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                        placeholder: { Circle().fill(Color.gray.opacity(0.3)) }
-                                            .frame(width: 45, height: 45).clipShape(Circle())
-                                    } else {
-                                        Image(systemName: "person.circle.fill").resizable()
-                                            .frame(width: 45, height: 45).foregroundStyle(.gray)
-                                    }
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(t.username).font(.headline)
-                                        Text(t.isValid ? "Live" : "Die").font(.caption).bold()
-                                            .foregroundStyle(t.isValid ? .green : .red)
-                                    }
-                                    Spacer()
-                                    if t.isValid {
-                                        Button { app.toggleTokenSelection(t) } label: {
-                                            Image(systemName: app.selectedTokenIds.contains(t.id)
-                                                  ? "checkmark.circle.fill" : "circle")
-                                                .foregroundStyle(.indigo).font(.title3)
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .padding(.vertical, 4)
-                            }
-                            .onDelete(perform: app.deleteToken)
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Quản lý Token")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button("Thêm tay", systemImage: "keyboard") { showAdd = true }
-                        Button("Nhập file", systemImage: "doc.text") { showImport = true }
-                    } label: { Image(systemName: "plus.circle.fill").font(.title3) }
-                }
-            }
-            .sheet(isPresented: $showAdd) { AddTokenSheet() }
-            .sheet(isPresented: $showImport) {
-                DocumentPicker(contentTypes: [.item]) { u in Task { await app.addTokensFromFile(url: u) } }
-            }
-            .overlay {
-                if app.isCheckingToken {
-                    ProgressView("Đang check...").padding()
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                }
-            }
-        }
-    }
-}
-
-struct AddTokenSheet: View {
-    @EnvironmentObject var app: AppState
-    @Environment(\.dismiss) var dismiss
-    @State private var input = ""
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Nhập Token") {
-                    TextField("Dán token...", text: $input)
-                        .autocorrectionDisabled().textInputAutocapitalization(.never)
-                }
-            }
-            .navigationTitle("Thêm Token").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Lưu") { Task { await app.addToken(input); dismiss() } }
-                        .disabled(input.isEmpty || app.isCheckingToken)
-                }
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - SPAM VIEWS
-// ==========================================
-struct SpamView: View {
-    @EnvironmentObject var app: AppState
-    @State private var searchText = ""
-
-    var displayedGuilds: [Guild] { app.multiGuilds }
-    var filtered: [Guild] {
-        searchText.isEmpty
-            ? displayedGuilds
-            : displayedGuilds.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                if app.selectedTokenIds.count >= 2 {
-                    HStack(spacing: 6) {
-                        Image(systemName: "person.2.fill")
-                        Text("\(app.selectedTokenIds.count) token · Server chung: \(app.multiGuilds.count)")
-                            .font(.caption.bold())
-                    }
-                    .foregroundStyle(.indigo)
-                    .padding(8).frame(maxWidth: .infinity)
-                    .background(Color.indigo.opacity(0.1)).cornerRadius(8)
-                    .padding(.horizontal, 12).padding(.top, 4)
-                }
-
-                Group {
-                    if app.selectedTokenIds.isEmpty {
-                        EmptyStateView(title: "Chưa chọn Token", systemImage: "exclamationmark.triangle",
-                                       description: "Vào tab Tokens để chọn 1 hoặc nhiều token.")
-                    } else if app.isLoading {
-                        ProgressView("Đang tải...")
-                    } else if filtered.isEmpty {
-                        EmptyStateView(title: "Không có server chung", systemImage: "server.rack",
-                                       description: "Các token được chọn không cùng ở server nào.")
-                    } else {
-                        List(filtered) { g in
-                            NavigationLink(value: g) {
-                                HStack {
-                                    if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
-                                       let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
-                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                        placeholder: { Circle().fill(.gray) }.frame(width: 35, height: 35).clipShape(Circle())
-                                    } else { Circle().fill(.gray.opacity(0.3)).frame(width: 35, height: 35) }
-                                    Text(g.name).fontWeight(.medium)
-                                }
-                            }
-                        }.searchable(text: $searchText, prompt: "Tìm Server...")
-                    }
-                }
-            }
-            .navigationTitle("Chọn Server")
-            .navigationDestination(for: Guild.self) { ChannelListView(guild: $0) }
-            .refreshable { await app.recomputeMultiGuilds() }
-        }
-    }
-}
-
-struct ChannelListView: View {
-    @EnvironmentObject var app: AppState
-    let guild: Guild
-    @State private var searchText = ""
-    var sections: [(category: Channel?, items: [Channel])] {
-        let s = app.groupedChannels()
-        if searchText.isEmpty { return s }
-        return s.compactMap { sec in
-            let f = sec.items.filter { $0.displayName.localizedCaseInsensitiveContains(searchText) }
-            return f.isEmpty ? nil : (sec.category, f)
-        }
-    }
-    var body: some View {
-        Group {
-            if app.isLoading { ProgressView() }
-            else {
-                List {
-                    ForEach(sections, id: \.category?.id) { sec in
-                        Section {
-                            ForEach(sec.items) { c in
-                                NavigationLink(value: c) {
-                                    HStack {
-                                        Image(systemName: c.type == 5 ? "megaphone" : "number")
-                                            .foregroundStyle(.secondary)
-                                        Text(c.displayName)
-                                    }
-                                }
-                            }
-                        } header: {
-                            Text(sec.category?.displayName.uppercased() ?? "KHÁC")
-                                .font(.caption).bold()
-                        }
-                    }
-                }
-            }
-        }
-        .searchable(text: $searchText, prompt: "Tìm kênh...")
-        .navigationTitle(guild.name)
-        .task { await app.loadChannels(for: guild) }
-        .navigationDestination(for: Channel.self) { SendView(channel: $0) }
-    }
-}
-
-struct SendView: View {
-    @EnvironmentObject var app: AppState
-    let channel: Channel
-    @State private var showImport = false
-    @State private var showErr = false
-
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                HStack {
-                    Image(systemName: "number.circle.fill").font(.title).foregroundStyle(.indigo)
-                    Text(channel.displayName).font(.title2.bold())
-                    Spacer()
-                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("CẤU HÌNH").font(.caption).bold().foregroundStyle(.secondary)
-                    Toggle("Tag User ID", isOn: $app.useTag).tint(.indigo)
-                    if app.useTag {
-                        TextField("User ID", text: $app.targetUserId).keyboardType(.numberPad)
-                            .padding(10).background(Color(UIColor.tertiarySystemBackground)).cornerRadius(8)
-                    }
-                    HStack {
-                        Toggle("Thêm '>'", isOn: $app.addPrefix).tint(.indigo)
-                        Toggle("Thêm '#'", isOn: $app.addSuffix).tint(.indigo)
-                    }
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("Delay:")
-                            Spacer()
-                            Text("\(String(format: "%.1f", app.delaySeconds))s").bold()
-                                .foregroundStyle(app.delaySeconds < 1.0 ? .red : .indigo)
-                        }
-                        Slider(value: $app.delaySeconds, in: 0.1...5.0, step: 0.1).tint(.indigo)
-                    }
-                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("NỘI DUNG TIN NHẮN").font(.caption).bold().foregroundStyle(.secondary)
-                        Spacer()
-                        Button { showImport = true } label: {
-                            Label("Import", systemImage: "doc.badge.plus").font(.caption).bold()
-                        }
-                    }
-                    ZStack(alignment: .topTrailing) {
-                        TextEditor(text: $app.inputText)
-                            .frame(height: 100).padding(8)
-                            .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(10)
-                            .onChange(of: app.inputText) { _ in app.parseDirectInput() }
-                        if !app.inputText.isEmpty {
-                            Button { app.inputText = ""; app.parseDirectInput() } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundStyle(.gray).padding(12)
-                            }
-                        }
-                    }
-                    if !app.messages.isEmpty {
-                        Text("Nhận diện: \(app.messages.count) dòng").font(.caption).foregroundStyle(.green)
-                    }
-                }.padding().background(Color(UIColor.secondarySystemBackground)).cornerRadius(15)
-
-                if app.isSending {
-                    VStack(spacing: 12) {
-                        HStack {
-                            ProgressView().tint(.indigo)
-                            Text("Đang gửi...").font(.headline).foregroundStyle(.indigo)
-                            Spacer()
-                            Text("\(app.totalSent) tin").font(.headline).bold()
-                        }
-                        if !app.currentMessageStr.isEmpty {
-                            Text(app.currentMessageStr)
-                                .font(.caption).foregroundStyle(.secondary)
-                                .lineLimit(2).truncationMode(.tail)
-                        }
-                        if !app.tokenSendCount.isEmpty {
-                            ForEach(Array(app.tokenSendCount.keys), id: \.self) { id in
-                                if let t = app.tokens.first(where: { $0.id == id }) {
-                                    HStack {
-                                        Text(t.username).font(.caption)
-                                        Spacer()
-                                        Text("\(app.tokenSendCount[id] ?? 0)").font(.caption.bold())
-                                    }
-                                }
-                            }
-                        }
-                        Button(role: .destructive) {
-                            app.stopSending()
-                        } label: {
-                            Label("Dừng", systemImage: "stop.fill").frame(maxWidth: .infinity).padding()
-                        }
-                        .background(Color.red).foregroundStyle(.white).cornerRadius(10)
-                    }
-                    .padding()
-                    .background(Color(UIColor.secondarySystemBackground))
-                    .cornerRadius(15)
-                } else {
-                    Button {
-                        app.hideKeyboard()
-                        app.startSending(channel: channel)
-                    } label: {
-                        HStack {
-                            Image(systemName: "paperplane.fill")
-                            Text("BẮT ĐẦU SPAM").bold()
-                        }
-                        .frame(maxWidth: .infinity).padding()
-                    }
-                    .background(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty) ? Color.gray : Color.indigo)
-                    .foregroundStyle(.white).cornerRadius(10)
-                    .disabled(app.messages.isEmpty || (app.useTag && app.targetUserId.isEmpty))
-                }
-
-                if let err = app.lastError {
-                    Text(err).font(.caption).foregroundStyle(.red)
-                }
-
-                Spacer(minLength: 20)
-            }
-            .padding()
-        }
-        .background(Color(UIColor.systemGroupedBackground))
-        .navigationTitle("Gửi tin")
-        .navigationBarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showImport) {
-            DocumentPicker(contentTypes: [.plainText, .text, .item]) { u in app.parseFile(url: u) }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - BOT NUKE VIEW
-// ==========================================
-struct BotNukeView: View {
-    @EnvironmentObject var bot: BotManager
-    @State private var showTokenSheet = false
-    @State private var tokenInput = ""
-    @State private var selectedGuild: Guild?
-    @State private var showConfigSheet = false
-    @State private var nukeConfig = NukeConfig()
-
-    var body: some View {
-        Group {
-            if bot.config == nil {
-                EmptyStateView(title: "Chưa cấu hình Bot",
-                               systemImage: "key.slash",
-                               description: "Nhập bot token để bắt đầu nuke server.")
-                    .overlay(alignment: .bottom) {
-                        Button {
-                            showTokenSheet = true
-                        } label: {
-                            Label("Nhập Bot Token", systemImage: "key.fill")
-                                .frame(maxWidth: .infinity).padding()
-                        }
-                        .background(Color.indigo).foregroundStyle(.white).cornerRadius(10)
-                        .padding()
-                    }
-            } else if bot.isNuking {
-                ScrollView {
-                    VStack(spacing: 14) {
-                        HStack {
-                            ProgressView().tint(.red)
-                            Text(bot.currentPhase).font(.headline)
-                            Spacer()
-                        }
-                        ProgressView(value: bot.phaseProgress).tint(.red)
-                        HStack(spacing: 12) {
-                            StatCard(title: "Ban OK", value: "\(bot.banSuccess)", color: .green)
-                            StatCard(title: "Ban FAIL", value: "\(bot.banFailed)", color: .red)
-                        }
-                        HStack(spacing: 12) {
-                            StatCard(title: "Xóa kênh", value: "\(bot.channelsDeleted)", color: .orange)
-                            StatCard(title: "Tạo kênh", value: "\(bot.channelsCreated)", color: .blue)
-                        }
-                        HStack(spacing: 12) {
-                            StatCard(title: "Tin nhắn", value: "\(bot.messagesSent)", color: .purple)
-                            StatCard(title: "Role", value: "\(bot.rolesCreated)", color: .pink)
-                        }
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(bot.nukeLog.suffix(200), id: \.self) { line in
-                                    Text(line).font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(height: 200).padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(10)
-
-                        Button(role: .destructive) {
-                            bot.stopNuke()
-                        } label: {
-                            Label("DỪNG", systemImage: "stop.fill").frame(maxWidth: .infinity).padding()
-                        }
-                        .background(Color.red).foregroundStyle(.white).cornerRadius(10)
-                    }.padding()
-                }
-            } else {
-                List {
-                    Section("Bot") {
-                        HStack {
-                            if let url = bot.config?.avatarURL {
-                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                placeholder: { Circle().fill(.gray) }.frame(width: 40, height: 40).clipShape(Circle())
-                            }
-                            VStack(alignment: .leading) {
-                                Text(bot.config?.displayName ?? "").font(.headline)
-                                Text("Bot").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button(role: .destructive) { bot.removeConfig() } label: {
-                                Image(systemName: "trash")
-                            }
-                        }
-                    }
-                    Section("Chọn server để nuke") {
-                        if bot.botGuilds.isEmpty {
-                            Text("Không có server").foregroundStyle(.secondary)
-                        } else {
-                            ForEach(bot.botGuilds) { g in
-                                Button {
-                                    selectedGuild = g
-                                    showConfigSheet = true
-                                } label: {
-                                    HStack {
-                                        if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
-                                           let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
-                                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                            placeholder: { Circle().fill(.gray) }.frame(width: 32, height: 32).clipShape(Circle())
-                                        } else { Circle().fill(.gray.opacity(0.3)).frame(width: 32, height: 32) }
-                                        Text(g.name).foregroundStyle(.primary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .sheet(isPresented: $showTokenSheet) {
-            NavigationStack {
-                Form {
-                    Section("Bot Token") {
-                        TextField("Dán bot token...", text: $tokenInput)
-                            .autocorrectionDisabled().textInputAutocapitalization(.never)
-                    }
-                    if let e = bot.tokenError {
-                        Text(e).font(.caption).foregroundStyle(.red)
-                    }
-                }
-                .navigationTitle("Bot Token").navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { showTokenSheet = false } }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Lưu") {
-                            Task {
-                                await bot.setToken(tokenInput)
-                                if bot.config != nil { showTokenSheet = false }
-                            }
-                        }.disabled(tokenInput.isEmpty || bot.isCheckingToken)
-                    }
-                }
-            }
-        }
-        .sheet(isPresented: $showConfigSheet) {
-            if let g = selectedGuild {
-                NukeConfigSheet(guild: g, config: $nukeConfig, title: "Bot Nuke") {
-                    Task {
-                        showConfigSheet = false
-                        await bot.runNuke(guild: g, options: nukeConfig)
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - USER NUKE VIEW
-// ==========================================
-struct UserNukeView: View {
-    @EnvironmentObject var userNuke: UserNukeManager
-    @State private var showImport = false
-    @State private var selectedGuild: Guild?
-    @State private var showConfigSheet = false
-    @State private var nukeConfig = NukeConfig()
-
-    var body: some View {
-        Group {
-            if userNuke.isNuking {
-                ScrollView {
-                    VStack(spacing: 14) {
-                        HStack {
-                            ProgressView().tint(.red)
-                            Text(userNuke.currentPhase).font(.headline)
-                            Spacer()
-                        }
-                        ProgressView(value: userNuke.phaseProgress).tint(.red)
-                        HStack(spacing: 12) {
-                            StatCard(title: "Ban OK", value: "\(userNuke.banSuccess)", color: .green)
-                            StatCard(title: "Ban FAIL", value: "\(userNuke.banFailed)", color: .red)
-                        }
-                        HStack(spacing: 12) {
-                            StatCard(title: "Xóa kênh", value: "\(userNuke.channelsDeleted)", color: .orange)
-                            StatCard(title: "Tạo kênh", value: "\(userNuke.channelsCreated)", color: .blue)
-                        }
-                        HStack(spacing: 12) {
-                            StatCard(title: "Tin nhắn", value: "\(userNuke.messagesSent)", color: .purple)
-                            StatCard(title: "Role", value: "\(userNuke.rolesCreated)", color: .pink)
-                        }
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(userNuke.nukeLog.suffix(200), id: \.self) { line in
-                                    Text(line).font(.system(size: 10, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }.frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(height: 200).padding(8)
-                        .background(Color(UIColor.tertiarySystemBackground)).cornerRadius(10)
-
-                        Button(role: .destructive) {
-                            userNuke.stop()
-                        } label: {
-                            Label("DỪNG", systemImage: "stop.fill").frame(maxWidth: .infinity).padding()
-                        }
-                        .background(Color.red).foregroundStyle(.white).cornerRadius(10)
-                    }.padding()
-                }
-            } else {
-                List {
-                    Section("Tokens (\(userNuke.selectedTokenIds.count)/\(userNuke.tokens.count))") {
-                        if userNuke.tokens.isEmpty {
-                            Text("Chưa có token").foregroundStyle(.secondary)
-                        } else {
-                            ForEach(userNuke.tokens) { t in
-                                HStack {
-                                    if let url = t.avatarURL {
-                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                        placeholder: { Circle().fill(.gray) }.frame(width: 35, height: 35).clipShape(Circle())
-                                    }
-                                    VStack(alignment: .leading) {
-                                        Text(t.username).font(.subheadline)
-                                        Text(t.isValid ? "Live" : "Die")
-                                            .font(.caption2)
-                                            .foregroundStyle(t.isValid ? .green : .red)
-                                    }
-                                    Spacer()
-                                    if t.isValid {
-                                        Button { userNuke.toggleSelection(t) } label: {
-                                            Image(systemName: userNuke.selectedTokenIds.contains(t.id)
-                                                  ? "checkmark.circle.fill" : "circle")
-                                                .foregroundStyle(.indigo)
-                                        }.buttonStyle(.plain)
-                                    }
-                                    Button(role: .destructive) {
-                                        userNuke.removeToken(t.id)
-                                    } label: {
-                                        Image(systemName: "trash").font(.caption)
-                                    }
-                                }
-                            }
-                        }
-                        Button {
-                            showImport = true
-                        } label: {
-                            Label("Import file token", systemImage: "doc.badge.plus")
-                        }
-                    }
-
-                    Section("Server có thể nuke") {
-                        if userNuke.selectedTokenIds.isEmpty {
-                            Text("Chọn token trước").foregroundStyle(.secondary)
-                        } else if userNuke.isLoadingGuilds {
-                            ProgressView()
-                        } else if userNuke.eligibleGuilds.isEmpty {
-                            Text("Không có server phù hợp").foregroundStyle(.secondary)
-                        } else {
-                            ForEach(userNuke.eligibleGuilds) { g in
-                                Button {
-                                    selectedGuild = g
-                                    showConfigSheet = true
-                                } label: {
-                                    HStack {
-                                        if let icon = g.icon, !AppEndpoints.cdnIcons.isEmpty,
-                                           let url = URL(string: "\(AppEndpoints.cdnIcons)/\(g.id)/\(icon).png?size=64") {
-                                            AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                            placeholder: { Circle().fill(.gray) }.frame(width: 32, height: 32).clipShape(Circle())
-                                        } else { Circle().fill(.gray.opacity(0.3)).frame(width: 32, height: 32) }
-                                        Text(g.name).foregroundStyle(.primary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                .refreshable { await userNuke.loadAllGuildsForSelected() }
-            }
-        }
-        .onChange(of: userNuke.selectedTokenIds) { _ in
-            Task { await userNuke.loadAllGuildsForSelected() }
-        }
-        .sheet(isPresented: $showImport) {
-            DocumentPicker(contentTypes: [.plainText, .text, .item]) { u in
-                Task { await userNuke.importFromFile(url: u) }
-            }
-        }
-        .sheet(isPresented: $showConfigSheet) {
-            if let g = selectedGuild {
-                NukeConfigSheet(guild: g, config: $nukeConfig, title: "User Nuke") {
-                    Task {
-                        showConfigSheet = false
-                        await userNuke.runNuke(guild: g, options: nukeConfig)
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - NUKE CONFIG SHEET
-// ==========================================
-struct NukeConfigSheet: View {
-    let guild: Guild
-    @Binding var config: NukeConfig
-    let title: String
-    let onRun: () -> Void
-    @Environment(\.dismiss) var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Bước thực hiện") {
-                    ForEach(NukeStepType.allCases) { step in
-                        Toggle(isOn: Binding(
-                            get: { config.enabledSteps.contains(step) },
-                            set: { on in
-                                if on { config.enabledSteps.insert(step) }
-                                else { config.enabledSteps.remove(step) }
-                            })) {
-                            Label(step.rawValue, systemImage: step.icon)
-                        }
-                    }
-                }
-
-                Section("Tuỳ chọn") {
-                    if config.enabledSteps.contains(.massBan) {
-                        TextField("Ban role ID (tuỳ chọn)", text: $config.banRoleId)
-                            .keyboardType(.numberPad)
-                        HStack {
-                            Text("Delay ban")
-                            Slider(value: $config.banDelay, in: 0...1.0, step: 0.01)
-                            Text("\(String(format: "%.2f", config.banDelay))s").font(.caption)
-                        }
-                    }
-                    if config.enabledSteps.contains(.renameGuild) {
-                        TextField("Tên server mới", text: $config.newGuildName)
-                    }
-                    if config.enabledSteps.contains(.createRoles) {
-                        TextField("Tên role", text: $config.roleName)
-                        Stepper("Số role: \(config.roleCount)", value: $config.roleCount, in: 1...500)
-                    }
-                    if config.enabledSteps.contains(.createChannels) {
-                        TextField("Tên kênh", text: $config.channelName)
-                        Stepper("Số kênh: \(config.channelCount)", value: $config.channelCount, in: 1...500)
-                        TextField("Nội dung tin nhắn", text: $config.messageContent, axis: .vertical)
-                            .lineLimit(3...6)
-                        Toggle("Tag @everyone", isOn: $config.tagEveryone)
-                    }
-                }
-            }
-            .navigationTitle("\(title): \(guild.name)")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("BẮT ĐẦU") {
-                        if config.enabledSteps.isEmpty { dismiss(); return }
-                        onRun()
-                    }
-                    .bold()
-                    .disabled(config.enabledSteps.isEmpty)
-                }
-            }
-        }
-    }
-}
-
-// ==========================================
-// MARK: - STAT CARD
-// ==========================================
-struct StatCard: View {
-    let title: String
-    let value: String
-    let color: Color
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(value).font(.title3.bold()).foregroundStyle(color)
-            Text(title).font(.caption2).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity).padding(8)
-        .background(color.opacity(0.1)).cornerRadius(8)
-    }
-}
+// (MainTabView, NukeTabView, EmptyStateView, TokenListView, AddTokenSheet, SpamView, ChannelListView, SendView, BotNukeView, UserNukeView, NukeConfigSheet, StatCard -> ModernViews.swift)
 
 // ==============================================================================
 // MARK: - DISCORD VOICE GATEWAY & XẢ MIC VIP & TREO ROOM 24/7 (MAKE SUPER VIP)
@@ -5760,6 +5163,7 @@ final class VoiceRoomManager: ObservableObject {
 
     private var timer: Timer?
     private var joinTask: Task<Void, Never>?
+    private var activeChannelName: String = ""
     private let goLiveEngine = TreoMediaBroadcastEngine()
     private let fakeCamEngine = TreoMediaBroadcastEngine()
     private var streamCacheListener: (H264FullVideoCacheSession, UUID)?
@@ -5993,11 +5397,13 @@ final class VoiceRoomManager: ObservableObject {
             for s in sessions {
                 s.stopGoLive()
             }
+            syncVoiceNowPlaying()
             return
         }
 
         let prof = activeProfile
         prepareBackgroundCache(forStream: true)
+        syncVoiceNowPlaying()
         addLog("▶ GO LIVE (\(prof.label) • Loop ∞): \(media.title)")
         for s in sessions {
             s.startGoLive(profile: prof)
@@ -6031,6 +5437,7 @@ final class VoiceRoomManager: ObservableObject {
             for s in sessions {
                 s.setFakeCam(enabled: false, profile: nil)
             }
+            syncVoiceNowPlaying()
             return
         }
 
@@ -6038,6 +5445,7 @@ final class VoiceRoomManager: ObservableObject {
         let baseProf = activeProfile
         let camProf = camProfile(from: baseProf)
         prepareBackgroundCache(forStream: false)
+        syncVoiceNowPlaying()
 
         addLog("▶ FAKE CAM (\(camProf.label) • Loop ∞): \(media.title)")
         for s in sessions {
@@ -6071,17 +5479,41 @@ final class VoiceRoomManager: ObservableObject {
 
         isRunning = true
         elapsedSeconds = 0
+        activeChannelName = channelName
         logs = []
 
         addLog("Bắt đầu treo room [\(channelName)] (\(tokens.count) tài khoản)")
 
         BackgroundManager.shared.start(tag: "treo")
-        NowPlayingHelper.shared.start(onStop: { [weak self] in
-            Task { @MainActor in self?.stopTreo() }
-        })
-        NowPlayingHelper.shared.update(
-            title: "Treo Voice: \(channelName)",
-            detail: "\(tokens.count) tài khoản đang online"
+        NowPlayingHelper.shared.registerSession(
+            NowPlayingSessionState(
+                feature: .treoVoice,
+                title: "Treo Voice • \(channelName)",
+                detail: "0/\(tokens.count) token • Đang vào phòng...",
+                controlsHint: "⏸ Tắt/Mở Mic • ◀◀ Cam • ▶▶ Go Live",
+                isPaused: selfMute,
+                elapsedTime: 0,
+                duration: 0,
+                isLiveStream: true,
+                onPlay: { [weak self] in
+                    guard let self = self else { return }
+                    self.updateToggles(mute: false, deaf: self.selfDeaf, video: self.selfVideo)
+                },
+                onPause: { [weak self] in
+                    guard let self = self else { return }
+                    self.updateToggles(mute: true, deaf: self.selfDeaf, video: self.selfVideo)
+                },
+                onStop: { [weak self] in self?.stopTreo() },
+                onNext: { [weak self] in
+                    guard let self = self else { return }
+                    self.setStreamEnabled(!self.isStreamEnabled)
+                },
+                onPrevious: { [weak self] in
+                    guard let self = self else { return }
+                    self.setCamEnabled(!self.isCamEnabled)
+                }
+            ),
+            focus: true
         )
 
         var newSessions = [VoiceGatewaySession]()
@@ -6151,15 +5583,30 @@ final class VoiceRoomManager: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self = self, self.isRunning else { return }
                 self.elapsedSeconds += 1
-                if self.elapsedSeconds % 10 == 0 {
-                    let joinedCount = self.sessions.filter { $0.isJoined }.count
-                    NowPlayingHelper.shared.update(
-                        title: "Treo Voice: \(channelName)",
-                        detail: "\(joinedCount)/\(tokens.count) token | \(self.formatDuration(self.elapsedSeconds))"
-                    )
+                if self.elapsedSeconds % 2 == 0 {
+                    self.syncVoiceNowPlaying()
                 }
             }
         }
+    }
+
+    func syncVoiceNowPlaying() {
+        guard isRunning else { return }
+        let joinedCount = sessions.filter { $0.isJoined }.count
+        var flags: [String] = []
+        if isStreamEnabled { flags.append("LIVE") }
+        if isCamEnabled { flags.append("CAM") }
+        if selfMute { flags.append("MUTE") }
+        let badgeStr = flags.isEmpty ? "" : " • " + flags.joined(separator: "/")
+        NowPlayingHelper.shared.updateSession(
+            .treoVoice,
+            title: "Treo Voice • \(activeChannelName)",
+            detail: "\(joinedCount)/\(sessions.count) token • \(formatDuration(elapsedSeconds))\(badgeStr)",
+            isPaused: selfMute,
+            elapsedTime: Double(elapsedSeconds),
+            duration: 0,
+            isLiveStream: true
+        )
     }
 
     func setAppInBackground(_ inBackground: Bool) {
@@ -6187,10 +5634,8 @@ final class VoiceRoomManager: ObservableObject {
         }
         sessions.removeAll()
         isRunning = false
+        NowPlayingHelper.shared.endSession(.treoVoice)
         BackgroundManager.shared.stop(tag: "treo")
-        if !BackgroundManager.shared.isKeepAliveActive {
-            NowPlayingHelper.shared.stop()
-        }
         addLog("Đã dừng treo room, Fake Cam và Go Live.")
     }
 
@@ -6201,6 +5646,7 @@ final class VoiceRoomManager: ObservableObject {
         for s in sessions {
             s.updateToggles(mute: mute, deaf: deaf, video: video)
         }
+        syncVoiceNowPlaying()
     }
 
     func setSpeaking(_ speaking: Bool) {
@@ -6461,6 +5907,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     self.duration = decoder.durationSeconds
                     self.currentTime = 0
                     self.statusText = self.isPlaying ? "🔥 Đang xả: \(self.currentSongTitle)" : "Đã sẵn sàng: \(self.currentSongTitle)"
+                    if self.isPlaying { self.syncMusicNowPlaying() }
                     if self.playLocalSpeaker {
                         self.setupLocalPlayer(url: url)
                         if self.isPlaying && !self.isPaused {
@@ -6514,13 +5961,12 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         self.duration = toneDuration
         self.currentTime = 0
         self.statusText = self.isPlaying ? "🔥 Đang xả: \(preset.rawValue)" : "Đã chọn: \(preset.rawValue)"
+        if self.isPlaying { self.syncMusicNowPlaying() }
     }
 
     private func setupLocalPlayer(url: URL) {
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP])
-            try session.setActive(true)
+            BackgroundManager.shared.applyAudioSessionCategory()
 
             localPlayer = try AVAudioPlayer(contentsOf: url)
             localPlayer?.delegate = self
@@ -6580,12 +6026,24 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         addLog("⚡ Khởi động HỆ THỐNG TIÊN NGHỊCH: Triệu tập \(tokensToUse.count) Đạo hữu vào phòng [\(channelId)]")
 
         BackgroundManager.shared.start(tag: "music")
-        NowPlayingHelper.shared.start(onStop: { [weak self] in
-            Task { @MainActor in self?.stopSpam() }
-        })
-        NowPlayingHelper.shared.update(
-            title: "Xả Cha VIP: \(currentSongTitle)",
-            detail: "Đang phát vào kênh [\(channelId)] (\(tokensToUse.count) bot)"
+        NowPlayingHelper.shared.registerSession(
+            NowPlayingSessionState(
+                feature: .music,
+                title: currentSongTitle,
+                detail: "Xả Nhạc VIP • Triệu tập \(tokensToUse.count) token",
+                controlsHint: "⏸ Câm/Sủa • ◀◀/▶▶ Chuyển bài • Kéo tua",
+                isPaused: false,
+                elapsedTime: 0,
+                duration: duration,
+                isLiveStream: duration <= 0,
+                onPlay: { [weak self] in self?.resumeSpam() },
+                onPause: { [weak self] in self?.pauseSpam() },
+                onStop: { [weak self] in self?.stopSpam() },
+                onNext: { [weak self] in self?.playNext() },
+                onPrevious: { [weak self] in self?.playPrevious() },
+                onSeek: { [weak self] sec in self?.seek(to: sec) }
+            ),
+            focus: true
         )
 
         Task { [weak self] in
@@ -6674,9 +6132,25 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     self.localPlayer?.play()
                 }
 
+                self.syncMusicNowPlaying()
                 self.startStreamingTask()
             }
         }
+    }
+
+    func syncMusicNowPlaying() {
+        guard isPlaying else { return }
+        let readyCount = activeSessions.filter { $0.isVoiceUDPReady }.count
+        let countLabel = readyCount > 0 ? "\(readyCount) phân thân" : "Đang kết nối..."
+        NowPlayingHelper.shared.updateSession(
+            .music,
+            title: currentSongTitle,
+            detail: "Xả Nhạc VIP • \(countLabel) • \(audioFX.rawValue)",
+            isPaused: isPaused,
+            elapsedTime: currentTime,
+            duration: duration,
+            isLiveStream: duration <= 0
+        )
     }
 
     // MARK: - SÁT CHIÊU CÂM MỒM (!cam) & SỦA TIẾP (!sua)
@@ -6689,6 +6163,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         localPlayer?.pause()
         statusText = "🔇 Đã phong ấn âm thanh (Câm mồm)"
         addLog("🔇 Đã phong ấn âm thanh (Câm mồm). Giữ nguyên toàn bộ phân thân trong phòng.")
+        syncMusicNowPlaying()
     }
 
     func resumeSpam() {
@@ -6700,6 +6175,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         localPlayer?.play()
         statusText = "🔊 Đã giải ấn! Tiếp tục xả hỏa lực"
         addLog("🔊 Đã giải ấn! Tiếp tục xả hỏa lực y như lúc ban đầu.")
+        syncMusicNowPlaying()
     }
 
     // MARK: - BẾ QUAN / THU HỒI PHÂN THÂN (!exit)
@@ -6726,10 +6202,8 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         localPlayer?.stop()
         localPlayer = nil
 
+        NowPlayingHelper.shared.endSession(.music)
         BackgroundManager.shared.stop(tag: "music")
-        if !BackgroundManager.shared.isKeepAliveActive {
-            NowPlayingHelper.shared.stop()
-        }
 
         statusText = "⛩️ Bế quan (Đã thu hồi toàn bộ phân thân)"
         addLog("⛩️ Đã bế quan, giải tán hàng đợi nhạc và thu hồi toàn bộ phân thân.")
@@ -6743,6 +6217,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         streamFrameIndex = Int(Double(decoder.totalFrames) * fraction)
         currentTime = seconds
         localPlayer?.currentTime = seconds
+        if isPlaying { syncMusicNowPlaying() }
     }
 
     // MARK: - STREAMING ENGINE ĐA PHÂN THÂN MAKE SUPER VIP
@@ -6903,6 +6378,9 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                         self.currentTime = Double(self.streamFrameIndex * 960) / 48000.0
                         self.visualizerLevels = (0..<8).map { _ in CGFloat.random(in: 0.2...0.95) }
                     }
+                    if self.streamFrameIndex % 50 == 0 {
+                        self.syncMusicNowPlaying()
+                    }
                 }
 
                 let nowNanos = DispatchTime.now().uptimeNanoseconds
@@ -6994,7 +6472,7 @@ struct VoiceRoomTabView: View {
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, 4)
-                        .padding(.bottom, 28)
+                        .padding(.bottom, 96)
                     }
                 }
             }
