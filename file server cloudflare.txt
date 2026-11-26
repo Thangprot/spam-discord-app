@@ -1,16 +1,39 @@
-// ============================================================
-// Cloudflare Worker — Quoc Thang Tools Backend (Anti-Crack v2)
+// ============================================================================
+// Cloudflare Worker — Quoc Thang Studio Backend (Anti-Crack & Anti-Tamper v3)
 // Binding: KV namespace APP_DATA
-// Environment Variables: ADMIN_SECRET
-// ============================================================
+// Environment Variables (đặt trong Cloudflare Worker Settings -> Variables & Secrets):
+//   - ADMIN_SECRET_HASH (Khuyến nghị: mã SHA-256 hex 64 ký tự của mật khẩu Admin, KHÔNG lưu mật khẩu dạng văn bản thuần!)
+//   - hoặc ADMIN_SECRET (tương thích ngược — Worker tự băm SHA-256 trước khi so sánh constant-time)
+// ============================================================================
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-CSRF",
 };
 
-const DISCORD_CONFIG = {
+const SEC_HEADERS_HTML = {
+  "Content-Type": "text/html; charset=utf-8",
+  "X-Frame-Options": "DENY",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "Cache-Control": "no-store, no-cache, must-revalidate",
+  "Content-Security-Policy": "default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';",
+};
+
+// ============================================================================
+// TOÀN BỘ API, ROUTE, HEADER, THAM SỐ DISCORD CHỈ LƯU DUY NHẤT TRÊN SERVER CLF
+// (Trong app iOS KHÔNG lưu bất cứ URL, route hay header nào của Discord!)
+// ============================================================================
+const SERVER_MASTER_SECRET = "QT_v2_SEC_9b8f2a4c7e1d5a8b3c6e9f2a4d7b1e8f";
+const CONFIG_VERSION = 3;
+
+const REMOTE_PUBLIC_ASSETS = {
+  cdn_avatars: "https://cdn.discordapp.com/avatars",
+  cdn_icons: "https://cdn.discordapp.com/icons",
+};
+
+const REMOTE_FUNCTIONAL_CONFIG = {
   api_base: "https://discord.com/api/v10",
   gateway_url: "wss://gateway.discord.gg/?v=10&encoding=json",
   cdn_avatars: "https://cdn.discordapp.com/avatars",
@@ -39,29 +62,310 @@ const DISCORD_CONFIG = {
   origin: "https://discord.com",
   referer: "https://discord.com/channels/@me",
   everyone_allow: "248896",
-  // ⚠️ MASTER SECRET DÙNG ĐỂ MÃ HÓA & KÝ GÓI TIN (ĐÃ OBFUSCATE TRONG APP)
-  app_secret: "QT_v2_SEC_9b8f2a4c7e1d5a8b3c6e9f2a4d7b1e8f",
+  routes: {
+    me: "/users/@me",
+    me_guilds: "/users/@me/guilds",
+    guild: "/guilds/{guild_id}",
+    guild_roles: "/guilds/{guild_id}/roles",
+    guild_member: "/guilds/{guild_id}/members/{user_id}",
+    guild_members: "/guilds/{guild_id}/members?limit=1000&after={after}",
+    guild_channels: "/guilds/{guild_id}/channels",
+    channel: "/channels/{channel_id}",
+    channel_messages: "/channels/{channel_id}/messages",
+    guild_ban: "/guilds/{guild_id}/bans/{user_id}",
+  },
+  headers: {
+    auth: "Authorization",
+    bot_prefix: "Bot ",
+    content_type: "Content-Type",
+    json_mime: "application/json",
+    user_agent: "User-Agent",
+    super_props: "X-Super-Properties",
+    locale_key: "X-Discord-Locale",
+    locale_val: "en-US",
+    tz_key: "X-Discord-Timezone",
+    tz_val: "Asia/Ho_Chi_Minh",
+    ctx_key: "X-Context-Properties",
+    ctx_val: "e30=",
+    origin: "Origin",
+    referer: "Referer",
+  },
+  voice: {
+    ws_scheme: "wss://",
+    ws_query: "/?v=8",
+    ip_lookup_url: "https://api.ipify.org",
+    aead_aes: "aead_aes256_gcm_rtpsize",
+    aead_xchacha: "aead_xchacha20_poly1305_rtpsize",
+    gw_os: "iOS",
+    gw_browser: "Safari",
+    gw_device: "iPhone",
+    audio_codec: "opus",
+    video_codec: "H264",
+    audio_pt: 120,
+    video_pt: 101,
+    rtx_pt: 102,
+    stream_rid: "100",
+  },
 };
+
+const VALID_FEATURES = new Set(["tokens", "spam", "voice", "music", "bot_nuke", "user_nuke"]);
+
+// Trả về CHÍNH XÁC thông tin cấu hình cho từng chức năng yêu cầu (người dùng dùng chức năng nào trả về chức năng đó)
+function buildScopedFeatureConfig(feature) {
+  const f = REMOTE_FUNCTIONAL_CONFIG;
+  const r = f.routes;
+  const h = f.headers;
+  const v = f.voice;
+
+  switch (feature) {
+    case "tokens":
+      return {
+        api_base: f.api_base,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_desktop: f.user_agent_desktop,
+        super_properties_desktop: f.super_properties_desktop,
+        routes: {
+          me: r.me,
+          me_guilds: r.me_guilds,
+        },
+        headers: {
+          auth: h.auth,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+          super_props: h.super_props,
+          locale_key: h.locale_key,
+          locale_val: h.locale_val,
+        },
+      };
+
+    case "spam":
+      return {
+        api_base: f.api_base,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_desktop: f.user_agent_desktop,
+        super_properties_desktop: f.super_properties_desktop,
+        routes: {
+          me: r.me,
+          me_guilds: r.me_guilds,
+          guild_channels: r.guild_channels,
+          channel_messages: r.channel_messages,
+        },
+        headers: {
+          auth: h.auth,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+          super_props: h.super_props,
+          locale_key: h.locale_key,
+          locale_val: h.locale_val,
+        },
+      };
+
+    case "voice":
+      return {
+        api_base: f.api_base,
+        gateway_url: f.gateway_url,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_mobile: f.user_agent_mobile,
+        super_properties_mobile: f.super_properties_mobile,
+        origin: f.origin,
+        referer: f.referer,
+        routes: {
+          guild_channels: r.guild_channels,
+          channel: r.channel,
+        },
+        headers: {
+          auth: h.auth,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+          super_props: h.super_props,
+          locale_key: h.locale_key,
+          locale_val: h.locale_val,
+          tz_key: h.tz_key,
+          tz_val: h.tz_val,
+          ctx_key: h.ctx_key,
+          ctx_val: h.ctx_val,
+          origin: h.origin,
+          referer: h.referer,
+        },
+        voice: {
+          ws_scheme: v.ws_scheme,
+          ws_query: v.ws_query,
+          ip_lookup_url: v.ip_lookup_url,
+          aead_aes: v.aead_aes,
+          aead_xchacha: v.aead_xchacha,
+          gw_os: v.gw_os,
+          gw_browser: v.gw_browser,
+          gw_device: v.gw_device,
+          audio_codec: v.audio_codec,
+          video_codec: v.video_codec,
+          audio_pt: v.audio_pt,
+          video_pt: v.video_pt,
+          rtx_pt: v.rtx_pt,
+          stream_rid: v.stream_rid,
+        },
+      };
+
+    case "music":
+      return {
+        api_base: f.api_base,
+        gateway_url: f.gateway_url,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_mobile: f.user_agent_mobile,
+        super_properties_mobile: f.super_properties_mobile,
+        origin: f.origin,
+        referer: f.referer,
+        routes: {
+          guild_channels: r.guild_channels,
+          channel: r.channel,
+        },
+        headers: {
+          auth: h.auth,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+          super_props: h.super_props,
+          locale_key: h.locale_key,
+          locale_val: h.locale_val,
+          tz_key: h.tz_key,
+          tz_val: h.tz_val,
+          ctx_key: h.ctx_key,
+          ctx_val: h.ctx_val,
+          origin: h.origin,
+          referer: h.referer,
+        },
+        voice: {
+          ws_scheme: v.ws_scheme,
+          ws_query: v.ws_query,
+          ip_lookup_url: v.ip_lookup_url,
+          aead_aes: v.aead_aes,
+          aead_xchacha: v.aead_xchacha,
+          gw_os: v.gw_os,
+          gw_browser: v.gw_browser,
+          gw_device: v.gw_device,
+        },
+      };
+
+    case "bot_nuke":
+      return {
+        api_base: f.api_base,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_bot: f.user_agent_bot,
+        everyone_allow: f.everyone_allow,
+        routes: {
+          me: r.me,
+          me_guilds: r.me_guilds,
+          guild: r.guild,
+          guild_roles: r.guild_roles,
+          guild_member: r.guild_member,
+          guild_members: r.guild_members,
+          guild_channels: r.guild_channels,
+          channel: r.channel,
+          channel_messages: r.channel_messages,
+          guild_ban: r.guild_ban,
+        },
+        headers: {
+          auth: h.auth,
+          bot_prefix: h.bot_prefix,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+        },
+      };
+
+    case "user_nuke":
+      return {
+        api_base: f.api_base,
+        gateway_url: f.gateway_url,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_mobile: f.user_agent_mobile,
+        super_properties_mobile: f.super_properties_mobile,
+        origin: f.origin,
+        referer: f.referer,
+        everyone_allow: f.everyone_allow,
+        routes: {
+          me: r.me,
+          me_guilds: r.me_guilds,
+          guild: r.guild,
+          guild_roles: r.guild_roles,
+          guild_member: r.guild_member,
+          guild_members: r.guild_members,
+          guild_channels: r.guild_channels,
+          channel: r.channel,
+          channel_messages: r.channel_messages,
+          guild_ban: r.guild_ban,
+        },
+        headers: {
+          auth: h.auth,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+          super_props: h.super_props,
+          locale_key: h.locale_key,
+          locale_val: h.locale_val,
+          tz_key: h.tz_key,
+          tz_val: h.tz_val,
+          ctx_key: h.ctx_key,
+          ctx_val: h.ctx_val,
+          origin: h.origin,
+          referer: h.referer,
+        },
+        voice: {
+          gw_os: v.gw_os,
+          gw_browser: v.gw_browser,
+          gw_device: v.gw_device,
+        },
+      };
+
+    default:
+      return null;
+  }
+}
 
 // ---------- Helpers Cryptography ----------
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 function base64ToUint8(str) {
-  const binary = atob(str);
+  let norm = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (norm.length % 4 !== 0) norm += "=";
+  const binary = atob(norm);
   const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
 
 function uint8ToBase64(bytes) {
   let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary);
+}
+
+function toHex(bytes) {
+  return Array.from(new Uint8Array(bytes)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(str) {
+  const hash = await crypto.subtle.digest("SHA-256", enc.encode(str));
+  return toHex(hash);
+}
+
+// Constant-time string comparison (chống timing attack cho mật khẩu Admin & chữ ký)
+async function timingSafeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ha = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(a)));
+  const hb = new Uint8Array(await crypto.subtle.digest("SHA-256", enc.encode(b)));
+  let diff = ha.length ^ hb.length;
+  for (let i = 0; i < ha.length; i++) diff |= ha[i] ^ hb[i];
+  return diff === 0;
 }
 
 async function getAesKey(seed) {
@@ -72,29 +376,37 @@ async function getAesKey(seed) {
 async function hmacSign(msg, secret) {
   const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(msg));
-  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
+  return toHex(sig);
 }
 
-async function decryptClientPayload(reqBody, secret) {
+async function decryptClientPayload(reqBody, env, secret) {
   const { payload, nonce, ts, sig } = reqBody || {};
   if (!payload || !nonce || !ts || !sig) {
     throw new Error("Missing required security envelope");
   }
 
-  // Chống Replay Attack: Cho phép dung sai chênh lệch thời gian 300 giây (5 phút) để tránh lỗi lệch giờ thiết bị
+  // Chống Replay Attack #1: Dung sai thời gian 300s
   const nowSec = Math.floor(Date.now() / 1000);
-  const reqSec = parseInt(ts);
+  const reqSec = parseInt(ts, 10);
   if (isNaN(reqSec) || Math.abs(nowSec - reqSec) > 300) {
     throw new Error("Request expired / Replay attack detected");
   }
 
-  // Kiểm tra chữ ký HMAC
+  // Kiểm tra chữ ký HMAC-SHA256 (constant-time)
   const expectedSig = await hmacSign(`${payload}:${nonce}:${ts}`, secret);
-  if (sig.toLowerCase() !== expectedSig.toLowerCase()) {
+  if (!(await timingSafeEqualStr(String(sig).toLowerCase(), expectedSig.toLowerCase()))) {
     throw new Error("Invalid cryptographic signature");
   }
 
-  // Giải mã AES-GCM
+  // Chống Replay Attack #2: Nonce 1 lần trong KV (TTL 360s)
+  const nonceKey = `NONCE:${nonce}`;
+  const seen = await env.APP_DATA.get(nonceKey);
+  if (seen) {
+    throw new Error("Replay nonce reused");
+  }
+  await env.APP_DATA.put(nonceKey, "1", { expirationTtl: 360 });
+
+  // Giải mã AES-256-GCM
   const key = await getAesKey(`${secret}:${nonce}:${ts}`);
   const combined = base64ToUint8(payload);
   if (combined.length < 28) throw new Error("Payload too short");
@@ -120,463 +432,1375 @@ async function encryptServerResponse(respObj, nonce, ts, secret) {
   return { payload, sig };
 }
 
-async function generateSessionToken(key, machineId, expiresAt, secret) {
+async function generateSessionToken(key, machineId, expiresAt, secret, extra = {}) {
   const iat = Math.floor(Date.now() / 1000);
-  const exp = expiresAt ? Math.floor(expiresAt / 1000) : iat + 86400 * 30;
+  // Session token sống ngắn (2 giờ) để ép app định kỳ xác thực lại với server
+  const maxShortExp = iat + 7200;
+  const keyExp = expiresAt ? Math.floor(expiresAt / 1000) : maxShortExp;
+  const exp = Math.min(maxShortExp, keyExp);
+  const rand = toHex(crypto.getRandomValues(new Uint8Array(6)));
   const payloadObj = {
-    key: key,
+    key,
     mid: machineId,
-    iat: iat,
-    exp: exp,
-    salt: Math.random().toString(36).substring(2, 10),
+    iat,
+    exp,
+    salt: rand,
+    ...extra,
   };
   const bodyB64 = uint8ToBase64(enc.encode(JSON.stringify(payloadObj)));
   const sig = await hmacSign(bodyB64, secret);
   return `${bodyB64}.${sig}`;
 }
 
-// ---------- KV Helpers ----------
-const json = (data, status = 200) =>
+async function generateFeatureToken(key, machineId, feature, secret) {
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + 300; // Feature permit sống 5 phút
+  const payloadObj = {
+    key,
+    mid: machineId,
+    ft: feature,
+    iat,
+    exp,
+    salt: toHex(crypto.getRandomValues(new Uint8Array(4))),
+  };
+  const bodyB64 = uint8ToBase64(enc.encode(JSON.stringify(payloadObj)));
+  const sig = await hmacSign(bodyB64, secret);
+  return { token: `${bodyB64}.${sig}`, exp };
+}
+
+// ---------- KV & Security Helpers ----------
+const json = (data, status = 200, extraHeaders = {}) =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...CORS, ...extraHeaders },
   });
 
 const nowMs = () => Date.now();
+const getClientIP = (req) => req.headers.get("CF-Connecting-IP") || req.headers.get("X-Forwarded-For") || "unknown";
 
 const getLicense = async (env, key) => {
   const raw = await env.APP_DATA.get(key);
   return raw ? JSON.parse(raw) : null;
 };
-const putLicense = (env, key, data) =>
-  env.APP_DATA.put(key, JSON.stringify(data));
+const putLicense = (env, key, data) => env.APP_DATA.put(key, JSON.stringify(data));
+const deleteLicense = (env, key) => env.APP_DATA.delete(key);
 
-const makeKey = () => {
-  const s = () => Math.random().toString(36).substring(2, 7).toUpperCase();
-  return `QT-${s()}-${s()}-${s()}`;
-};
-
-// ---------- Giao diện Admin ----------
-async function handleAdminPage() {
-  const html = `
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quoc Thang Tools - Secure Admin</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #090d16; color: #f1f5f9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
-        .card { background: #131d2e; border: 1px solid #1e293b; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.7); width: 100%; max-width: 480px; padding: 32px; }
-        h2 { margin: 0 0 8px 0; color: #6366f1; text-align: center; font-size: 24px; font-weight: 800; }
-        p.sub { margin: 0 0 24px 0; color: #94a3b8; font-size: 13px; text-align: center; }
-        input { width: 100%; padding: 12px 14px; margin: 8px 0; border-radius: 8px; border: 1px solid #334155; background: #0b1120; color: white; font-size: 14px; }
-        input:focus { outline: none; border-color: #6366f1; }
-        button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: none; background: #4f46e5; color: white; font-weight: bold; font-size: 14px; cursor: pointer; transition: 0.2s; }
-        button:hover { background: #4338ca; }
-        .tab-bar { display: flex; gap: 8px; margin-bottom: 20px; }
-        .tab-btn { flex: 1; padding: 8px; background: #1e293b; color: #94a3b8; border: 1px solid #334155; border-radius: 8px; font-size: 13px; cursor: pointer; }
-        .tab-btn.active { background: #4f46e5; color: white; border-color: #4f46e5; }
-        .result-box { display: none; margin-top: 16px; background: #064e3b; padding: 16px; border-radius: 10px; border: 1px solid #10b981; }
-        .key-text { font-size: 18px; font-weight: bold; color: #34d399; letter-spacing: 1.5px; font-family: monospace; word-break: break-all; margin: 8px 0; }
-        .info-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #1e293b; font-size: 13px; }
-        .info-label { color: #94a3b8; }
-        .info-val { color: #f8fafc; font-weight: 600; }
-        .error { color: #f87171; font-size: 13px; margin-top: 10px; text-align: center; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h2>🛡️ Quoc Thang Admin</h2>
-        <p class="sub">Hệ thống quản lý bản quyền & chống crack v2</p>
-
-        <div id="loginSection">
-            <input type="password" id="adminPass" placeholder="Nhập Mật Khẩu Admin (ADMIN_SECRET)">
-            <button onclick="checkLogin()">Đăng Nhập Quản Trị</button>
-        </div>
-
-        <div id="adminPanel" style="display:none;">
-            <div class="tab-bar">
-                <button class="tab-btn active" id="btnTabGen" onclick="switchTab('gen')">Tạo Key</button>
-                <button class="tab-btn" id="btnTabManage" onclick="switchTab('manage')">Tra Cứu & Reset</button>
-            </div>
-
-            <!-- Tab Tạo Key -->
-            <div id="tabGen">
-                <input type="text" id="email" placeholder="Ghi chú / Khách hàng (VD: anh Thắng Discord)">
-                <input type="number" id="days" placeholder="Số ngày sử dụng (VD: 30)" value="30" min="1">
-                <button onclick="generateKey()">Tạo License Key Mới</button>
-                <div id="resultBox" class="result-box">
-                    <p style="margin:0; font-size:13px; color:#a7f3d0;">🎉 Tạo Key Thành Công!</p>
-                    <div id="licenseKey" class="key-text"></div>
-                    <button onclick="copyKey()" style="background:#10b981;">Sao Chép Key</button>
-                </div>
-            </div>
-
-            <!-- Tab Quản Lý Key -->
-            <div id="tabManage" style="display:none;">
-                <input type="text" id="searchKey" placeholder="Nhập mã License Key (QT-XXXX-...)">
-                <button onclick="lookupKey()">Kiểm Tra Thông Tin Key</button>
-
-                <div id="manageBox" style="display:none; margin-top:16px; background:#0b1120; padding:14px; border-radius:10px; border:1px solid #334155;">
-                    <div class="info-row"><span class="info-label">Trạng thái:</span><span id="mStatus" class="info-val"></span></div>
-                    <div class="info-row"><span class="info-label">Hạn dùng:</span><span id="mExpiry" class="info-val"></span></div>
-                    <div class="info-row"><span class="info-label">Khách hàng:</span><span id="mNote" class="info-val"></span></div>
-                    <div class="info-row"><span class="info-label">Thiết bị gắn:</span><span id="mHwid" class="info-val" style="font-size:11px; max-width:200px; overflow:hidden; text-overflow:ellipsis;"></span></div>
-                    
-                    <div style="display:flex; gap:8px; margin-top:14px;">
-                        <button onclick="resetHwid()" style="background:#d97706; margin:0;">Reset Thiết Bị (HWID)</button>
-                        <button id="btnToggle" onclick="toggleKey()" style="background:#dc2626; margin:0;">Khóa Key</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div id="errorMsg" class="error"></div>
-    </div>
-
-    <script>
-        let currentPass = "";
-
-        function checkLogin() {
-            currentPass = document.getElementById('adminPass').value;
-            if(!currentPass) return;
-            document.getElementById('loginSection').style.display = 'none';
-            document.getElementById('adminPanel').style.display = 'block';
-            document.getElementById('errorMsg').innerText = "";
-        }
-
-        function switchTab(t) {
-            document.getElementById('tabGen').style.display = t === 'gen' ? 'block' : 'none';
-            document.getElementById('tabManage').style.display = t === 'manage' ? 'block' : 'none';
-            document.getElementById('btnTabGen').className = t === 'gen' ? 'tab-btn active' : 'tab-btn';
-            document.getElementById('btnTabManage').className = t === 'manage' ? 'tab-btn active' : 'tab-btn';
-            document.getElementById('errorMsg').innerText = "";
-        }
-
-        async function generateKey() {
-            const email = document.getElementById('email').value;
-            const days = document.getElementById('days').value;
-            const errorMsg = document.getElementById('errorMsg');
-            const resultBox = document.getElementById('resultBox');
-            errorMsg.innerText = "";
-            resultBox.style.display = 'none';
-
-            try {
-                const res = await fetch('/admin/generate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: currentPass, email, days })
-                });
-                const data = await res.json();
-                if (res.ok && data.valid) {
-                    document.getElementById('licenseKey').innerText = data.key;
-                    resultBox.style.display = 'block';
-                } else {
-                    errorMsg.innerText = data.error || "Lỗi tạo key";
-                }
-            } catch (err) {
-                errorMsg.innerText = "Không thể kết nối đến máy chủ";
-            }
-        }
-
-        async function lookupKey() {
-            const key = document.getElementById('searchKey').value.trim();
-            const errorMsg = document.getElementById('errorMsg');
-            const manageBox = document.getElementById('manageBox');
-            errorMsg.innerText = "";
-            manageBox.style.display = 'none';
-
-            if (!key) return;
-            try {
-                const res = await fetch('/admin/info', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: currentPass, key })
-                });
-                const data = await res.json();
-                if (res.ok && data.found) {
-                    document.getElementById('mStatus').innerText = data.disabled ? "🚫 ĐÃ KHÓA" : (data.expired ? "⏰ HẾT HẠN" : "✅ HỢP LỆ");
-                    document.getElementById('mStatus').style.color = data.disabled ? "#ef4444" : (data.expired ? "#f59e0b" : "#10b981");
-                    document.getElementById('mExpiry').innerText = new Date(data.expires_at).toLocaleDateString('vi-VN');
-                    document.getElementById('mNote').innerText = data.email || "(Trống)";
-                    document.getElementById('mHwid').innerText = data.machine_id ? data.machine_id : "Chưa gắn thiết bị";
-                    
-                    const btnToggle = document.getElementById('btnToggle');
-                    btnToggle.innerText = data.disabled ? "Mở Khóa Key" : "Khóa Key";
-                    btnToggle.style.background = data.disabled ? "#10b981" : "#dc2626";
-                    manageBox.style.display = 'block';
-                } else {
-                    errorMsg.innerText = data.error || "Không tìm thấy key";
-                }
-            } catch (e) {
-                errorMsg.innerText = "Lỗi kết nối máy chủ";
-            }
-        }
-
-        async function resetHwid() {
-            const key = document.getElementById('searchKey').value.trim();
-            if (!confirm("Bạn có chắc muốn xóa thiết bị cũ để người dùng đăng nhập trên điện thoại mới?")) return;
-            try {
-                const res = await fetch('/admin/reset_hwid', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: currentPass, key })
-                });
-                const d = await res.json();
-                if (d.success) {
-                    alert("Đã reset thiết bị thành công!");
-                    lookupKey();
-                } else {
-                    alert(d.error || "Lỗi reset HWID");
-                }
-            } catch (e) { alert("Lỗi kết nối"); }
-        }
-
-        async function toggleKey() {
-            const key = document.getElementById('searchKey').value.trim();
-            try {
-                const res = await fetch('/admin/toggle', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: currentPass, key })
-                });
-                const d = await res.json();
-                if (d.success) {
-                    alert("Cập nhật trạng thái thành công!");
-                    lookupKey();
-                } else {
-                    alert(d.error || "Lỗi");
-                }
-            } catch (e) { alert("Lỗi kết nối"); }
-        }
-
-        function copyKey() {
-            const key = document.getElementById('licenseKey').innerText;
-            navigator.clipboard.writeText(key);
-            alert("Đã copy: " + key);
-        }
-    </script>
-</body>
-</html>
-  `;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+function randomChunk(len = 5) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[bytes[i] % chars.length];
+  return out;
 }
 
-// ---------- Logic API Quản Trị ----------
-async function handleGenerateKey(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const body = await req.json().catch(() => ({}));
-  if (!env.ADMIN_SECRET || body.password !== env.ADMIN_SECRET) {
-    return json({ error: "Invalid password" }, 401);
+function makeKey(prefix = "QT") {
+  const cleanPrefix = String(prefix || "QT").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6) || "QT";
+  return `${cleanPrefix}-${randomChunk(5)}-${randomChunk(5)}-${randomChunk(5)}`;
+}
+
+// ---------- Security Policy & Tamper Audit (Anti-Crack App) ----------
+const DEFAULT_SEC_SETTINGS = {
+  enforce_binary_hash: false,
+  allowed_hashes: [],
+  enforce_source_sig: false,
+  allowed_source_sigs: [],
+};
+
+async function getSecSettings(env) {
+  const raw = await env.APP_DATA.get("SEC:SETTINGS");
+  if (!raw) return { ...DEFAULT_SEC_SETTINGS };
+  try {
+    return { ...DEFAULT_SEC_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_SEC_SETTINGS };
+  }
+}
+
+async function recordObservedBuild(env, integrity) {
+  if (!integrity || (!integrity.text_hash && !integrity.source_sig)) return;
+  const raw = await env.APP_DATA.get("SEC:OBSERVED");
+  let list = [];
+  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  const textHash = String(integrity.text_hash || "");
+  const sourceSig = String(integrity.source_sig || "");
+  const bundleId = String(integrity.bundle_id || "");
+  const idx = list.findIndex(x => x.text_hash === textHash && x.source_sig === sourceSig);
+  const entry = {
+    text_hash: textHash,
+    source_sig: sourceSig,
+    bundle_id: bundleId,
+    last_seen: nowMs(),
+    count: idx >= 0 ? (list[idx].count || 1) + 1 : 1,
+  };
+  if (idx >= 0) list.splice(idx, 1);
+  list.unshift(entry);
+  if (list.length > 12) list = list.slice(0, 12);
+  await env.APP_DATA.put("SEC:OBSERVED", JSON.stringify(list));
+}
+
+async function logSecurityAlert(env, req, reason, details = {}) {
+  const raw = await env.APP_DATA.get("SEC:ALERTS");
+  let alerts = [];
+  try { alerts = raw ? JSON.parse(raw) : []; } catch { alerts = []; }
+  alerts.unshift({
+    ts: nowMs(),
+    ip: getClientIP(req),
+    reason,
+    ...details,
+  });
+  if (alerts.length > 60) alerts = alerts.slice(0, 60);
+  await env.APP_DATA.put("SEC:ALERTS", JSON.stringify(alerts));
+}
+
+async function verifyAppIntegrity(req, env, body) {
+  const integrity = body && typeof body.integrity === "object" ? body.integrity : null;
+  const key = (body.license_key || "").trim().toUpperCase();
+  const mid = (body.machine_id || "").trim();
+
+  if (!integrity) {
+    await logSecurityAlert(env, req, "Thiếu trường integrity (client giả mạo / bản cũ)", { key, mid });
+    return { ok: false, cracked: true, error: "Phiên bản ứng dụng không hợp lệ hoặc đã bị chỉnh sửa." };
   }
 
-  const key = makeKey();
-  const days = parseInt(body.days) || 30;
-  const expiresAt = nowMs() + days * 86400000;
+  // Ghi nhận hash build để Admin có thể ghim trực tiếp trên web
+  await recordObservedBuild(env, integrity);
 
-  const licData = {
-    email: body.email || "",
-    created_at: nowMs(),
-    expires_at: expiresAt,
-    machine_id: null,
-    disabled: false
-  };
+  if (integrity.tampered === true) {
+    const reasons = Array.isArray(integrity.reasons) ? integrity.reasons.join(", ") : "Tamper detected";
+    await logSecurityAlert(env, req, `Phát hiện công cụ bẻ khóa/can thiệp: ${reasons}`, { key, mid, text_hash: integrity.text_hash });
+    return { ok: false, cracked: true, error: "Phát hiện công cụ debug / tiêm thư viện / chỉnh sửa ứng dụng!" };
+  }
 
-  await putLicense(env, key, licData);
-  return json({ valid: true, key: key, expires_at: expiresAt });
+  const settings = await getSecSettings(env);
+  if (settings.enforce_binary_hash && Array.isArray(settings.allowed_hashes) && settings.allowed_hashes.length > 0) {
+    const h = String(integrity.text_hash || "").toLowerCase();
+    const allowed = settings.allowed_hashes.map(x => String(x).toLowerCase());
+    if (!h || !allowed.includes(h)) {
+      await logSecurityAlert(env, req, "Sai mã băm __TEXT (Binary đã bị patch/sửa mã nguồn)", { key, mid, text_hash: h });
+      return { ok: false, cracked: true, error: "File thực thi của ứng dụng đã bị chỉnh sửa trái phép!" };
+    }
+  }
+
+  if (settings.enforce_source_sig && Array.isArray(settings.allowed_source_sigs) && settings.allowed_source_sigs.length > 0) {
+    const s = String(integrity.source_sig || "").toLowerCase();
+    const allowed = settings.allowed_source_sigs.map(x => String(x).toLowerCase());
+    if (!s || !allowed.includes(s)) {
+      await logSecurityAlert(env, req, "Sai chữ ký mã nguồn (Source đã bị chỉnh sửa)", { key, mid, source_sig: s });
+      return { ok: false, cracked: true, error: "Mã nguồn ứng dụng đã bị thay đổi trái phép!" };
+    }
+  }
+
+  return { ok: true };
+}
+
+// ---------- Server-Side Anti-Crack Admin Session Auth ----------
+function parseCookies(req) {
+  const header = req.headers.get("Cookie") || "";
+  const map = {};
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq > 0) {
+      map[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+    }
+  }
+  return map;
+}
+
+async function getAdminSigningSecret(env) {
+  if (env.ADMIN_SECRET_HASH && String(env.ADMIN_SECRET_HASH).trim().length >= 32) {
+    return String(env.ADMIN_SECRET_HASH).trim().toLowerCase();
+  }
+  if (env.ADMIN_SECRET && String(env.ADMIN_SECRET).length > 0) {
+    return await sha256Hex(String(env.ADMIN_SECRET));
+  }
+  return null;
+}
+
+async function verifyAdminPassword(pass, env) {
+  if (typeof pass !== "string" || !pass) return false;
+  const expectedHash = await getAdminSigningSecret(env);
+  if (!expectedHash) return false;
+  const inputHash = await sha256Hex(pass);
+  return await timingSafeEqualStr(inputHash, expectedHash);
+}
+
+async function createAdminCookie(req, env) {
+  const signKey = await getAdminSigningSecret(env);
+  const ipHash = (await sha256Hex(getClientIP(req))).slice(0, 16);
+  const uaHash = (await sha256Hex(req.headers.get("User-Agent") || "")).slice(0, 16);
+  const csrf = toHex(crypto.getRandomValues(new Uint8Array(16)));
+  const exp = Math.floor(Date.now() / 1000) + 7200; // Phiên Admin sống 2 giờ
+  const payloadObj = { iph: ipHash, uah: uaHash, csrf, exp, nonce: toHex(crypto.getRandomValues(new Uint8Array(8))) };
+  const bodyB64 = uint8ToBase64(enc.encode(JSON.stringify(payloadObj)));
+  const sig = await hmacSign(`ADMIN_V3:${bodyB64}`, signKey);
+  const token = `${bodyB64}.${sig}`;
+  const isHttps = new URL(req.url).protocol === "https:";
+  const cookie = `QT_ADMIN_SID=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=7200${isHttps ? "; Secure" : ""}`;
+  return { cookie, csrf, exp };
+}
+
+async function verifyAdminSession(req, env, requireCsrf = true) {
+  const signKey = await getAdminSigningSecret(env);
+  if (!signKey) return { ok: false, error: "Server chưa cấu hình ADMIN_SECRET_HASH hoặc ADMIN_SECRET" };
+
+  const cookies = parseCookies(req);
+  const token = cookies["QT_ADMIN_SID"];
+  if (!token || !token.includes(".")) {
+    return { ok: false, error: "Phiên đăng nhập chưa xác thực hoặc đã hết hạn." };
+  }
+
+  const [bodyB64, sig] = token.split(".");
+  if (!bodyB64 || !sig) return { ok: false, error: "Cookie không hợp lệ." };
+
+  const expectedSig = await hmacSign(`ADMIN_V3:${bodyB64}`, signKey);
+  if (!(await timingSafeEqualStr(sig.toLowerCase(), expectedSig.toLowerCase()))) {
+    return { ok: false, error: "Chữ ký phiên quản trị bị giả mạo." };
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(dec.decode(base64ToUint8(bodyB64)));
+  } catch {
+    return { ok: false, error: "Cookie lỗi định dạng." };
+  }
+
+  if (!payload.exp || Math.floor(Date.now() / 1000) > payload.exp) {
+    return { ok: false, error: "Phiên quản trị đã hết hạn, vui lòng đăng nhập lại." };
+  }
+
+  const curUaHash = (await sha256Hex(req.headers.get("User-Agent") || "")).slice(0, 16);
+  if (payload.uah !== curUaHash) {
+    return { ok: false, error: "Trình duyệt không khớp phiên đăng nhập." };
+  }
+
+  if (requireCsrf) {
+    const hdrCsrf = req.headers.get("X-Admin-CSRF") || "";
+    if (!(await timingSafeEqualStr(hdrCsrf, payload.csrf || ""))) {
+      return { ok: false, error: "Thiếu hoặc sai mã CSRF bảo mật." };
+    }
+  }
+
+  return { ok: true, csrf: payload.csrf, exp: payload.exp };
+}
+
+async function handleAdminAuth(req, env) {
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  const hasSecret = await getAdminSigningSecret(env);
+  if (!hasSecret) return json({ error: "Chưa cấu hình ADMIN_SECRET_HASH hoặc ADMIN_SECRET trên Cloudflare Worker" }, 500);
+
+  const ip = getClientIP(req);
+  const rlKey = `ADMIN_RL:${ip}`;
+  const rawRl = await env.APP_DATA.get(rlKey);
+  let rl = { fails: 0, lockedUntil: 0 };
+  if (rawRl) {
+    try { rl = JSON.parse(rawRl); } catch {}
+  }
+
+  if (rl.lockedUntil && nowMs() < rl.lockedUntil) {
+    const remainSec = Math.ceil((rl.lockedUntil - nowMs()) / 1000);
+    return json({ ok: false, error: `Nhập sai quá nhiều lần! Khóa IP thêm ${remainSec} giây.` }, 429);
+  }
+
+  const body = await req.json().catch(() => ({}));
+  const pass = String(body.password || "");
+  const valid = await verifyAdminPassword(pass, env);
+
+  if (!valid) {
+    // Chống brute-force: tăng đếm lỗi & delay nhẹ
+    rl.fails = (rl.fails || 0) + 1;
+    if (rl.fails >= 5) {
+      rl.lockedUntil = nowMs() + 15 * 60 * 1000; // Khóa 15 phút
+      await logSecurityAlert(env, req, `Brute-force Admin bị chặn (${rl.fails} lần sai)`);
+    }
+    await env.APP_DATA.put(rlKey, JSON.stringify(rl), { expirationTtl: 900 });
+    await new Promise(r => setTimeout(r, 450));
+    const left = Math.max(0, 5 - rl.fails);
+    return json({
+      ok: false,
+      error: left > 0 ? `Sai mật khẩu quản trị! Còn ${left} lần thử.` : "Sai quá 5 lần! IP đã bị khóa 15 phút."
+    }, 401);
+  }
+
+  // Đăng nhập thành công -> xóa bộ đếm lỗi & cấp HttpOnly Cookie ký HMAC
+  await env.APP_DATA.delete(rlKey);
+  const { cookie, csrf, exp } = await createAdminCookie(req, env);
+  return json(
+    { ok: true, csrf, exp },
+    200,
+    { "Set-Cookie": cookie }
+  );
+}
+
+async function handleAdminLogout(req) {
+  const isHttps = new URL(req.url).protocol === "https:";
+  const clearCookie = `QT_ADMIN_SID=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${isHttps ? "; Secure" : ""}`;
+  return json({ ok: true }, 200, { "Set-Cookie": clearCookie });
+}
+
+// ---------- Giao diện Login Gate (Khi chưa đăng nhập — KHÔNG lộ bất kỳ code Admin nào!) ----------
+function renderAdminLoginPage() {
+  const html = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quoc Thang Studio — Xác Thực Quản Trị</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;
+      background: radial-gradient(circle at 20% 20%, rgba(99,102,241,0.22), transparent 45%),
+                  radial-gradient(circle at 80% 80%, rgba(168,85,247,0.18), transparent 45%),
+                  #060913;
+      color: #f8fafc;
+    }
+    .glass {
+      width: 100%; max-width: 420px; padding: 34px 28px;
+      background: rgba(15, 23, 42, 0.78); backdrop-filter: blur(20px);
+      border: 1px solid rgba(148, 163, 184, 0.16); border-radius: 24px;
+      box-shadow: 0 24px 70px rgba(0,0,0,0.65);
+    }
+    .icon-box {
+      width: 64px; height: 64px; border-radius: 18px; margin: 0 auto 16px;
+      background: linear-gradient(135deg, #6366f1, #a855f7);
+      display: flex; align-items: center; justify-content: center; font-size: 30px;
+      box-shadow: 0 12px 30px rgba(99, 102, 241, 0.42);
+    }
+    h1 { text-align: center; font-size: 22px; font-weight: 800; letter-spacing: 0.3px; }
+    .sub { text-align: center; color: #94a3b8; font-size: 13px; margin: 6px 0 24px; }
+    label { display: block; font-size: 12px; font-weight: 700; color: #cbd5e1; margin-bottom: 8px; letter-spacing: 0.4px; }
+    input {
+      width: 100%; padding: 14px 16px; border-radius: 13px; border: 1px solid rgba(148,163,184,0.22);
+      background: rgba(2, 6, 23, 0.7); color: #fff; font-size: 15px; outline: none; transition: 0.2s;
+    }
+    input:focus { border-color: #818cf8; box-shadow: 0 0 0 3px rgba(99,102,241,0.25); }
+    button {
+      width: 100%; margin-top: 16px; padding: 14px; border: none; border-radius: 13px;
+      background: linear-gradient(135deg, #4f46e5, #7c3aed); color: #fff;
+      font-size: 15px; font-weight: 800; cursor: pointer; transition: 0.2s;
+      box-shadow: 0 10px 25px rgba(79,70,229,0.35);
+    }
+    button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+    .err {
+      margin-top: 14px; padding: 11px 13px; border-radius: 11px; display: none;
+      background: rgba(239, 68, 68, 0.14); border: 1px solid rgba(239,68,68,0.35);
+      color: #fca5a5; font-size: 13px; font-weight: 600; text-align: center;
+    }
+    .shield-note {
+      margin-top: 22px; text-align: center; font-size: 11px; color: #64748b;
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="glass">
+    <div class="icon-box">🛡️</div>
+    <h1>Quoc Thang Admin</h1>
+    <p class="sub">Xác thực mật khẩu trên Server Cloudflare trước khi truy cập</p>
+    <form id="loginForm">
+      <label for="pass">MẬT KHẨU QUẢN TRỊ (ADMIN_SECRET)</label>
+      <input type="password" id="pass" placeholder="Nhập mật khẩu bí mật..." autocomplete="current-password" required>
+      <button type="submit" id="btnSubmit">Xác Thực & Vào Quản Trị</button>
+    </form>
+    <div id="errBox" class="err"></div>
+    <div class="shield-note">🔒 HttpOnly Signed Session • Chống Brute-Force 5 lần khóa IP 15 phút</div>
+  </div>
+  <script>
+    const form = document.getElementById('loginForm');
+    const passInput = document.getElementById('pass');
+    const btn = document.getElementById('btnSubmit');
+    const errBox = document.getElementById('errBox');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const password = passInput.value;
+      if (!password) return;
+      errBox.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = 'Đang xác thực trên Server...';
+      try {
+        const res = await fetch('/admin/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          location.reload();
+        } else {
+          errBox.textContent = data.error || 'Sai mật khẩu quản trị!';
+          errBox.style.display = 'block';
+          passInput.value = '';
+          passInput.focus();
+        }
+      } catch {
+        errBox.textContent = 'Không thể kết nối máy chủ Cloudflare.';
+        errBox.style.display = 'block';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Xác Thực & Vào Quản Trị';
+      }
+    });
+  </script>
+</body>
+</html>`;
+  return new Response(html, { headers: SEC_HEADERS_HTML });
+}
+
+// ---------- Giao diện Admin Studio Dashboard (CHỈ RENDER KHI ĐÃ XÁC THỰC COOKIE TRÊN SERVER!) ----------
+function renderAdminDashboardPage(csrfToken) {
+  const html = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quoc Thang Studio — Key & Anti-Crack Console</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #060913; --card: rgba(15, 23, 42, 0.82); --border: rgba(148,163,184,0.14);
+      --muted: #94a3b8; --text: #f8fafc; --accent: #6366f1; --accent2: #a855f7;
+      --green: #10b981; --red: #ef4444; --amber: #f59e0b;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at 15% 10%, rgba(99,102,241,0.18), transparent 40%),
+                  radial-gradient(circle at 85% 90%, rgba(168,85,247,0.15), transparent 40%),
+                  var(--bg);
+      color: var(--text); min-height: 100vh; padding: 20px 16px 60px;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+      padding: 16px 20px; border-radius: 20px; background: var(--card); border: 1px solid var(--border);
+      backdrop-filter: blur(16px); margin-bottom: 18px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-icon {
+      width: 44px; height: 44px; border-radius: 13px; display: flex; align-items: center; justify-content: center;
+      font-size: 20px; background: linear-gradient(135deg, var(--accent), var(--accent2));
+      box-shadow: 0 8px 20px rgba(99,102,241,0.35);
+    }
+    .brand h1 { font-size: 18px; font-weight: 800; }
+    .brand p { font-size: 12px; color: var(--muted); }
+    .btn-logout {
+      padding: 9px 15px; border-radius: 11px; border: 1px solid rgba(239,68,68,0.35);
+      background: rgba(239,68,68,0.14); color: #fca5a5; font-size: 13px; font-weight: 700; cursor: pointer;
+    }
+    .btn-logout:hover { background: rgba(239,68,68,0.28); }
+    .tabs {
+      display: flex; gap: 8px; padding: 5px; border-radius: 16px;
+      background: var(--card); border: 1px solid var(--border); margin-bottom: 18px;
+    }
+    .tab {
+      flex: 1; padding: 11px 12px; border: none; border-radius: 12px; background: transparent;
+      color: var(--muted); font-size: 13px; font-weight: 700; cursor: pointer; transition: 0.2s;
+    }
+    .tab.active {
+      background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff;
+      box-shadow: 0 6px 18px rgba(99,102,241,0.32);
+    }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 20px;
+      padding: 22px; margin-bottom: 16px; backdrop-filter: blur(16px);
+    }
+    .card h2 { font-size: 16px; font-weight: 800; margin-bottom: 4px; }
+    .card .desc { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .stat {
+      padding: 14px; border-radius: 15px; background: rgba(2, 6, 23, 0.55); border: 1px solid var(--border);
+    }
+    .stat .k { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; }
+    .stat .v { font-size: 24px; font-weight: 900; margin-top: 4px; }
+    label { display: block; font-size: 11px; font-weight: 700; color: #cbd5e1; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.4px; }
+    input, select, textarea {
+      width: 100%; padding: 11px 13px; border-radius: 11px; border: 1px solid rgba(148,163,184,0.2);
+      background: rgba(2, 6, 23, 0.72); color: #fff; font-size: 14px; outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: #818cf8; }
+    .presets { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0 16px; }
+    .chip {
+      padding: 7px 12px; border-radius: 999px; border: 1px solid rgba(99,102,241,0.35);
+      background: rgba(99,102,241,0.12); color: #c7d2fe; font-size: 12px; font-weight: 700; cursor: pointer;
+    }
+    .chip:hover, .chip.active { background: #4f46e5; color: #fff; border-color: #6366f1; }
+    .btn {
+      padding: 12px 16px; border: none; border-radius: 12px; font-size: 14px; font-weight: 800;
+      cursor: pointer; color: #fff; transition: 0.18s;
+    }
+    .btn-primary { width: 100%; background: linear-gradient(135deg, #4f46e5, #7c3aed); box-shadow: 0 8px 22px rgba(79,70,229,0.35); }
+    .btn-primary:hover { filter: brightness(1.08); }
+    .btn-sm { padding: 7px 11px; font-size: 12px; border-radius: 9px; font-weight: 700; border: none; cursor: pointer; color: #fff; }
+    .btn-green { background: #059669; }
+    .btn-blue { background: #2563eb; }
+    .btn-amber { background: #d97706; }
+    .btn-red { background: #dc2626; }
+    .btn-slate { background: #334155; }
+    .toggle-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 12px 14px; border-radius: 12px; background: rgba(2,6,23,0.55); border: 1px solid var(--border);
+      margin: 12px 0;
+    }
+    .toggle-row input[type=checkbox] { width: 20px; height: 20px; accent-color: #6366f1; cursor: pointer; }
+    .batch-out {
+      display: none; margin-top: 16px; padding: 16px; border-radius: 15px;
+      background: rgba(6, 78, 59, 0.35); border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .key-item {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 9px 12px; border-radius: 10px; background: rgba(2,6,23,0.65); margin-top: 7px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #34d399;
+    }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .key-card {
+      padding: 14px; border-radius: 14px; background: rgba(2, 6, 23, 0.58);
+      border: 1px solid var(--border); margin-bottom: 10px;
+    }
+    .key-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .key-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; font-weight: 800; color: #a5b4fc; }
+    .badge { padding: 3px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+    .b-ok { background: rgba(16,185,129,0.18); color: #34d399; }
+    .b-wait { background: rgba(56,189,248,0.18); color: #38bdf8; }
+    .b-exp { background: rgba(245,158,11,0.18); color: #fbbf24; }
+    .b-ban { background: rgba(239,68,68,0.18); color: #f87171; }
+    .meta { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0 11px; font-size: 12px; color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; font-size: 12px; }
+    .toast {
+      position: fixed; bottom: 20px; right: 20px; padding: 12px 18px; border-radius: 12px;
+      background: #10b981; color: #fff; font-size: 13px; font-weight: 700; display: none;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.45); z-index: 99;
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-icon">🛡️</div>
+      <div>
+        <h1>Quoc Thang Studio — Key & Anti-Crack v3</h1>
+        <p>Server-Only Discord Vault • Tạo Key Hàng Loạt & Key Giờ • Chống Sửa Mã Nguồn</p>
+      </div>
+    </div>
+    <button class="btn-logout" onclick="doLogout()">Đăng Xuất</button>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" id="tGen" onclick="switchTab('gen')">⚡ Tạo Key (Lô / Giờ)</button>
+    <button class="tab" id="tManage" onclick="switchTab('manage')">🔑 Danh Sách & Quản Lý</button>
+    <button class="tab" id="tSec" onclick="switchTab('sec')">🛡️ Anti-Crack & Hash App</button>
+  </div>
+
+  <!-- TAB 1: TẠO KEY HÀNG LOẠT + KEY GIỜ -->
+  <div id="pGen">
+    <div class="card">
+      <h2>⚡ Tạo License Key Mới (Hỗ trợ tạo 1 lần nhiều key & key theo giờ)</h2>
+      <p class="desc">Chọn nhanh mốc giờ/ngày hoặc nhập chính xác Ngày + Giờ + Phút và số lượng key cần tạo.</p>
+
+      <label>CHỌN NHANH THỜI HẠN (GIỜ / NGÀY / TUẦN / THÁNG)</label>
+      <div class="presets">
+        <button class="chip" onclick="setDur(0,1,0,this)">1 Giờ</button>
+        <button class="chip" onclick="setDur(0,3,0,this)">3 Giờ</button>
+        <button class="chip" onclick="setDur(0,6,0,this)">6 Giờ</button>
+        <button class="chip" onclick="setDur(0,12,0,this)">12 Giờ</button>
+        <button class="chip" onclick="setDur(1,0,0,this)">1 Ngày</button>
+        <button class="chip" onclick="setDur(3,0,0,this)">3 Ngày</button>
+        <button class="chip" onclick="setDur(7,0,0,this)">1 Tuần</button>
+        <button class="chip" onclick="setDur(14,0,0,this)">2 Tuần</button>
+        <button class="chip active" onclick="setDur(30,0,0,this)">1 Tháng</button>
+        <button class="chip" onclick="setDur(90,0,0,this)">3 Tháng</button>
+        <button class="chip" onclick="setDur(365,0,0,this)">1 Năm</button>
+      </div>
+
+      <div class="grid-3" style="margin-bottom:12px;">
+        <div>
+          <label>Số Ngày</label>
+          <input type="number" id="inDays" value="30" min="0" max="3650">
+        </div>
+        <div>
+          <label>Số Giờ</label>
+          <input type="number" id="inHours" value="0" min="0" max="8760">
+        </div>
+        <div>
+          <label>Số Phút</label>
+          <input type="number" id="inMins" value="0" min="0" max="59">
+        </div>
+      </div>
+
+      <div class="grid-4" style="margin-bottom:4px;">
+        <div>
+          <label>Số Lượng Key (1–100)</label>
+          <input type="number" id="inQty" value="1" min="1" max="100">
+        </div>
+        <div>
+          <label>Số Thiết Bị / Key</label>
+          <input type="number" id="inMaxDev" value="1" min="1" max="50">
+        </div>
+        <div>
+          <label>Tiền Tố (Prefix)</label>
+          <input type="text" id="inPrefix" value="QT" maxlength="6" placeholder="QT / VIP">
+        </div>
+        <div>
+          <label>Ghi Chú / Khách</label>
+          <input type="text" id="inNote" placeholder="VD: Lô key 3h">
+        </div>
+      </div>
+
+      <div class="toggle-row">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Bắt đầu đếm giờ khi khách kích hoạt lần đầu</div>
+          <div style="font-size:11px;color:var(--muted);">Rất tiện khi tạo sẵn 1 lô key giờ (1h/3h/24h) để bán dần mà không bị trôi giờ trước!</div>
+        </div>
+        <input type="checkbox" id="inStartOnAct" checked>
+      </div>
+
+      <button class="btn btn-primary" id="btnGen" onclick="generateKeys()">⚡ Tạo License Key Ngay</button>
+
+      <div class="batch-out" id="batchOut">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+          <div id="batchTitle" style="font-weight:800;color:#6ee7b7;font-size:14px;"></div>
+          <div style="display:flex;gap:8px;">
+            <button class="btn-sm btn-green" onclick="copyAllGenerated()">📋 Copy Tất Cả</button>
+            <button class="btn-sm btn-blue" onclick="downloadGenerated()">⬇️ Tải .TXT</button>
+          </div>
+        </div>
+        <div id="batchList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 2: DANH SÁCH & QUẢN LÝ KEY -->
+  <div id="pManage" style="display:none;">
+    <div class="grid-4">
+      <div class="stat"><div class="k">Tổng Key</div><div class="v" id="stTotal">0</div></div>
+      <div class="stat"><div class="k">Đang Hoạt Động</div><div class="v" style="color:var(--green);" id="stActive">0</div></div>
+      <div class="stat"><div class="k">Chưa Kích Hoạt</div><div class="v" style="color:#38bdf8;" id="stWait">0</div></div>
+      <div class="stat"><div class="k">Hết Hạn / Khóa</div><div class="v" style="color:var(--red);" id="stBad">0</div></div>
+    </div>
+
+    <div class="card">
+      <div class="toolbar">
+        <input type="text" id="qSearch" placeholder="Tìm theo mã Key hoặc ghi chú khách hàng..." oninput="renderKeyList()" style="flex:2;min-width:200px;">
+        <select id="qFilter" onchange="renderKeyList()" style="flex:1;min-width:140px;">
+          <option value="all">Tất cả trạng thái</option>
+          <option value="active">Đang hoạt động</option>
+          <option value="waiting">Chưa kích hoạt</option>
+          <option value="expired">Đã hết hạn</option>
+          <option value="disabled">Đã khóa</option>
+        </select>
+        <button class="btn-sm btn-blue" onclick="loadKeyList()" style="padding:10px 15px;">🔄 Tải Lại</button>
+      </div>
+      <div id="keysContainer"><p style="color:var(--muted);text-align:center;padding:24px;">Đang tải danh sách key...</p></div>
+    </div>
+  </div>
+
+  <!-- TAB 3: ANTI-CRACK & CHỐNG THAY ĐỔI MÃ NGUỒN -->
+  <div id="pSec" style="display:none;">
+    <div class="card">
+      <h2>🛡️ Chống Thay Đổi Mã Nguồn & Ghim Mã Băm Binary (__TEXT)</h2>
+      <p class="desc">Mỗi khi app iOS kết nối về server, app gửi mã băm SHA-256 của vùng mã máy <code>__TEXT,__text</code> và chữ ký mã nguồn. Bạn có thể ghim mã băm bản build chính chủ để chặn mọi bản IPA bị chỉnh sửa hoặc crack.</p>
+
+      <div class="toggle-row">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Bật kiểm tra chặt mã băm Binary (__TEXT SHA-256)</div>
+          <div style="font-size:11px;color:var(--muted);">Chỉ bật sau khi bạn đã ghim ít nhất 1 mã băm bản build chính chủ bên dưới!</div>
+        </div>
+        <input type="checkbox" id="secEnforceBin">
+      </div>
+
+      <label>DANH SÁCH BINARY __TEXT HASH ĐƯỢC PHÉP (Mỗi dòng 1 mã SHA-256)</label>
+      <textarea id="secAllowedHashes" rows="3" class="mono" placeholder="Dán mã __TEXT SHA-256 từ GitHub Actions hoặc bấm Ghim ở bảng bên dưới..."></textarea>
+
+      <div class="toggle-row">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Bật kiểm tra chặt chữ ký Mã Nguồn (Source Signature)</div>
+          <div style="font-size:11px;color:var(--muted);">Chặn app nếu có người sửa hằng số bảo mật trong mã nguồn Swift.</div>
+        </div>
+        <input type="checkbox" id="secEnforceSrc">
+      </div>
+
+      <label>DANH SÁCH SOURCE SIGNATURE ĐƯỢC PHÉP (Mỗi dòng 1 mã)</label>
+      <textarea id="secAllowedSigs" rows="2" class="mono" placeholder="Tự động hiện ở bảng thiết bị bên dưới để ghim 1 chạm..."></textarea>
+
+      <button class="btn btn-primary" style="margin-top:14px;" onclick="saveSecSettings()">💾 Lưu Cấu Hình Chống Crack</button>
+    </div>
+
+    <div class="card">
+      <h2>📱 Mã Băm Build Ghi Nhận Từ App Thực Tế</h2>
+      <p class="desc">Mở app sau khi cài bản build mới nhất, mã băm sẽ tự xuất hiện tại đây để bạn ghim chỉ bằng 1 chạm.</p>
+      <div id="observedBox"><p style="color:var(--muted);font-size:13px;">Chưa có dữ liệu.</p></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <h2>🚨 Cảnh Báo Can Thiệp / Anti-Crack Gần Đây</h2>
+        <button class="btn-sm btn-red" onclick="clearAlerts()">Xóa Log</button>
+      </div>
+      <div id="alertsBox"><p style="color:var(--muted);font-size:13px;">Chưa có cảnh báo nào.</p></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  const CSRF = ${JSON.stringify(csrfToken)};
+  let lastGenerated = [];
+  let allKeys = [];
+
+  function toast(msg, err = false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.style.background = err ? '#dc2626' : '#10b981';
+    t.style.display = 'block';
+    clearTimeout(window._tt);
+    window._tt = setTimeout(() => t.style.display = 'none', 2600);
+  }
+
+  async function api(path, body = {}) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-CSRF': CSRF },
+      body: JSON.stringify(body)
+    });
+    if (res.status === 401) {
+      toast('Phiên quản trị hết hạn, đang tải lại...', true);
+      setTimeout(() => location.reload(), 900);
+      throw new Error('Unauthorized');
+    }
+    return res.json();
+  }
+
+  function switchTab(t) {
+    ['gen','manage','sec'].forEach(id => {
+      document.getElementById('p' + id[0].toUpperCase() + id.slice(1)).style.display = (id === t) ? 'block' : 'none';
+      document.getElementById('t' + id[0].toUpperCase() + id.slice(1)).className = (id === t) ? 'tab active' : 'tab';
+    });
+    if (t === 'manage') loadKeyList();
+    if (t === 'sec') loadSecData();
+  }
+
+  function setDur(d, h, m, el) {
+    document.getElementById('inDays').value = d;
+    document.getElementById('inHours').value = h;
+    document.getElementById('inMins').value = m;
+    document.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+    if (el) el.classList.add('active');
+  }
+
+  async function generateKeys() {
+    const days = parseInt(document.getElementById('inDays').value) || 0;
+    const hours = parseInt(document.getElementById('inHours').value) || 0;
+    const minutes = parseInt(document.getElementById('inMins').value) || 0;
+    const quantity = Math.min(100, Math.max(1, parseInt(document.getElementById('inQty').value) || 1));
+    const max_devices = Math.min(50, Math.max(1, parseInt(document.getElementById('inMaxDev').value) || 1));
+    const prefix = document.getElementById('inPrefix').value.trim() || 'QT';
+    const email = document.getElementById('inNote').value.trim();
+    const start_on_activate = document.getElementById('inStartOnAct').checked;
+
+    if (days === 0 && hours === 0 && minutes === 0) {
+      toast('Thời hạn phải lớn hơn 0!', true);
+      return;
+    }
+
+    const btn = document.getElementById('btnGen');
+    btn.disabled = true;
+    btn.textContent = 'Đang tạo ' + quantity + ' key...';
+    try {
+      const data = await api('/admin/generate', { days, hours, minutes, quantity, max_devices, prefix, email, start_on_activate });
+      if (data.valid && Array.isArray(data.keys)) {
+        lastGenerated = data.keys;
+        document.getElementById('batchTitle').textContent = '🎉 Đã tạo ' + data.keys.length + ' key (' + data.duration_label + ' • ' + max_devices + ' máy/key' + (start_on_activate ? ' • Đếm khi kích hoạt' : '') + ')';
+        document.getElementById('batchList').innerHTML = data.keys.map(k =>
+          '<div class="key-item"><span>' + k + '</span><button class="btn-sm btn-slate" onclick="copyOne(\\'' + k + '\\')">Copy</button></div>'
+        ).join('');
+        document.getElementById('batchOut').style.display = 'block';
+        toast('Đã tạo ' + data.keys.length + ' key thành công!');
+      } else {
+        toast(data.error || 'Lỗi tạo key', true);
+      }
+    } catch (e) {
+      if (e.message !== 'Unauthorized') toast('Lỗi kết nối server', true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '⚡ Tạo License Key Ngay';
+    }
+  }
+
+  function copyOne(k) { navigator.clipboard.writeText(k); toast('Đã copy: ' + k); }
+  function copyAllGenerated() {
+    if (!lastGenerated.length) return;
+    navigator.clipboard.writeText(lastGenerated.join('\\n'));
+    toast('Đã copy ' + lastGenerated.length + ' key!');
+  }
+  function downloadGenerated() {
+    if (!lastGenerated.length) return;
+    const blob = new Blob([lastGenerated.join('\\n')], { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'keys_' + lastGenerated.length + '_' + Date.now() + '.txt';
+    a.click();
+  }
+
+  function fmtDur(ms) {
+    if (!ms || ms <= 0) return '0p';
+    const totalMin = Math.round(ms / 60000);
+    const d = Math.floor(totalMin / 1440);
+    const h = Math.floor((totalMin % 1440) / 60);
+    const m = totalMin % 60;
+    const parts = [];
+    if (d) parts.push(d + ' ngày');
+    if (h) parts.push(h + ' giờ');
+    if (m) parts.push(m + ' phút');
+    return parts.join(' ') || '<1 phút';
+  }
+
+  async function loadKeyList() {
+    const box = document.getElementById('keysContainer');
+    box.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;">Đang tải danh sách từ Cloudflare KV...</p>';
+    try {
+      const data = await api('/admin/list', {});
+      allKeys = data.items || [];
+      renderKeyList();
+    } catch (e) {
+      if (e.message !== 'Unauthorized') box.innerHTML = '<p style="color:#f87171;text-align:center;">Lỗi tải danh sách key.</p>';
+    }
+  }
+
+  function renderKeyList() {
+    const q = (document.getElementById('qSearch').value || '').toLowerCase().trim();
+    const flt = document.getElementById('qFilter').value;
+    const now = Date.now();
+
+    let cActive = 0, cWait = 0, cBad = 0;
+    allKeys.forEach(item => {
+      if (item.disabled) cBad++;
+      else if (item.waiting_activation) cWait++;
+      else if (item.expires_at && now > item.expires_at) cBad++;
+      else cActive++;
+    });
+    document.getElementById('stTotal').textContent = allKeys.length;
+    document.getElementById('stActive').textContent = cActive;
+    document.getElementById('stWait').textContent = cWait;
+    document.getElementById('stBad').textContent = cBad;
+
+    const filtered = allKeys.filter(it => {
+      const matchQ = !q || it.key.toLowerCase().includes(q) || (it.email || '').toLowerCase().includes(q);
+      if (!matchQ) return false;
+      const isExp = !it.waiting_activation && it.expires_at && now > it.expires_at;
+      if (flt === 'active') return !it.disabled && !it.waiting_activation && !isExp;
+      if (flt === 'waiting') return !it.disabled && it.waiting_activation;
+      if (flt === 'expired') return !it.disabled && isExp;
+      if (flt === 'disabled') return !!it.disabled;
+      return true;
+    });
+
+    const box = document.getElementById('keysContainer');
+    if (!filtered.length) {
+      box.innerHTML = '<p style="color:var(--muted);text-align:center;padding:24px;">Không có key nào phù hợp.</p>';
+      return;
+    }
+
+    box.innerHTML = filtered.map(it => {
+      const isExp = !it.waiting_activation && it.expires_at && now > it.expires_at;
+      let badge = '<span class="badge b-ok">Hoạt động</span>';
+      if (it.disabled) badge = '<span class="badge b-ban">Đã khóa</span>';
+      else if (it.waiting_activation) badge = '<span class="badge b-wait">Chờ kích hoạt (' + fmtDur(it.duration_ms) + ')</span>';
+      else if (isExp) badge = '<span class="badge b-exp">Hết hạn</span>';
+
+      const expText = it.waiting_activation
+        ? 'Bắt đầu đếm khi dùng (' + fmtDur(it.duration_ms) + ')'
+        : (it.expires_at ? new Date(it.expires_at).toLocaleString('vi-VN') : 'N/A');
+
+      const createdText = it.created_at ? new Date(it.created_at).toLocaleString('vi-VN') : 'N/A';
+      const usedDev = Array.isArray(it.machine_ids) ? it.machine_ids.length : (it.machine_id ? 1 : 0);
+      const maxDev = it.max_devices || 1;
+
+      return '<div class="key-card">'
+        + '<div class="key-head"><span class="key-code">' + it.key + '</span>' + badge + '</div>'
+        + '<div class="meta">'
+        + '<span>👤 ' + (it.email || '(Không ghi chú)') + '</span>'
+        + '<span>📅 Tạo: ' + createdText + '</span>'
+        + '<span>⏱ Hạn: ' + expText + '</span>'
+        + '<span>📱 Thiết bị: ' + usedDev + '/' + maxDev + '</span>'
+        + '</div>'
+        + '<div class="actions">'
+        + '<button class="btn-sm btn-slate" onclick="copyOne(\\'' + it.key + '\\')">Copy</button>'
+        + '<button class="btn-sm btn-blue" onclick="extendKey(\\'' + it.key + '\\')">+ Gia Hạn</button>'
+        + '<button class="btn-sm btn-amber" onclick="resetHwid(\\'' + it.key + '\\')">Reset Máy</button>'
+        + '<button class="btn-sm ' + (it.disabled ? 'btn-green' : 'btn-red') + '" onclick="toggleKey(\\'' + it.key + '\\')">' + (it.disabled ? 'Mở Khóa' : 'Khóa Key') + '</button>'
+        + '<button class="btn-sm btn-red" onclick="deleteKey(\\'' + it.key + '\\')">Xóa Vĩnh Viễn</button>'
+        + '</div></div>';
+    }).join('');
+  }
+
+  async function extendKey(key) {
+    const inp = prompt('Nhập số GIỜ muốn cộng thêm cho ' + key + ' (VD: 24 = 1 ngày, 2 = 2 giờ):', '24');
+    if (!inp) return;
+    const hours = parseFloat(inp);
+    if (isNaN(hours) || hours <= 0) { toast('Số giờ không hợp lệ', true); return; }
+    const d = await api('/admin/extend', { key, hours });
+    if (d.success) { toast('Đã cộng thêm ' + hours + ' giờ!'); loadKeyList(); }
+    else toast(d.error || 'Lỗi gia hạn', true);
+  }
+
+  async function resetHwid(key) {
+    if (!confirm('Reset thiết bị cho ' + key + '?')) return;
+    const d = await api('/admin/reset_hwid', { key });
+    if (d.success) { toast('Đã reset thiết bị!'); loadKeyList(); }
+    else toast(d.error || 'Lỗi', true);
+  }
+
+  async function toggleKey(key) {
+    const d = await api('/admin/toggle', { key });
+    if (d.success) { toast(d.disabled ? 'Đã khóa key!' : 'Đã mở khóa key!'); loadKeyList(); }
+    else toast(d.error || 'Lỗi', true);
+  }
+
+  async function deleteKey(key) {
+    if (!confirm('XÓA VĨNH VIỄN key ' + key + '? App đang dùng key này sẽ bị khóa ngay lập tức!')) return;
+    const d = await api('/admin/delete', { key });
+    if (d.success) { toast('Đã xóa vĩnh viễn ' + key); loadKeyList(); }
+    else toast(d.error || 'Lỗi xóa key', true);
+  }
+
+  async function loadSecData() {
+    const d = await api('/admin/security/get', {});
+    const s = d.settings || {};
+    document.getElementById('secEnforceBin').checked = !!s.enforce_binary_hash;
+    document.getElementById('secAllowedHashes').value = (s.allowed_hashes || []).join('\\n');
+    document.getElementById('secEnforceSrc').checked = !!s.enforce_source_sig;
+    document.getElementById('secAllowedSigs').value = (s.allowed_source_sigs || []).join('\\n');
+
+    const obs = d.observed || [];
+    document.getElementById('observedBox').innerHTML = obs.length ? obs.map(o =>
+      '<div class="key-card"><div class="mono" style="color:#a5b4fc;">__TEXT: ' + (o.text_hash || 'N/A') + '</div>'
+      + '<div class="mono" style="color:#34d399;margin-top:4px;">SOURCE: ' + (o.source_sig || 'N/A') + '</div>'
+      + '<div class="meta"><span>Bundle: ' + (o.bundle_id || '-') + '</span><span>Lượt: ' + (o.count || 1) + '</span><span>' + new Date(o.last_seen).toLocaleString('vi-VN') + '</span></div>'
+      + '<button class="btn-sm btn-green" onclick="pinObserved(\\'' + (o.text_hash || '') + '\\',\\'' + (o.source_sig || '') + '\\')">📌 Ghim Hash Build Này</button></div>'
+    ).join('') : '<p style="color:var(--muted);font-size:13px;">Mở app iOS 1 lần để server ghi nhận mã băm build chính chủ.</p>';
+
+    const alerts = d.alerts || [];
+    document.getElementById('alertsBox').innerHTML = alerts.length ? alerts.map(a =>
+      '<div class="key-card" style="border-color:rgba(239,68,68,0.3);"><div style="color:#fca5a5;font-weight:700;font-size:13px;">🚨 ' + a.reason + '</div>'
+      + '<div class="meta"><span>IP: ' + a.ip + '</span><span>Key: ' + (a.key || '-') + '</span><span>' + new Date(a.ts).toLocaleString('vi-VN') + '</span></div></div>'
+    ).join('') : '<p style="color:var(--muted);font-size:13px;">Hệ thống sạch — chưa phát hiện cảnh báo crack nào.</p>';
+  }
+
+  function pinObserved(binHash, srcSig) {
+    if (binHash) {
+      const el = document.getElementById('secAllowedHashes');
+      const set = new Set(el.value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean));
+      set.add(binHash);
+      el.value = Array.from(set).join('\\n');
+    }
+    if (srcSig) {
+      const el = document.getElementById('secAllowedSigs');
+      const set = new Set(el.value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean));
+      set.add(srcSig);
+      el.value = Array.from(set).join('\\n');
+    }
+    toast('Đã thêm vào danh sách ghim — nhớ bấm Lưu Cấu Hình!');
+  }
+
+  async function saveSecSettings() {
+    const enforce_binary_hash = document.getElementById('secEnforceBin').checked;
+    const allowed_hashes = document.getElementById('secAllowedHashes').value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+    const enforce_source_sig = document.getElementById('secEnforceSrc').checked;
+    const allowed_source_sigs = document.getElementById('secAllowedSigs').value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+    const d = await api('/admin/security/save', { enforce_binary_hash, allowed_hashes, enforce_source_sig, allowed_source_sigs });
+    if (d.success) toast('Đã lưu cấu hình chống crack!');
+    else toast(d.error || 'Lỗi lưu', true);
+  }
+
+  async function clearAlerts() {
+    const d = await api('/admin/security/clear_alerts', {});
+    if (d.success) { toast('Đã xóa log cảnh báo!'); loadSecData(); }
+  }
+
+  async function doLogout() {
+    await fetch('/admin/logout', { method: 'POST' });
+    location.reload();
+  }
+</script>
+</body>
+</html>`;
+  return new Response(html, { headers: SEC_HEADERS_HTML });
+}
+
+async function handleAdminPage(req, env) {
+  const auth = await verifyAdminSession(req, env, false);
+  if (!auth.ok) {
+    return renderAdminLoginPage();
+  }
+  return renderAdminDashboardPage(auth.csrf);
+}
+
+// ---------- Admin API Handlers (Tất cả bắt buộc verifyAdminSession!) ----------
+async function requireAdmin(req, env) {
+  if (req.method !== "POST") return { res: json({ error: "Method not allowed" }, 405) };
+  const auth = await verifyAdminSession(req, env, true);
+  if (!auth.ok) return { res: json({ error: auth.error }, 401) };
+  return { ok: true };
+}
+
+async function handleGenerateKey(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
+
+  const body = await req.json().catch(() => ({}));
+  const days = Math.max(0, parseInt(body.days, 10) || 0);
+  const hours = Math.max(0, parseInt(body.hours, 10) || 0);
+  const minutes = Math.max(0, parseInt(body.minutes, 10) || 0);
+  const quantity = Math.min(100, Math.max(1, parseInt(body.quantity, 10) || 1));
+  const maxDevices = Math.min(50, Math.max(1, parseInt(body.max_devices, 10) || 1));
+  const prefix = String(body.prefix || "QT").trim();
+  const email = String(body.email || "").trim();
+  const startOnActivate = body.start_on_activate === true;
+
+  const durationMs = ((days * 24 + hours) * 60 + minutes) * 60 * 1000;
+  if (durationMs <= 0) {
+    return json({ valid: false, error: "Thời hạn key phải lớn hơn 0." }, 400);
+  }
+
+  const labelParts = [];
+  if (days > 0) labelParts.push(`${days} ngày`);
+  if (hours > 0) labelParts.push(`${hours} giờ`);
+  if (minutes > 0) labelParts.push(`${minutes} phút`);
+  const durationLabel = labelParts.join(" ");
+
+  const created = nowMs();
+  const keys = [];
+  for (let i = 0; i < quantity; i++) {
+    const key = makeKey(prefix);
+    const licData = {
+      email: quantity > 1 && email ? `${email} #${i + 1}` : email,
+      created_at: created,
+      duration_ms: durationMs,
+      start_on_activate: startOnActivate,
+      activated_at: startOnActivate ? null : created,
+      expires_at: startOnActivate ? null : created + durationMs,
+      max_devices: maxDevices,
+      machine_ids: [],
+      machine_id: null,
+      disabled: false,
+    };
+    await putLicense(env, key, licData);
+    keys.push(key);
+  }
+
+  return json({
+    valid: true,
+    key: keys[0],
+    keys,
+    quantity: keys.length,
+    max_devices: maxDevices,
+    duration_ms: durationMs,
+    duration_label: durationLabel,
+    start_on_activate: startOnActivate,
+  });
+}
+
+async function handleListKeys(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
+
+  const listed = await env.APP_DATA.list({ limit: 500 });
+  const items = [];
+  for (const entry of listed.keys) {
+    const name = entry.name;
+    // Bỏ qua các key nội bộ (NONCE:, ADMIN_RL:, SEC:)
+    if (name.startsWith("NONCE:") || name.startsWith("ADMIN_RL:") || name.startsWith("SEC:")) continue;
+    const lic = await getLicense(env, name);
+    if (!lic || typeof lic !== "object") continue;
+    const waiting = !!(lic.start_on_activate && !lic.activated_at && !lic.expires_at);
+    const mids = Array.isArray(lic.machine_ids) ? lic.machine_ids : (lic.machine_id ? [lic.machine_id] : []);
+    items.push({
+      key: name,
+      email: lic.email || "",
+      created_at: lic.created_at || 0,
+      activated_at: lic.activated_at || null,
+      expires_at: lic.expires_at || null,
+      duration_ms: lic.duration_ms || 0,
+      waiting_activation: waiting,
+      max_devices: Math.max(1, parseInt(lic.max_devices, 10) || 1),
+      machine_ids: mids,
+      machine_id: lic.machine_id || mids[0] || null,
+      disabled: !!lic.disabled,
+    });
+  }
+  items.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  return json({ ok: true, items });
 }
 
 async function handleKeyInfo(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const body = await req.json().catch(() => ({}));
-  if (!env.ADMIN_SECRET || body.password !== env.ADMIN_SECRET) return json({ error: "Unauthorized" }, 401);
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
 
+  const body = await req.json().catch(() => ({}));
   const key = (body.key || "").trim().toUpperCase();
   const lic = await getLicense(env, key);
   if (!lic) return json({ found: false, error: "Key không tồn tại" });
 
   return json({
     found: true,
-    key: key,
+    key,
     email: lic.email,
     created_at: lic.created_at,
+    activated_at: lic.activated_at || null,
     expires_at: lic.expires_at,
-    expired: nowMs() > lic.expires_at,
+    duration_ms: lic.duration_ms || 0,
+    expired: lic.expires_at ? nowMs() > lic.expires_at : false,
     machine_id: lic.machine_id,
-    disabled: !!lic.disabled
+    disabled: !!lic.disabled,
   });
 }
 
-async function handleResetHwid(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const body = await req.json().catch(() => ({}));
-  if (!env.ADMIN_SECRET || body.password !== env.ADMIN_SECRET) return json({ error: "Unauthorized" }, 401);
+async function handleExtendKey(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
 
+  const body = await req.json().catch(() => ({}));
+  const key = (body.key || "").trim().toUpperCase();
+  const addHours = parseFloat(body.hours);
+  if (!key || isNaN(addHours) || addHours <= 0) return json({ error: "Dữ liệu không hợp lệ" }, 400);
+
+  const lic = await getLicense(env, key);
+  if (!lic) return json({ error: "Key không tồn tại" }, 404);
+
+  const addMs = Math.round(addHours * 3600 * 1000);
+  if (lic.start_on_activate && !lic.activated_at && !lic.expires_at) {
+    lic.duration_ms = (lic.duration_ms || 0) + addMs;
+  } else {
+    const base = Math.max(nowMs(), lic.expires_at || nowMs());
+    lic.expires_at = base + addMs;
+  }
+  await putLicense(env, key, lic);
+  return json({ success: true, expires_at: lic.expires_at, duration_ms: lic.duration_ms });
+}
+
+async function handleResetHwid(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
+
+  const body = await req.json().catch(() => ({}));
   const key = (body.key || "").trim().toUpperCase();
   const lic = await getLicense(env, key);
-  if (!lic) return json({ error: "Key không tồn tại" });
+  if (!lic) return json({ error: "Key không tồn tại" }, 404);
 
   lic.machine_id = null;
+  lic.machine_ids = [];
   await putLicense(env, key, lic);
   return json({ success: true });
 }
 
 async function handleToggleKey(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const body = await req.json().catch(() => ({}));
-  if (!env.ADMIN_SECRET || body.password !== env.ADMIN_SECRET) return json({ error: "Unauthorized" }, 401);
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
 
+  const body = await req.json().catch(() => ({}));
   const key = (body.key || "").trim().toUpperCase();
   const lic = await getLicense(env, key);
-  if (!lic) return json({ error: "Key không tồn tại" });
+  if (!lic) return json({ error: "Key không tồn tại" }, 404);
 
   lic.disabled = !lic.disabled;
   await putLicense(env, key, lic);
   return json({ success: true, disabled: lic.disabled });
 }
 
-// ---------- Logic API App (Encrypted & Signed Anti-Crack) ----------
-async function handleActivate(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+async function handleDeleteKey(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
 
-  let body;
-  try {
-    const rawReq = await req.json();
-    body = await decryptClientPayload(rawReq, DISCORD_CONFIG.app_secret);
-    var nonce = rawReq.nonce;
-    var ts = rawReq.ts;
-  } catch (err) {
-    return json({ error: "Tampered or invalid signature: " + err.message }, 403);
-  }
-
-  const key = (body.license_key || "").trim().toUpperCase();
-  const machineId = (body.machine_id || "").trim();
-
-  let respData;
-  if (!key || !machineId) {
-    respData = { valid: false, error: "Missing fields" };
-  } else {
-    const lic = await getLicense(env, key);
-    if (!lic) {
-      respData = { valid: false, error: "Key không tồn tại trên hệ thống" };
-    } else if (lic.disabled) {
-      respData = { valid: false, error: "Key đã bị vô hiệu hóa" };
-    } else if (lic.expires_at && nowMs() > lic.expires_at) {
-      respData = { valid: false, error: "Key đã hết hạn sử dụng" };
-    } else if (!lic.machine_id) {
-      // Khóa key vào thiết bị này
-      lic.machine_id = machineId;
-      await putLicense(env, key, lic);
-      const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
-      const { app_secret, ...publicCfg } = DISCORD_CONFIG;
-      respData = { valid: true, created_at: lic.created_at || nowMs(), expires_at: lic.expires_at, session_token: sessionToken, config: publicCfg, message: "OK" };
-    } else if (lic.machine_id !== machineId) {
-      respData = { valid: false, error: "Key đã được kích hoạt trên thiết bị khác" };
-    } else {
-      const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
-      const { app_secret, ...publicCfg } = DISCORD_CONFIG;
-      respData = { valid: true, created_at: lic.created_at || nowMs(), expires_at: lic.expires_at, session_token: sessionToken, config: publicCfg, message: "OK" };
-    }
-  }
-
-  const encResp = await encryptServerResponse(respData, nonce, ts, DISCORD_CONFIG.app_secret);
-  return json(encResp);
+  const body = await req.json().catch(() => ({}));
+  const key = (body.key || "").trim().toUpperCase();
+  if (!key) return json({ error: "Thiếu key" }, 400);
+  await deleteLicense(env, key);
+  return json({ success: true });
 }
 
-async function handleValidate(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+async function handleSecGet(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
 
-  let body;
-  try {
-    const rawReq = await req.json();
-    body = await decryptClientPayload(rawReq, DISCORD_CONFIG.app_secret);
-    var nonce = rawReq.nonce;
-    var ts = rawReq.ts;
-  } catch (err) {
-    return json({ error: "Tampered or invalid signature" }, 403);
-  }
-
-  const key = (body.license_key || "").trim().toUpperCase();
-  const machineId = (body.machine_id || "").trim();
-
-  let respData;
-  if (!key || !machineId) {
-    respData = { valid: false, error: "Missing fields" };
-  } else {
-    const lic = await getLicense(env, key);
-    if (!lic) {
-      respData = { valid: false, error: "Key không tồn tại" };
-    } else if (lic.disabled) {
-      respData = { valid: false, error: "Key đã bị vô hiệu hóa" };
-    } else if (lic.expires_at && nowMs() > lic.expires_at) {
-      respData = { valid: false, error: "Key đã hết hạn" };
-    } else if (lic.machine_id && lic.machine_id !== machineId) {
-      respData = { valid: false, error: "Key đã dùng trên thiết bị khác" };
-    } else {
-      const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
-      respData = { valid: true, created_at: lic.created_at || nowMs(), expires_at: lic.expires_at, session_token: sessionToken };
-    }
-  }
-
-  const encResp = await encryptServerResponse(respData, nonce, ts, DISCORD_CONFIG.app_secret);
-  return json(encResp);
+  const settings = await getSecSettings(env);
+  const obsRaw = await env.APP_DATA.get("SEC:OBSERVED");
+  const alertRaw = await env.APP_DATA.get("SEC:ALERTS");
+  return json({
+    ok: true,
+    settings,
+    observed: obsRaw ? JSON.parse(obsRaw) : [],
+    alerts: alertRaw ? JSON.parse(alertRaw) : [],
+  });
 }
 
-async function handleConfig(req, env) {
-  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+async function handleSecSave(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
 
-  let body;
-  try {
-    const rawReq = await req.json();
-    body = await decryptClientPayload(rawReq, DISCORD_CONFIG.app_secret);
-    var nonce = rawReq.nonce;
-    var ts = rawReq.ts;
-  } catch (err) {
-    return json({ error: "Lỗi giải mã hoặc lệch giờ: " + err.message, valid: false }, 403);
+  const body = await req.json().catch(() => ({}));
+  const next = {
+    enforce_binary_hash: !!body.enforce_binary_hash,
+    allowed_hashes: Array.isArray(body.allowed_hashes) ? body.allowed_hashes : [],
+    enforce_source_sig: !!body.enforce_source_sig,
+    allowed_source_sigs: Array.isArray(body.allowed_source_sigs) ? body.allowed_source_sigs : [],
+  };
+  await env.APP_DATA.put("SEC:SETTINGS", JSON.stringify(next));
+  return json({ success: true, settings: next });
+}
+
+async function handleSecClearAlerts(req, env) {
+  const guard = await requireAdmin(req, env);
+  if (guard.res) return guard.res;
+  await env.APP_DATA.delete("SEC:ALERTS");
+  return json({ success: true });
+}
+
+// ---------- Core License Evaluation Helper ----------
+async function evaluateLicenseForApp(req, env, body, allowBindHwid = true) {
+  const integ = await verifyAppIntegrity(req, env, body);
+  if (!integ.ok) {
+    return { valid: false, cracked: true, error: integ.error };
   }
 
   const key = (body.license_key || "").trim().toUpperCase();
   const machineId = (body.machine_id || "").trim();
+  if (!key || !machineId) {
+    return { valid: false, error: "Thiếu license key hoặc mã thiết bị." };
+  }
 
-  let respData;
   const lic = await getLicense(env, key);
   if (!lic) {
-    respData = { error: "Key không tồn tại", valid: false };
-  } else if (lic.disabled) {
-    respData = { error: "Key đã bị vô hiệu hóa", cracked: true, valid: false };
-  } else if (lic.expires_at && nowMs() > lic.expires_at) {
-    respData = { error: "Key đã hết hạn sử dụng", expired: true, valid: false };
-  } else if (!lic.machine_id) {
-    // Tự động gắn machine_id nếu chưa có
-    lic.machine_id = machineId;
-    await putLicense(env, key, lic);
-    const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
-    const { app_secret, ...publicCfg } = DISCORD_CONFIG;
-    respData = {
-      valid: true,
-      created_at: lic.created_at || nowMs(),
-      expires_at: lic.expires_at,
-      session_token: sessionToken,
-      config: publicCfg,
-    };
-  } else if (lic.machine_id !== machineId) {
-    respData = { error: "Key đã dùng trên thiết bị khác (HWID mismatch)", valid: false };
-  } else {
-    const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, DISCORD_CONFIG.app_secret);
-    const { app_secret, ...publicCfg } = DISCORD_CONFIG;
-    respData = {
-      valid: true,
-      created_at: lic.created_at || nowMs(),
-      expires_at: lic.expires_at,
-      session_token: sessionToken,
-      config: publicCfg,
-    };
+    return { valid: false, error: "License key không tồn tại hoặc đã bị xóa." };
+  }
+  if (lic.disabled) {
+    return { valid: false, cracked: true, error: "License key đã bị khóa bởi quản trị viên." };
   }
 
-  const encResp = await encryptServerResponse(respData, nonce, ts, DISCORD_CONFIG.app_secret);
+  // Hỗ trợ key tính giờ từ lúc kích hoạt lần đầu
+  let dirty = false;
+  if (lic.start_on_activate && !lic.activated_at && lic.duration_ms > 0) {
+    const now = nowMs();
+    lic.activated_at = now;
+    lic.expires_at = now + lic.duration_ms;
+    dirty = true;
+  }
+
+  if (lic.expires_at && nowMs() > lic.expires_at) {
+    return { valid: false, expired: true, expires_at: lic.expires_at, error: "Key đã hết hạn sử dụng." };
+  }
+
+  const mids = Array.isArray(lic.machine_ids) ? lic.machine_ids.slice() : (lic.machine_id ? [lic.machine_id] : []);
+  const maxDevices = Math.max(1, parseInt(lic.max_devices, 10) || 1);
+
+  if (!mids.includes(machineId)) {
+    if (mids.length >= maxDevices) {
+      return { valid: false, error: `Key đã đạt giới hạn thiết bị (${mids.length}/${maxDevices}).` };
+    }
+    if (!allowBindHwid) {
+      return { valid: false, error: "Thiết bị chưa được kích hoạt với key này." };
+    }
+    mids.push(machineId);
+    lic.machine_ids = mids;
+    lic.machine_id = mids[0];
+    dirty = true;
+  }
+
+  if (dirty) {
+    await putLicense(env, key, lic);
+  }
+
+  const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, SERVER_MASTER_SECRET, { v: CONFIG_VERSION });
+  return {
+    valid: true,
+    key,
+    machineId,
+    created_at: lic.activated_at || lic.created_at || nowMs(),
+    expires_at: lic.expires_at,
+    session_token: sessionToken,
+  };
+}
+
+// ---------- App Endpoints (100% AES-256-GCM + HMAC-SHA256 + Anti-Replay + Anti-Tamper) ----------
+async function handleEncryptedAppEndpoint(req, env, processor) {
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  let body, nonce, ts;
+  try {
+    const rawReq = await req.json();
+    nonce = rawReq.nonce;
+    ts = rawReq.ts;
+    body = await decryptClientPayload(rawReq, env, SERVER_MASTER_SECRET);
+  } catch (err) {
+    await logSecurityAlert(env, req, "Lỗi giải mã / chữ ký / replay: " + err.message);
+    return json({ valid: false, error: "Lỗi xác thực bảo mật: " + err.message }, 403);
+  }
+  const respData = await processor(body);
+  const encResp = await encryptServerResponse(respData, nonce, ts, SERVER_MASTER_SECRET);
   return json(encResp);
+}
+
+// /activate: Kích hoạt key, CHỈ trả session_token + asset CDN cơ bản (chưa trả API chức năng)
+async function handleActivate(req, env) {
+  return handleEncryptedAppEndpoint(req, env, async (body) => {
+    const ev = await evaluateLicenseForApp(req, env, body, true);
+    if (!ev.valid) return ev;
+    return {
+      valid: true,
+      created_at: ev.created_at,
+      expires_at: ev.expires_at,
+      session_token: ev.session_token,
+      assets: REMOTE_PUBLIC_ASSETS,
+      message: "OK",
+    };
+  });
+}
+
+// /config & /validate: Check key mỗi khi mở app / thoát ra vào lại / kiểm tra định kỳ
+async function handleConfig(req, env) {
+  return handleEncryptedAppEndpoint(req, env, async (body) => {
+    const ev = await evaluateLicenseForApp(req, env, body, true);
+    if (!ev.valid) return ev;
+    return {
+      valid: true,
+      created_at: ev.created_at,
+      expires_at: ev.expires_at,
+      session_token: ev.session_token,
+      assets: REMOTE_PUBLIC_ASSETS,
+    };
+  });
+}
+
+// /feature-auth: GỌI MỖI KHI DÙNG CHỨC NĂNG — Xác thực key trực tiếp trên server rồi mới gửi thông tin Discord xuống RAM!
+async function handleFeatureAuth(req, env) {
+  return handleEncryptedAppEndpoint(req, env, async (body) => {
+    const feature = String(body.feature || "").trim().toLowerCase();
+    if (!VALID_FEATURES.has(feature)) {
+      return { valid: false, error: "Chức năng yêu cầu không hợp lệ." };
+    }
+    const ev = await evaluateLicenseForApp(req, env, body, false);
+    if (!ev.valid) return ev;
+
+    const scopedConfig = buildScopedFeatureConfig(feature);
+    if (!scopedConfig) {
+      return { valid: false, error: "Không tìm thấy cấu hình cho chức năng yêu cầu." };
+    }
+
+    const ft = await generateFeatureToken(ev.key, ev.machineId, feature, SERVER_MASTER_SECRET);
+    return {
+      valid: true,
+      feature,
+      created_at: ev.created_at,
+      expires_at: ev.expires_at,
+      session_token: ev.session_token,
+      feature_token: ft.token,
+      feature_exp: ft.exp,
+      config: scopedConfig,
+    };
+  });
 }
 
 // ---------- Router ----------
@@ -586,16 +1810,25 @@ export default {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
     try {
       switch (url.pathname) {
-        case "/":               return new Response("Quoc Thang Tools - Secure License Server v2", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
-        case "/admin":          return await handleAdminPage();
-        case "/admin/generate": return await handleGenerateKey(req, env);
-        case "/admin/info":     return await handleKeyInfo(req, env);
-        case "/admin/reset_hwid": return await handleResetHwid(req, env);
-        case "/admin/toggle":   return await handleToggleKey(req, env);
-        case "/activate":       return await handleActivate(req, env);
-        case "/validate":       return await handleValidate(req, env);
-        case "/config":         return await handleConfig(req, env);
-        default:                return json({ error: "Not found" }, 404);
+        case "/":                           return new Response("Quoc Thang Studio — Secure Anti-Crack Server v3", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+        case "/admin":                      return await handleAdminPage(req, env);
+        case "/admin/auth":                 return await handleAdminAuth(req, env);
+        case "/admin/logout":               return await handleAdminLogout(req);
+        case "/admin/generate":             return await handleGenerateKey(req, env);
+        case "/admin/list":                 return await handleListKeys(req, env);
+        case "/admin/info":                 return await handleKeyInfo(req, env);
+        case "/admin/extend":               return await handleExtendKey(req, env);
+        case "/admin/reset_hwid":           return await handleResetHwid(req, env);
+        case "/admin/toggle":               return await handleToggleKey(req, env);
+        case "/admin/delete":               return await handleDeleteKey(req, env);
+        case "/admin/security/get":         return await handleSecGet(req, env);
+        case "/admin/security/save":        return await handleSecSave(req, env);
+        case "/admin/security/clear_alerts":return await handleSecClearAlerts(req, env);
+        case "/activate":                   return await handleActivate(req, env);
+        case "/validate":                   return await handleConfig(req, env);
+        case "/config":                     return await handleConfig(req, env);
+        case "/feature-auth":               return await handleFeatureAuth(req, env);
+        default:                            return json({ error: "Not found" }, 404);
       }
     } catch (e) {
       return json({ error: "Server error: " + e.message }, 500);
