@@ -34,9 +34,14 @@ enum NitroPremiumTier: Int, Codable, Equatable, Sendable {
 }
 
 enum NitroTrialOfferSource: String, Codable, Equatable, Sendable {
-    case userOffer = "Discord Offer"
+    case userOffer = "Discord Offer (Web)"
+    case stripeOffer = "Discord Offer (Stripe)"
+    case appleOffer = "Discord Offer (Apple iOS)"
+    case googleOffer = "Discord Offer (Google Play)"
     case trialOffersList = "Trial Offers"
+    case platformPromo = "Discord Promotion"
     case referral = "Bạn bè tặng Trial"
+    case customTrialId = "Trial ID mục tiêu"
     case promoLink = "Link Promo Trial"
 }
 
@@ -58,6 +63,15 @@ struct NitroSubscriptionTrial: Codable, Equatable, Sendable {
         case "978380684370378762": return "Nitro Basic"
         case "521842865731534868": return "Nitro Classic"
         default: return "Nitro Trial"
+        }
+    }
+
+    var estimatedDays: Int {
+        switch interval {
+        case 1: return intervalCount * 30
+        case 2: return intervalCount * 365
+        case 3: return intervalCount
+        default: return intervalCount
         }
     }
 
@@ -96,10 +110,25 @@ struct NitroTrialOffer: Identifiable, Equatable, Sendable {
     let subscriptionTrial: NitroSubscriptionTrial?
     let referrerId: String?
     let source: NitroTrialOfferSource
+    var customLabel: String? = nil
+    var paymentGateway: Int? = nil
+    var inferredDays: Int? = nil
+
+    var estimatedDays: Int {
+        if let st = subscriptionTrial { return st.estimatedDays }
+        return inferredDays ?? 30
+    }
+
+    var isLongTrial: Bool {
+        estimatedDays >= 90
+    }
 
     var title: String {
         if let st = subscriptionTrial {
             return "\(st.skuDisplayName) • \(st.durationText)"
+        }
+        if let lbl = customLabel, !lbl.isEmpty {
+            return lbl
         }
         return "Discord Nitro Trial"
     }
@@ -108,6 +137,10 @@ struct NitroTrialOffer: Identifiable, Equatable, Sendable {
         if let st = subscriptionTrial {
             return "TRIAL \(st.durationText.uppercased())"
         }
+        if let days = inferredDays, days >= 30 {
+            let months = max(1, days / 30)
+            return "TRIAL \(months) THÁNG"
+        }
         return "CÓ TRIAL"
     }
 
@@ -115,6 +148,13 @@ struct NitroTrialOffer: Identifiable, Equatable, Sendable {
         if let exp = expiresAt, !exp.isEmpty { return true }
         return false
     }
+}
+
+struct NitroPaymentHistorySummary: Sendable {
+    let neverHadNitro: Bool
+    let hadNitroLast12Months: Bool
+    let nitroPaymentCount: Int
+    let totalPaymentCount: Int
 }
 
 struct NitroDiscountOffer: Identifiable, Equatable, Sendable {
@@ -323,6 +363,10 @@ struct NitroTokenScanResult: Identifiable, Equatable, Sendable {
     var premiumTier: NitroPremiumTier = .none
     var emailVerified: Bool? = nil
     var hasPhone: Bool = false
+    var accountAgeDays: Int? = nil
+    var neverHadNitro: Bool? = nil
+    var hadNitroLast12Months: Bool = false
+    var nitroPaymentCount: Int = 0
     var countryCode: String? = nil
     var paymentSources: [NitroPaymentSource] = []
     var activeSubscriptions: [NitroSubscription] = []
@@ -334,6 +378,18 @@ struct NitroTokenScanResult: Identifiable, Equatable, Sendable {
     var autoRenewCanceled: Bool = false
     var statusDetail: String = "Chưa quét"
     var lastUpdatedAt: Date? = nil
+
+    var isCleanFirstTimeAccount: Bool {
+        guard neverHadNitro == true, !premiumTier.isNitro else { return false }
+        if let age = accountAgeDays, age < 30 { return false }
+        if emailVerified == false { return false }
+        return true
+    }
+
+    var isYoungAccount: Bool {
+        guard let age = accountAgeDays else { return false }
+        return age < 30
+    }
 
     var avatarURL: URL? {
         guard let h = avatarHash, !h.isEmpty, !AppEndpoints.cdnAvatars.isEmpty else { return nil }
@@ -392,6 +448,7 @@ struct NitroLogEntry: Identifiable, Sendable {
 enum NitroResultFilter: String, CaseIterable, Identifiable {
     case all = "Tất cả"
     case trial = "Có Trial"
+    case cleanFirstTime = "Acc sạch"
     case claimed = "Đã Claim"
     case alreadyNitro = "Đang Nitro"
     case needsPayment = "Cần thẻ"
@@ -454,6 +511,18 @@ enum NitroDateHelper {
     static func formatDisplay(_ raw: String?) -> String? {
         guard let d = parseISO(raw) else { return nil }
         return displayFormatter.string(from: d)
+    }
+
+    static func accountCreatedDate(fromUserId userId: String) -> Date? {
+        guard let snowflake = UInt64(userId), snowflake > 0 else { return nil }
+        let discordEpochMs: UInt64 = 1_420_070_400_000
+        let timestampMs = (snowflake >> 22) + discordEpochMs
+        return Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
+    }
+
+    static func accountAgeDays(fromUserId userId: String) -> Int? {
+        guard let created = accountCreatedDate(fromUserId: userId) else { return nil }
+        return max(0, Int(Date().timeIntervalSince(created) / 86_400.0))
     }
 }
 
@@ -766,31 +835,99 @@ final class DiscordNitroClient: @unchecked Sendable {
         }
     }
 
-    // MARK: - 2. Scan ALL Nitro Trial & Discount Offer Endpoints
+    /// Kiểm tra lịch sử thanh toán để xác định "Acc sạch — chưa từng mua/dùng Nitro lần nào"
+    func fetchPaymentHistory() async -> NitroPaymentHistorySummary {
+        guard let (_, data) = try? await performRequest(path: "/users/@me/billing/payments?limit=25", allow404AsEmpty: true),
+              !data.isEmpty,
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return NitroPaymentHistorySummary(neverHadNitro: true, hadNitroLast12Months: false, nitroPaymentCount: 0, totalPaymentCount: 0)
+        }
 
-    func fetchAllOffers() async -> (trials: [NitroTrialOffer], discount: NitroDiscountOffer?) {
-        var foundTrials: [NitroTrialOffer] = []
-        var foundDiscount: NitroDiscountOffer? = nil
+        let nitroSkuIds: Set<String> = [
+            "521847234246082599", // Nitro
+            "978380684370378762", // Nitro Basic
+            "521842865731534868"  // Nitro Classic
+        ]
+        let oneYearAgo = Date().addingTimeInterval(-365 * 86_400)
+        var nitroCount = 0
+        var recentNitro = false
 
-        // Source A: POST /users/@me/billing/user-offer (Endpoint chính của Discord Client)
-        if let (_, data) = try? await performRequest(
-            path: "/users/@me/billing/user-offer",
-            method: "POST",
-            jsonBody: [:],
-            allow404AsEmpty: true
-        ), !data.isEmpty,
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let trialObj = json["user_trial_offer"] as? [String: Any],
-               let offer = Self.parseTrialOffer(trialObj, source: .userOffer) {
-                foundTrials.append(offer)
-            }
-            if let discObj = json["user_discount_offer"] as? [String: Any],
-               let disc = Self.parseDiscountOffer(discObj) {
-                foundDiscount = disc
+        for item in arr {
+            let status = item["status"] as? Int ?? 0
+            // status 1 = Completed, 3 = Reversed/Refunded (ignore failed = 2)
+            let desc = (item["description"] as? String ?? "").lowercased()
+            let skuId = item["sku_id"] as? String ?? ""
+            let sub = item["subscription"] as? [String: Any]
+            let subType = sub?["type"] as? Int
+            let isNitroPayment = nitroSkuIds.contains(skuId) || desc.contains("nitro") || subType == 1
+
+            if isNitroPayment && status != 2 {
+                nitroCount += 1
+                if let created = NitroDateHelper.parseISO(item["created_at"] as? String), created >= oneYearAgo {
+                    recentNitro = true
+                }
+                if let subEnd = NitroDateHelper.parseISO(sub?["current_period_end"] as? String), subEnd >= oneYearAgo {
+                    recentNitro = true
+                }
             }
         }
 
-        // Source B: GET /users/@me/billing/user-trial-offers (Endpoint phụ / danh sách nhiều trial)
+        return NitroPaymentHistorySummary(
+            neverHadNitro: nitroCount == 0,
+            hadNitroLast12Months: recentNitro,
+            nitroPaymentCount: nitroCount,
+            totalPaymentCount: arr.count
+        )
+    }
+
+    // MARK: - 2. Scan ALL Nitro Trial & Discount Offer Endpoints (Multi-Gateway + Promotions + Custom Trial ID)
+
+    func fetchAllOffers(
+        scanMultiGateways: Bool = true,
+        customOfferOrTrialId: String = "",
+        paymentSource: NitroPaymentSource? = nil,
+        countryCode: String? = nil
+    ) async -> (trials: [NitroTrialOffer], discount: NitroDiscountOffer?) {
+        var foundTrials: [NitroTrialOffer] = []
+        var foundDiscount: NitroDiscountOffer? = nil
+
+        // Source A: POST /users/@me/billing/user-offer (Web/Default + đa cổng Stripe/Apple/Google để không bỏ sót gói 3-4 tháng)
+        var offerBodies: [([String: Any], NitroTrialOfferSource, Int?)] = [
+            ([:], .userOffer, nil)
+        ]
+        if scanMultiGateways {
+            offerBodies.append((["payment_gateway": 1], .stripeOffer, 1))
+            offerBodies.append((["payment_gateway": 3], .appleOffer, 3))
+            offerBodies.append((["payment_gateway": 4], .googleOffer, 4))
+        }
+        let trimmedCustom = customOfferOrTrialId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedCustom.isEmpty {
+            offerBodies.append((["offer_id": trimmedCustom], .customTrialId, nil))
+        }
+
+        for (body, src, gw) in offerBodies {
+            if Task.isCancelled { break }
+            if let (_, data) = try? await performRequest(
+                path: "/users/@me/billing/user-offer",
+                method: "POST",
+                jsonBody: body,
+                allow404AsEmpty: true
+            ), !data.isEmpty,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let trialObj = json["user_trial_offer"] as? [String: Any],
+                   var offer = Self.parseTrialOffer(trialObj, source: src) {
+                    offer.paymentGateway = gw
+                    Self.appendUnique(offer, to: &foundTrials)
+                }
+                if foundDiscount == nil,
+                   let discObj = json["user_discount_offer"] as? [String: Any],
+                   let disc = Self.parseDiscountOffer(discObj) {
+                    foundDiscount = disc
+                }
+            }
+        }
+
+        // Source B: GET /users/@me/billing/user-trial-offers (Danh sách tất cả trial đang có)
         if let (_, data) = try? await performRequest(
             path: "/users/@me/billing/user-trial-offers",
             method: "GET",
@@ -820,7 +957,54 @@ final class DiscordNitroClient: @unchecked Sendable {
             Self.appendUnique(offer, to: &foundTrials)
         }
 
-        // Source D: GET /users/@me/referrals (Friend Referral Nitro Trial 2 tuần)
+        // Source D: GET /promotions (Chiến dịch Nitro Trial 1-4 tháng đang mở của Discord)
+        if scanMultiGateways,
+           let (_, data) = try? await performRequest(
+            path: "/promotions",
+            method: "GET",
+            allow404AsEmpty: true
+           ), !data.isEmpty,
+           let promos = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            let now = Date()
+            let preferredCur = Self.resolveCurrency(paymentSource: paymentSource, countryCode: countryCode)
+            for p in promos {
+                if Task.isCancelled { break }
+                guard let tid = p["trial_id"] as? String, !tid.isEmpty else { continue }
+                if let endStr = p["end_date"] as? String,
+                   let endDate = NitroDateHelper.parseISO(endStr),
+                   endDate < now {
+                    continue
+                }
+                if foundTrials.contains(where: { $0.trialId == tid }) { continue }
+
+                // Xác thực thực tế với server Discord bằng preview == 0đ để tránh báo ảo!
+                if (try? await previewTrialSubscription(
+                    planId: "511651880837840896",
+                    trialId: tid,
+                    paymentSourceId: paymentSource?.id,
+                    currency: preferredCur
+                )) != nil {
+                    let header = (p["inbound_header_text"] as? String) ?? (p["outbound_title"] as? String) ?? "Discord Nitro Trial"
+                    let inferred = Self.inferTrialDays(from: header)
+                    let pid = (p["id"] as? String) ?? tid
+                    let offer = NitroTrialOffer(
+                        id: pid,
+                        userId: nil,
+                        trialId: tid,
+                        expiresAt: p["end_date"] as? String,
+                        subscriptionTrial: nil,
+                        referrerId: nil,
+                        source: .platformPromo,
+                        customLabel: header,
+                        paymentGateway: nil,
+                        inferredDays: inferred
+                    )
+                    Self.appendUnique(offer, to: &foundTrials)
+                }
+            }
+        }
+
+        // Source E: GET /users/@me/referrals (Friend Referral Nitro Trial 2 tuần)
         if let (_, data) = try? await performRequest(
             path: "/users/@me/referrals",
             method: "GET",
@@ -846,7 +1030,51 @@ final class DiscordNitroClient: @unchecked Sendable {
             }
         }
 
+        // Source F: Kiểm tra trực tiếp Custom Trial ID (nếu người dùng nhập ID chiến dịch 4 tháng / 3 tháng)
+        if !trimmedCustom.isEmpty && !foundTrials.contains(where: { $0.trialId == trimmedCustom || $0.id == trimmedCustom }) {
+            let preferredCur = Self.resolveCurrency(paymentSource: paymentSource, countryCode: countryCode)
+            if (try? await previewTrialSubscription(
+                planId: "511651880837840896",
+                trialId: trimmedCustom,
+                paymentSourceId: paymentSource?.id,
+                currency: preferredCur
+            )) != nil {
+                let customOffer = NitroTrialOffer(
+                    id: trimmedCustom,
+                    userId: nil,
+                    trialId: trimmedCustom,
+                    expiresAt: nil,
+                    subscriptionTrial: nil,
+                    referrerId: nil,
+                    source: .customTrialId,
+                    customLabel: "Nitro Trial (ID: \(trimmedCustom))",
+                    paymentGateway: nil,
+                    inferredDays: 120
+                )
+                Self.appendUnique(customOffer, to: &foundTrials)
+            }
+        }
+
+        // Sắp xếp ưu tiên gói dài hạn nhất lên đầu (4 tháng → 3 tháng → 1 tháng → 14 ngày → 7 ngày)
+        foundTrials.sort { lhs, rhs in
+            if lhs.estimatedDays != rhs.estimatedDays {
+                return lhs.estimatedDays > rhs.estimatedDays
+            }
+            return lhs.id < rhs.id
+        }
+
         return (foundTrials, foundDiscount)
+    }
+
+    private static func inferTrialDays(from text: String) -> Int? {
+        let lower = text.lowercased()
+        if lower.contains("4 month") || lower.contains("4 tháng") { return 120 }
+        if lower.contains("3 month") || lower.contains("3 tháng") { return 90 }
+        if lower.contains("2 month") || lower.contains("2 tháng") { return 60 }
+        if lower.contains("1 month") || lower.contains("1 tháng") { return 30 }
+        if lower.contains("2 week") || lower.contains("14 day") || lower.contains("2 tuần") { return 14 }
+        if lower.contains("1 week") || lower.contains("7 day") || lower.contains("1 tuần") { return 7 }
+        return nil
     }
 
     // MARK: - 3. Acknowledge Offer, Resolve Plan, Preview (0đ Guard) & Redeem
@@ -1272,6 +1500,15 @@ final class NitroTrialManager: ObservableObject {
     @Published var onlySelectedTokens: Bool {
         didSet { UserDefaults.standard.set(onlySelectedTokens, forKey: "QT_Nitro_OnlySelected") }
     }
+    @Published var onlyCleanFirstTimeAccounts: Bool {
+        didSet { UserDefaults.standard.set(onlyCleanFirstTimeAccounts, forKey: "QT_Nitro_OnlyCleanFirstTime") }
+    }
+    @Published var scanMultiGateways: Bool {
+        didSet { UserDefaults.standard.set(scanMultiGateways, forKey: "QT_Nitro_ScanMultiGateways") }
+    }
+    @Published var customTrialOrOfferId: String {
+        didSet { UserDefaults.standard.set(customTrialOrOfferId, forKey: "QT_Nitro_CustomTrialId") }
+    }
     @Published var useSavedPaymentSource: Bool {
         didSet { UserDefaults.standard.set(useSavedPaymentSource, forKey: "QT_Nitro_UseSavedPayment") }
     }
@@ -1291,6 +1528,9 @@ final class NitroTrialManager: ObservableObject {
     private init() {
         let ud = UserDefaults.standard
         self.onlySelectedTokens = ud.bool(forKey: "QT_Nitro_OnlySelected")
+        self.onlyCleanFirstTimeAccounts = ud.bool(forKey: "QT_Nitro_OnlyCleanFirstTime")
+        self.scanMultiGateways = ud.object(forKey: "QT_Nitro_ScanMultiGateways") == nil ? true : ud.bool(forKey: "QT_Nitro_ScanMultiGateways")
+        self.customTrialOrOfferId = ud.string(forKey: "QT_Nitro_CustomTrialId") ?? ""
         self.useSavedPaymentSource = ud.object(forKey: "QT_Nitro_UseSavedPayment") == nil ? true : ud.bool(forKey: "QT_Nitro_UseSavedPayment")
         self.autoCancelRenewal = ud.object(forKey: "QT_Nitro_AutoCancelRenewal") == nil ? true : ud.bool(forKey: "QT_Nitro_AutoCancelRenewal")
         let savedDelay = ud.double(forKey: "QT_Nitro_ScanDelay")
@@ -1341,6 +1581,10 @@ final class NitroTrialManager: ObservableObject {
 
     func countNeedsPayment(for tokens: [TokenInfo]) -> Int {
         tokens.filter { results[$0.id]?.state == .needsPayment }.count
+    }
+
+    func countCleanFirstTime(for tokens: [TokenInfo]) -> Int {
+        tokens.filter { results[$0.id]?.isCleanFirstTimeAccount == true }.count
     }
 
     func countScanned(for tokens: [TokenInfo]) -> Int {
@@ -1596,6 +1840,11 @@ final class NitroTrialManager: ObservableObject {
                 if snap.state == .tokenDead || snap.state == .alreadyNitro || snap.state == .claimed {
                     continue
                 }
+                // Với link Promo 3-4 tháng: ưu tiên acc sạch chưa từng mua Nitro & >= 30 ngày nếu bật chế độ lọc acc sạch
+                if self.onlyCleanFirstTimeAccounts && !snap.isCleanFirstTimeAccount {
+                    self.log("[\(snap.username)] Bỏ qua link Promo: không phải Acc sạch (chưa mua Nitro & ≥30 ngày).", level: .info)
+                    continue
+                }
 
                 let code = codes[codeIndex]
                 let client = DiscordNitroClient(token: tok.token)
@@ -1729,27 +1978,46 @@ final class NitroTrialManager: ObservableObject {
             entry.premiumTier = user.premiumType
             entry.emailVerified = user.verified
             entry.hasPhone = !(user.phone ?? "").isEmpty
+            entry.accountAgeDays = NitroDateHelper.accountAgeDays(fromUserId: user.id)
 
-            // Gọi song song các thông tin billing & offers
+            // Bước 1: lấy song song subscriptions, payment sources, lịch sử thanh toán, country & outbounds
             async let subsTask = client.fetchSubscriptions()
             async let payTask = client.fetchPaymentSources()
+            async let historyTask = client.fetchPaymentHistory()
             async let countryTask = client.fetchCountryCode()
-            async let offersTask = client.fetchAllOffers()
             async let outboundTask = client.fetchOutboundPromotions()
 
             let subs = await subsTask
             let payments = await payTask
+            let history = await historyTask
             let country = await countryTask
-            let (trials, discount) = await offersTask
             let outbounds = await outboundTask
 
             entry.activeSubscriptions = subs
             entry.paymentSources = payments
             entry.countryCode = country
+            entry.outboundPromos = outbounds
+            entry.nitroPaymentCount = history.nitroPaymentCount
+            entry.hadNitroLast12Months = history.hadNitroLast12Months
+            let neverNitro = !user.premiumType.isNitro && subs.isEmpty && history.neverHadNitro
+            entry.neverHadNitro = neverNitro
+
+            // Bước 2: quét toàn bộ nguồn Nitro Trial (Web + Stripe + Apple + Google + Promotions + Referrals + Custom Trial ID)
+            let (trials, discount) = await client.fetchAllOffers(
+                scanMultiGateways: scanMultiGateways,
+                customOfferOrTrialId: customTrialOrOfferId,
+                paymentSource: entry.preferredPaymentSource,
+                countryCode: country
+            )
+
             entry.trialOffers = trials
             entry.discountOffer = discount
-            entry.outboundPromos = outbounds
             entry.lastUpdatedAt = Date()
+
+            let ageText = entry.accountAgeDays.map { "\($0) ngày" } ?? "?"
+            let cleanTag = entry.isCleanFirstTimeAccount
+                ? "Acc sạch (\(ageText))"
+                : (neverNitro ? "Chưa Nitro • Acc mới (\(ageText))" : "Đã từng dùng Nitro")
 
             let hasActiveSub = subs.contains(where: { $0.isActive })
             if user.premiumType.isNitro || hasActiveSub {
@@ -1768,11 +2036,17 @@ final class NitroTrialManager: ObservableObject {
             if let firstTrial = trials.first {
                 entry.state = .trialAvailable
                 let payNote = entry.preferredPaymentSource.map { "Thẻ sẵn: \($0.displayName)" } ?? "Chưa gắn thẻ"
-                entry.statusDetail = "Tìm thấy \(firstTrial.title) • \(payNote)"
+                let multiNote = trials.count > 1 ? " (+\(trials.count - 1) gói khác)" : ""
+                entry.statusDetail = "Tìm thấy \(firstTrial.title)\(multiNote) • \(cleanTag) • \(payNote)"
                 results[token.id] = entry
-                log("[\(entry.username)] PHÁT HIỆN GÓI TRIAL: \(firstTrial.title) (\(payNote))", level: .success)
+                let tag4m = firstTrial.isLongTrial ? "🔥 GÓI DÀI HẠN " : ""
+                log("[\(entry.username)] \(tag4m)PHÁT HIỆN TRIAL: \(firstTrial.title) [\(firstTrial.source.rawValue)] • \(cleanTag) • \(payNote)", level: .success)
 
                 if autoClaim {
+                    if onlyCleanFirstTimeAccounts && !entry.isCleanFirstTimeAccount {
+                        log("[\(entry.username)] Bỏ qua auto-claim vì chỉ lọc Acc sạch (chưa Nitro & ≥30 ngày).", level: .info)
+                        return entry.state
+                    }
                     return await claimSingleTokenInternal(token)
                 }
                 return entry.state
@@ -1780,17 +2054,22 @@ final class NitroTrialManager: ObservableObject {
 
             if let disc = discount {
                 entry.state = .discountOnly
-                entry.statusDetail = "\(disc.summary) (không phải gói Trial 0đ)"
+                entry.statusDetail = "\(disc.summary) • \(cleanTag)"
                 results[token.id] = entry
-                log("[\(entry.username)] Chỉ có ưu đãi giảm giá: \(disc.summary)", level: .info)
+                log("[\(entry.username)] Chỉ có ưu đãi giảm giá: \(disc.summary) (\(cleanTag))", level: .info)
                 return entry.state
             }
 
             entry.state = .noOffer
-            let payCount = entry.validPaymentSources.count
-            entry.statusDetail = payCount > 0
-                ? "Không có gói Trial • Có \(payCount) thẻ hợp lệ"
-                : "Không có gói Nitro Trial khả dụng"
+            if entry.isCleanFirstTimeAccount {
+                let payNote = entry.validPaymentSources.count > 0 ? "Có \(entry.validPaymentSources.count) thẻ" : "Chưa gắn thẻ"
+                entry.statusDetail = "Acc sạch (\(ageText), chưa mua Nitro) — đủ ĐK nhận Trial 3–4 tháng (đang chờ Discord phát offer hoặc dán Link Promo) • \(payNote)"
+                log("[\(entry.username)] ACC SẠCH ĐỦ ĐK TRIAL (\(ageText)) — chưa có banner offer từ Discord, có thể claim bằng Link Promo 3-4 tháng.", level: .info)
+            } else if entry.isYoungAccount {
+                entry.statusDetail = "Tài khoản mới (\(ageText) < 30 ngày) — Discord yêu cầu tuổi acc ≥ 30 ngày cho gói Trial"
+            } else {
+                entry.statusDetail = "Không có gói Nitro Trial • \(cleanTag)"
+            }
             results[token.id] = entry
             return entry.state
 
@@ -1926,6 +2205,12 @@ final class NitroTrialManager: ObservableObject {
         var lines: [String] = []
         for tok in tokens {
             guard let res = results[tok.id] else { continue }
+            if states.contains("cleanFirstTime") && res.isCleanFirstTimeAccount {
+                let age = res.accountAgeDays.map { "\($0)d" } ?? "?"
+                let info = res.primaryOffer?.title ?? "Acc sạch đủ ĐK Trial (\(age))"
+                lines.append("\(tok.token) | \(res.username) | ACC_SACH | \(info)")
+                continue
+            }
             let key: String
             switch res.state {
             case .trialAvailable: key = "trial"
@@ -1976,6 +2261,8 @@ struct NitroTrialDashboardView: View {
                 return true
             case .trial:
                 return item.state == .trialAvailable
+            case .cleanFirstTime:
+                return item.isCleanFirstTimeAccount
             case .claimed:
                 return item.state == .claimed
             case .alreadyNitro:
@@ -2062,7 +2349,7 @@ struct NitroTrialDashboardView: View {
                         .foregroundStyle(.green)
                         .lineLimit(1)
                 } else {
-                    Text("Quét ưu đãi Trial, kiểm tra 0đ & tự động Claim")
+                    Text("Ưu tiên gói dài nhất (4T → 3T → 1T) • Check Acc sạch & 0đ")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -2102,12 +2389,18 @@ struct NitroTrialDashboardView: View {
     // MARK: 2. 4-Column Stats Grid
 
     private var statsGrid: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             NitroMiniStatBox(
                 title: "Đã quét",
                 value: "\(nitro.countScanned(for: app.tokens))/\(app.tokens.filter(\.isValid).count)",
                 icon: "magnifyingglass.circle.fill",
                 color: .indigo
+            )
+            NitroMiniStatBox(
+                title: "Acc sạch",
+                value: "\(nitro.countCleanFirstTime(for: app.tokens))",
+                icon: "checkmark.shield.fill",
+                color: .teal
             )
             NitroMiniStatBox(
                 title: "Có Trial",
@@ -2265,6 +2558,44 @@ struct NitroTrialDashboardView: View {
 
                     Divider()
 
+                    Toggle(isOn: $nitro.onlyCleanFirstTimeAccounts) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Chỉ Claim Acc sạch (chưa mua Nitro)")
+                                .font(.subheadline)
+                            Text("Kiểm tra lịch sử billing = chưa từng dùng Nitro & tuổi tài khoản ≥ 30 ngày.")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .tint(.teal)
+
+                    Divider()
+
+                    Toggle(isOn: $nitro.scanMultiGateways) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Quét đa cổng (Web / Apple / Google / Promo)")
+                                .font(.subheadline)
+                            Text("Quét toàn bộ cổng ưu đãi Discord & tự chọn gói dài nhất (4 tháng → 3 tháng → 1 tháng).")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .tint(.purple)
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Trial ID / Offer ID mục tiêu (tùy chọn)")
+                            .font(.subheadline)
+                        TextField("Nhập trial_id / offer_id chiến dịch 4 tháng (nếu có)...", text: $nitro.customTrialOrOfferId)
+                            .font(.system(.caption, design: .monospaced))
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .padding(9)
+                            .background(Color(UIColor.tertiarySystemGroupedBackground),
+                                        in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+
+                    Divider()
+
                     Toggle(isOn: $nitro.useSavedPaymentSource) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Dùng thẻ/ví đã lưu trên token")
@@ -2403,6 +2734,9 @@ struct NitroTrialDashboardView: View {
                     .font(.subheadline.bold())
                 Spacer()
                 Menu {
+                    Button("Copy Token Acc sạch (Chưa Nitro, ≥30d)", systemImage: "checkmark.shield") {
+                        copyExport(states: ["cleanFirstTime"], label: "Đã copy Token Acc sạch đủ ĐK Trial!")
+                    }
                     Button("Copy Token có Nitro Trial", systemImage: "gift") {
                         copyExport(states: ["trial", "needsPayment"], label: "Đã copy Token có Trial!")
                     }
@@ -2652,10 +2986,22 @@ struct NitroTokenResultCard: View {
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
                                 .background(Color.purple, in: Capsule())
+                        } else if result.isCleanFirstTimeAccount {
+                            Text("ACC SẠCH")
+                                .font(.system(size: 9, weight: .black, design: .rounded))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.teal, in: Capsule())
                         }
                     }
 
                     HStack(spacing: 8) {
+                        if let age = result.accountAgeDays {
+                            Label("\(age)d", systemImage: "calendar")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(age >= 30 ? .teal : .orange)
+                        }
                         if let verified = result.emailVerified {
                             Label(verified ? "Email OK" : "Chưa Verify",
                                   systemImage: verified ? "checkmark.shield.fill" : "exclamationmark.shield")
@@ -2699,9 +3045,19 @@ struct NitroTokenResultCard: View {
                     Image(systemName: "gift.fill")
                         .foregroundStyle(Color(red: 0.93, green: 0.28, blue: 0.60))
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(offer.title)
-                            .font(.caption.bold())
-                            .foregroundStyle(.primary)
+                        HStack(spacing: 6) {
+                            Text(offer.title)
+                                .font(.caption.bold())
+                                .foregroundStyle(.primary)
+                            if offer.isLongTrial {
+                                Text("DÀI HẠN")
+                                    .font(.system(size: 9, weight: .black, design: .rounded))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.orange, in: Capsule())
+                            }
+                        }
                         HStack(spacing: 8) {
                             Text(offer.source.rawValue)
                                 .font(.system(size: 10, weight: .medium))
