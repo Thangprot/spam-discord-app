@@ -178,6 +178,9 @@ struct CrackedView: View {
 }
 
 struct LoadingView: View {
+    @EnvironmentObject var license: LicenseManager
+    @State private var showRecoveryActions = false
+
     var body: some View {
         ZStack {
             LinearGradient(
@@ -204,6 +207,48 @@ struct LoadingView: View {
                 Text("Đang xác thực bản quyền...")
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white.opacity(0.85))
+
+                if showRecoveryActions {
+                    VStack(spacing: 10) {
+                        Text("Kết nối máy chủ hơi chậm, bạn có thể thử lại hoặc nhập key mới:")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.55))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 32)
+
+                        HStack(spacing: 10) {
+                            Button {
+                                Task { await license.refreshStatus(force: true) }
+                            } label: {
+                                Label("Thử lại", systemImage: "arrow.clockwise")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 9)
+                                    .background(Color.indigo.opacity(0.85), in: Capsule())
+                            }
+
+                            Button {
+                                license.deactivate()
+                            } label: {
+                                Label("Nhập Key khác", systemImage: "key.fill")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.white.opacity(0.9))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 9)
+                                    .background(Color.white.opacity(0.14), in: Capsule())
+                            }
+                        }
+                    }
+                    .padding(.top, 8)
+                    .transition(.opacity)
+                }
+            }
+        }
+        .task {
+            try? await Task.sleep(nanoseconds: 4_500_000_000)
+            withAnimation(.easeInOut(duration: 0.25)) {
+                showRecoveryActions = true
             }
         }
     }
@@ -350,6 +395,33 @@ struct LockView: View {
                         .padding(.horizontal, 14)
                         .padding(.vertical, 8)
                         .background(Color.orange.opacity(0.15), in: Capsule())
+                    } else if case .invalid(let reason) = license.status, !reason.isEmpty {
+                        VStack(spacing: 10) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                Text(reason)
+                                    .multilineTextAlignment(.center)
+                            }
+                            .font(.caption.bold())
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                            .background(Color.red.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .padding(.horizontal, 22)
+
+                            if let existingKey = license.licenseKey, !existingKey.isEmpty {
+                                Button {
+                                    Task { await license.refreshStatus(force: true) }
+                                } label: {
+                                    Label("Thử kiểm tra lại key đã lưu", systemImage: "arrow.clockwise")
+                                        .font(.caption.bold())
+                                        .foregroundColor(.white.opacity(0.85))
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 8)
+                                        .background(Color.white.opacity(0.12), in: Capsule())
+                                }
+                            }
+                        }
                     }
 
                     Spacer(minLength: 20)

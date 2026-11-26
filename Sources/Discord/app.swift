@@ -177,20 +177,40 @@ final class SecurityGuard: @unchecked Sendable {
         PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
     }
 
+    func clearSession() {
+        lock.lock()
+        sessionToken = nil
+        isCompromised = false
+        lock.unlock()
+        PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
+    }
+
     func loadCachedSessionToken() {
         if let token = PersistentStorage.shared.readString(forKey: "QT_CachedSessionToken") {
             _ = updateSessionToken(token, persist: false)
         }
     }
 
+    private static func decodeBase64Flexible(_ str: String) -> Data? {
+        if let d = Data(base64Encoded: str) { return d }
+        var normalized = str
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let rem = normalized.count % 4
+        if rem > 0 {
+            normalized += String(repeating: "=", count: 4 - rem)
+        }
+        return Data(base64Encoded: normalized)
+    }
+
     /// Xác thực và lưu Session Token từ server
     func updateSessionToken(_ token: String, persist: Bool = true) -> Bool {
         let parts = token.components(separatedBy: ".")
         guard parts.count == 2,
-              let payloadData = Data(base64Encoded: parts[0]),
+              let payloadData = Self.decodeBase64Flexible(parts[0]),
               let payloadObj = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
               let mid = payloadObj["mid"] as? String,
-              let exp = payloadObj["exp"] as? Double else {
+              let expRaw = (payloadObj["exp"] as? NSNumber)?.doubleValue else {
             return false
         }
 
@@ -204,7 +224,8 @@ final class SecurityGuard: @unchecked Sendable {
             return false
         }
 
-        guard exp > Date().timeIntervalSince1970 else {
+        let expSec = expRaw > 100_000_000_000 ? (expRaw / 1000.0) : expRaw
+        guard expSec > Date().timeIntervalSince1970 else {
             return false
         }
 
@@ -251,8 +272,8 @@ final class SecureAPIClient {
 
     private init() {
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 20
-        cfg.timeoutIntervalForResource = 30
+        cfg.timeoutIntervalForRequest = 12
+        cfg.timeoutIntervalForResource = 15
         session = URLSession(configuration: cfg)
     }
 
@@ -296,12 +317,9 @@ final class SecureAPIClient {
         req.httpBody = try JSONSerialization.data(withJSONObject: envelope)
 
         let (data, res) = try await session.data(for: req)
-        guard let httpRes = res as? HTTPURLResponse, (200...299).contains(httpRes.statusCode) else {
-            let msg = String(data: data, encoding: .utf8) ?? "HTTP Error"
-            throw NSError(domain: "Network", code: (res as? HTTPURLResponse)?.statusCode ?? 500, userInfo: [NSLocalizedDescriptionKey: msg])
-        }
+        let statusCode = (res as? HTTPURLResponse)?.statusCode ?? 500
 
-        // Kiểm tra xem phản hồi có phải là gói tin mã hóa AES-GCM không
+        // Thử giải mã envelope AES-GCM ngay cả khi HTTP 4xx (trường hợp worker trả về valid:false / cracked:true / expired:true kèm 403/404)
         if let serverEnvelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let respPayload = serverEnvelope["payload"] as? String,
            let respSig = serverEnvelope["sig"] as? String {
@@ -317,19 +335,41 @@ final class SecureAPIClient {
             }
             let respBox = try AES.GCM.SealedBox(combined: combinedRespData)
             let decryptedData = try AES.GCM.open(respBox, using: respKey)
-            return try JSONDecoder().decode(T.self, from: decryptedData)
+            if let decoded = try? JSONDecoder().decode(T.self, from: decryptedData) {
+                return decoded
+            }
+            if let errObj = try? JSONSerialization.jsonObject(with: decryptedData) as? [String: Any],
+               let errMsg = errObj["error"] as? String {
+                let dom = (400...499).contains(statusCode) ? "LicenseRejected" : "Security"
+                throw NSError(domain: dom, code: statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
+            }
         }
 
-        // Nếu server trả về JSON dạng thường (trường hợp worker báo lỗi trực tiếp)
-        if let plainObj = try? JSONDecoder().decode(T.self, from: data) {
+        // Nếu server trả về JSON dạng thường
+        if (200...299).contains(statusCode), let plainObj = try? JSONDecoder().decode(T.self, from: data) {
             return plainObj
         }
+        if (400...499).contains(statusCode) {
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               (obj["cracked"] as? Bool == true || obj["expired"] as? Bool == true),
+               let plainObj = try? JSONDecoder().decode(T.self, from: data) {
+                return plainObj
+            }
+            if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let errMsg = (errObj["error"] as? String) ?? (errObj["message"] as? String) {
+                throw NSError(domain: "LicenseRejected", code: statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
+            }
+            let rawMsg = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let msg = (rawMsg?.isEmpty == false) ? rawMsg! : "Key không tồn tại hoặc đã bị xóa (HTTP \(statusCode))."
+            throw NSError(domain: "LicenseRejected", code: statusCode, userInfo: [NSLocalizedDescriptionKey: msg])
+        }
         if let errObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let errMsg = errObj["error"] as? String {
-            throw NSError(domain: "Security", code: 400, userInfo: [NSLocalizedDescriptionKey: errMsg])
+           let errMsg = (errObj["error"] as? String) ?? (errObj["message"] as? String) {
+            throw NSError(domain: "Network", code: statusCode, userInfo: [NSLocalizedDescriptionKey: errMsg])
         }
 
-        throw NSError(domain: "Security", code: 403, userInfo: [NSLocalizedDescriptionKey: "Phản hồi từ server không hợp lệ."])
+        let msg = String(data: data, encoding: .utf8) ?? "HTTP Error \(statusCode)"
+        throw NSError(domain: "Network", code: statusCode, userInfo: [NSLocalizedDescriptionKey: msg])
     }
 }
 
@@ -2773,11 +2813,14 @@ final class LicenseManager: ObservableObject {
     @Published var licenseKey: String? = nil
     @Published var activatedAt: Date? = nil
     @Published var isChecking = false
+    @Published var isPermitReady = false
 
     private let keyStoreKey = "QT_LicenseKey_Server"
     private let expiryStoreKey = "QT_LicenseExpiry"
     private let lastCheckKey = "QT_LicenseLastCheck"
     private let activatedStoreKey = "QT_LicenseActivatedAt"
+    private var periodicTimer: Timer?
+    private var isRefreshInFlight = false
 
     init() {
         licenseKey = PersistentStorage.shared.readString(forKey: keyStoreKey)
@@ -2791,22 +2834,61 @@ final class LicenseManager: ObservableObject {
 
         _ = AppEndpoints.loadFromCache()
         SecurityGuard.shared.loadCachedSessionToken()
+        syncPermitReady()
 
         if let key = licenseKey, !key.isEmpty {
-            if let exp = expDate {
-                if Date() > exp {
-                    status = .expired(expiresOn: exp)
-                } else {
-                    // Nếu còn hạn: Mở app ngay lập tức, không bắt nhập lại key hay chờ đợi
-                    status = .valid(expiresOn: exp)
-                }
+            if let exp = expDate, Date() > exp {
+                clearRuntimePermit()
+                status = .expired(expiresOn: exp)
+            } else if let exp = expDate, isPermitReady {
+                // Chỉ mở app ngay nếu đã có đủ Remote Config + Session Token hợp lệ
+                status = .valid(expiresOn: exp)
             } else {
+                // Thiếu config hoặc session token đã hết hạn -> hiển thị trạng thái đang kiểm tra & làm mới từ server
                 status = .checking
             }
-            Task { @MainActor [weak self] in await self?.refreshStatus() }
+            Task { @MainActor [weak self] in await self?.refreshStatus(force: true) }
+            startPeriodicCheck()
         } else {
+            clearRuntimePermit()
             status = .notActivated
         }
+    }
+
+    private func syncPermitReady() {
+        isPermitReady = AppEndpoints.isLoaded && SecurityGuard.shared.verifyExecutionPermit()
+    }
+
+    private func clearRuntimePermit() {
+        AppEndpoints.clear()
+        SecurityGuard.shared.clearSession()
+        isPermitReady = false
+    }
+
+    private func revokeLocalLicense(reason: String) {
+        for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
+            PersistentStorage.shared.delete(forKey: k)
+        }
+        licenseKey = nil
+        activatedAt = nil
+        clearRuntimePermit()
+        stopPeriodicCheck()
+        status = .invalid(reason: reason)
+    }
+
+    private func startPeriodicCheck() {
+        periodicTimer?.invalidate()
+        periodicTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self, let k = self.licenseKey, !k.isEmpty else { return }
+                await self.refreshStatus()
+            }
+        }
+    }
+
+    private func stopPeriodicCheck() {
+        periodicTimer?.invalidate()
+        periodicTimer = nil
     }
 
     func activate(key: String) async -> LicenseStatus {
@@ -2817,7 +2899,8 @@ final class LicenseManager: ObservableObject {
         do {
             let res = try await LicenseAPIClient.shared.activate(key: clean)
             guard res.valid == true, let expMs = res.expiresAt else {
-                status = .invalid(reason: res.error ?? "Key không hợp lệ")
+                clearRuntimePermit()
+                status = .invalid(reason: res.error ?? "Key không hợp lệ hoặc đã bị xóa.")
                 return status
             }
             if let token = res.sessionToken {
@@ -2834,10 +2917,21 @@ final class LicenseManager: ObservableObject {
             PersistentStorage.shared.saveString("\(now.timeIntervalSince1970)", forKey: activatedStoreKey)
             licenseKey = clean
             activatedAt = now
-            status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
-            if !AppEndpoints.isLoaded {
-                await fetchAndApplyConfig(key: clean)
+            syncPermitReady()
+
+            if Date() > exp {
+                clearRuntimePermit()
+                status = .expired(expiresOn: exp)
+                return status
             }
+
+            if !isPermitReady {
+                await fetchAndApplyConfig(key: clean)
+                return status
+            }
+
+            status = .valid(expiresOn: exp)
+            startPeriodicCheck()
             return status
         } catch {
             status = .invalid(reason: "Lỗi kích hoạt: \(error.localizedDescription)")
@@ -2845,39 +2939,65 @@ final class LicenseManager: ObservableObject {
         }
     }
 
-    func refreshStatus() async {
+    func refreshStatus(force: Bool = false) async {
         guard let key = licenseKey, !key.isEmpty else {
-            AppEndpoints.clear()
+            clearRuntimePermit()
+            stopPeriodicCheck()
             status = .notActivated
             return
         }
+        if isRefreshInFlight && !force { return }
+        isRefreshInFlight = true
         isChecking = true
-        defer { isChecking = false }
+        defer {
+            isRefreshInFlight = false
+            isChecking = false
+        }
         await fetchAndApplyConfig(key: key)
     }
 
     private func fetchAndApplyConfig(key: String) async {
         do {
             let res = try await ConfigAPIClient.shared.fetchConfig(key: key)
+
             if res.cracked == true {
+                for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
+                    PersistentStorage.shared.delete(forKey: k)
+                }
+                licenseKey = nil
+                activatedAt = nil
                 SecurityGuard.shared.markCompromised(reason: res.error ?? "App has been cracked")
                 AppEndpoints.clear()
+                isPermitReady = false
+                stopPeriodicCheck()
                 status = .cracked(reason: res.error ?? "Key đã bị vô hiệu hóa.")
                 return
             }
+
             if res.expired == true || (res.expiresAt != nil && Date().timeIntervalSince1970 * 1000 > Double(res.expiresAt!)) {
                 let exp = res.expiresAt != nil ? Date(timeIntervalSince1970: Double(res.expiresAt!) / 1000) : Date()
+                clearRuntimePermit()
+                stopPeriodicCheck()
                 status = .expired(expiresOn: exp)
                 return
             }
-            guard res.valid == true, let cfg = res.config, let expMs = res.expiresAt else {
-                if case .valid = status {
-                    // Tránh văng user nếu server gặp sự cố tạm thời
-                    return
-                }
-                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc lỗi máy chủ.")
+
+            // Nếu server phản hồi rõ ràng valid == false hoặc có thông báo lỗi từ server -> khóa app ngay lập tức!
+            if res.valid == false || (res.valid != true && res.error != nil) {
+                revokeLocalLicense(reason: res.error ?? "License key đã bị xóa hoặc không còn hợp lệ.")
                 return
             }
+
+            guard res.valid == true, let cfg = res.config, let expMs = res.expiresAt else {
+                // Không bao giờ để kẹt ở màn hình xoay LoadingView nếu thiếu permit!
+                if case .valid = status, isPermitReady {
+                    return
+                }
+                clearRuntimePermit()
+                status = .invalid(reason: res.error ?? "Key không tồn tại hoặc máy chủ không trả về cấu hình.")
+                return
+            }
+
             if let token = res.sessionToken {
                 _ = SecurityGuard.shared.updateSessionToken(token)
             }
@@ -2887,29 +3007,50 @@ final class LicenseManager: ObservableObject {
                 PersistentStorage.shared.saveString("\(actDate.timeIntervalSince1970)", forKey: activatedStoreKey)
             }
             AppEndpoints.apply(cfg)
+            syncPermitReady()
+
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
             PersistentStorage.shared.saveString("\(exp.timeIntervalSince1970)", forKey: expiryStoreKey)
             PersistentStorage.shared.saveString("\(Date().timeIntervalSince1970)", forKey: lastCheckKey)
-            status = Date() > exp ? .expired(expiresOn: exp) : .valid(expiresOn: exp)
-        } catch {
-            // Khi mất mạng hoặc server chậm: giữ nguyên trạng thái valid nếu còn hạn
+
+            if Date() > exp {
+                clearRuntimePermit()
+                stopPeriodicCheck()
+                status = .expired(expiresOn: exp)
+            } else if isPermitReady {
+                status = .valid(expiresOn: exp)
+                startPeriodicCheck()
+            } else {
+                // Nếu session token từ server không khớp MachineID / đã hết hạn -> đưa về màn hình nhập key thay vì xoay vô tận
+                clearRuntimePermit()
+                status = .invalid(reason: "Phiên xác thực hết hạn hoặc không khớp thiết bị. Vui lòng nhập lại key.")
+            }
+        } catch let err as NSError {
+            // HTTP 4xx (401/403/404/410) -> key đã bị xóa hoặc bị từ chối trên server -> thu hồi và khóa ngay!
+            if err.domain == "LicenseRejected" {
+                revokeLocalLicense(reason: err.localizedDescription)
+                return
+            }
+
+            // Lỗi mất mạng / server 5xx tạm thời: CHỈ giữ valid nếu key còn hạn VÀ đã có đủ permit + endpoints
+            syncPermitReady()
             if let s = PersistentStorage.shared.readString(forKey: expiryStoreKey),
                let d = Double(s) {
                 let exp = Date(timeIntervalSince1970: d)
                 if Date() > exp {
-                    AppEndpoints.clear()
+                    clearRuntimePermit()
+                    stopPeriodicCheck()
                     status = .expired(expiresOn: exp)
                     return
-                } else if AppEndpoints.isLoaded {
+                } else if isPermitReady {
                     status = .valid(expiresOn: exp)
                     return
                 }
             }
-            if case .valid = status {
-                // Vẫn giữ valid
-            } else {
-                status = .invalid(reason: "Lỗi kết nối: \(error.localizedDescription)")
-            }
+
+            // Nếu không đủ permit mà lại mất mạng -> thoát khỏi màn hình xoay, báo lỗi rõ ràng trên LockView
+            clearRuntimePermit()
+            status = .invalid(reason: "Không thể xác thực bản quyền: \(err.localizedDescription)")
         }
     }
 
@@ -2917,13 +3058,15 @@ final class LicenseManager: ObservableObject {
         for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
             PersistentStorage.shared.delete(forKey: k)
         }
-        licenseKey = nil; activatedAt = nil
-        AppEndpoints.clear()
+        licenseKey = nil
+        activatedAt = nil
+        clearRuntimePermit()
+        stopPeriodicCheck()
         status = .notActivated
     }
 
     var isUnlocked: Bool {
-        if case .valid = status, AppEndpoints.isLoaded, SecurityGuard.shared.verifyExecutionPermit() { return true }
+        if case .valid = status, isPermitReady { return true }
         return false
     }
 
@@ -2987,7 +3130,7 @@ struct SpamDiscordApp: App {
             Group {
                 switch license.status {
                 case .valid:
-                    if AppEndpoints.isLoaded && SecurityGuard.shared.verifyExecutionPermit() {
+                    if license.isPermitReady {
                         MainTabView()
                             .environmentObject(app)
                             .environmentObject(bot)
@@ -2996,10 +3139,10 @@ struct SpamDiscordApp: App {
                             .environmentObject(voiceRoom)
                             .environmentObject(musicStream)
                     } else {
-                        LoadingView()
+                        LoadingView().environmentObject(license)
                     }
                 case .checking:
-                    LoadingView()
+                    LoadingView().environmentObject(license)
                 case .cracked(let reason):
                     CrackedView(message: reason).environmentObject(license)
                 case .notActivated, .expired, .invalid:
