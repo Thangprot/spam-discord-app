@@ -2838,7 +2838,6 @@ struct SpamDiscordApp: App {
     @StateObject private var license = LicenseManager.shared
     @StateObject private var voiceRoom = VoiceRoomManager.shared
     @StateObject private var musicStream = MusicStreamManager.shared
-    @StateObject private var nitroTrial = NitroTrialManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -2854,7 +2853,6 @@ struct SpamDiscordApp: App {
                             .environmentObject(license)
                             .environmentObject(voiceRoom)
                             .environmentObject(musicStream)
-                            .environmentObject(nitroTrial)
                     } else {
                         LoadingView()
                     }
@@ -2883,11 +2881,8 @@ struct SpamDiscordApp: App {
                     if musicStream.isPlaying {
                         BackgroundManager.shared.start(tag: "music")
                     }
-                    if nitroTrial.isRunning || nitroTrial.isAutoMonitorActive {
-                        BackgroundManager.shared.start(tag: "nitro")
-                    }
                 case .background, .inactive:
-                    if voiceRoom.isRunning || musicStream.isPlaying || app.isSending || nitroTrial.isRunning || nitroTrial.isAutoMonitorActive || BackgroundManager.shared.isKeepAliveActive {
+                    if voiceRoom.isRunning || musicStream.isPlaying || app.isSending || BackgroundManager.shared.isKeepAliveActive {
                         BackgroundManager.shared.ensureRunning()
                     }
                     if phase == .background {
@@ -2904,7 +2899,6 @@ struct SpamDiscordApp: App {
                     userNuke.stop()
                     voiceRoom.stopTreo()
                     musicStream.stop()
-                    nitroTrial.stopAll()
                     BackgroundManager.shared.stopAll()
                     NowPlayingHelper.shared.stop()
                 }
@@ -2960,56 +2954,56 @@ struct EmptyStateView: View {
 // ==========================================
 struct TokenListView: View {
     @EnvironmentObject var app: AppState
-    @EnvironmentObject var nitro: NitroTrialManager
     @State private var showAdd = false
     @State private var showImport = false
-    @State private var mode: TokenSubTab = .list
-
-    enum TokenSubTab: String, CaseIterable, Identifiable {
-        case list = "Danh sách Token"
-        case nitroTrial = "Nitro Trial"
-        var id: String { rawValue }
-    }
-
-    private var nitroTrialTabTitle: String {
-        let count = nitro.countTrialAvailable(for: app.tokens)
-        return count > 0 ? "Nitro Trial (\(count))" : "Nitro Trial"
-    }
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                Picker("", selection: $mode) {
-                    Text("Danh sách (\(app.tokens.count))").tag(TokenSubTab.list)
-                    Text(nitroTrialTabTitle).tag(TokenSubTab.nitroTrial)
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(Color(UIColor.systemGroupedBackground))
-
-                if mode == .list {
-                    tokenListContent
+            Group {
+                if app.tokens.isEmpty {
+                    EmptyStateView(title: "Chưa có Token", systemImage: "key.slash",
+                                   description: "Thêm token để bắt đầu.")
                 } else {
-                    NitroTrialDashboardView()
-                        .background(Color(UIColor.systemGroupedBackground))
+                    List {
+                        Section("Danh sách (\(app.selectedTokenIds.count) đã chọn)") {
+                            ForEach(app.tokens) { t in
+                                HStack(spacing: 12) {
+                                    if let url = t.avatarURL {
+                                        AsyncImage(url: url) { img in img.resizable().scaledToFill() }
+                                        placeholder: { Circle().fill(Color.gray.opacity(0.3)) }
+                                            .frame(width: 45, height: 45).clipShape(Circle())
+                                    } else {
+                                        Image(systemName: "person.circle.fill").resizable()
+                                            .frame(width: 45, height: 45).foregroundStyle(.gray)
+                                    }
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(t.username).font(.headline)
+                                        Text(t.isValid ? "Live" : "Die").font(.caption).bold()
+                                            .foregroundStyle(t.isValid ? .green : .red)
+                                    }
+                                    Spacer()
+                                    if t.isValid {
+                                        Button { app.toggleTokenSelection(t) } label: {
+                                            Image(systemName: app.selectedTokenIds.contains(t.id)
+                                                  ? "checkmark.circle.fill" : "circle")
+                                                .foregroundStyle(.indigo).font(.title3)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .onDelete(perform: app.deleteToken)
+                        }
+                    }
                 }
             }
-            .background(Color(UIColor.systemGroupedBackground))
-            .navigationTitle(mode == .list ? "Quản lý Token" : "Nitro Trial")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Quản lý Token")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button("Thêm tay", systemImage: "keyboard") { showAdd = true }
                         Button("Nhập file", systemImage: "doc.text") { showImport = true }
-                        Divider()
-                        Button("Quét & Claim Nitro Trial", systemImage: "sparkles") {
-                            mode = .nitroTrial
-                            let targets = nitro.targetTokens(from: app)
-                            nitro.startBatch(tokens: targets, autoClaim: true)
-                        }
-                        .disabled(app.tokens.filter(\.isValid).isEmpty || nitro.isRunning)
                     } label: { Image(systemName: "plus.circle.fill").font(.title3) }
                 }
             }
@@ -3021,52 +3015,6 @@ struct TokenListView: View {
                 if app.isCheckingToken {
                     ProgressView("Đang check...").padding()
                         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var tokenListContent: some View {
-        if app.tokens.isEmpty {
-            EmptyStateView(title: "Chưa có Token", systemImage: "key.slash",
-                           description: "Thêm token để bắt đầu.")
-        } else {
-            List {
-                Section("Danh sách (\(app.selectedTokenIds.count) đã chọn)") {
-                    ForEach(app.tokens) { t in
-                        HStack(spacing: 12) {
-                            if let url = t.avatarURL {
-                                AsyncImage(url: url) { img in img.resizable().scaledToFill() }
-                                placeholder: { Circle().fill(Color.gray.opacity(0.3)) }
-                                    .frame(width: 45, height: 45).clipShape(Circle())
-                            } else {
-                                Image(systemName: "person.circle.fill").resizable()
-                                    .frame(width: 45, height: 45).foregroundStyle(.gray)
-                            }
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(t.username).font(.headline)
-                                HStack(spacing: 6) {
-                                    Text(t.isValid ? "Live" : "Die").font(.caption).bold()
-                                        .foregroundStyle(t.isValid ? .green : .red)
-                                    if let scan = nitro.results[t.id], scan.state != .idle {
-                                        NitroTokenInlineBadge(result: scan)
-                                    }
-                                }
-                            }
-                            Spacer()
-                            if t.isValid {
-                                Button { app.toggleTokenSelection(t) } label: {
-                                    Image(systemName: app.selectedTokenIds.contains(t.id)
-                                          ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(.indigo).font(.title3)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                    .onDelete(perform: app.deleteToken)
                 }
             }
         }
