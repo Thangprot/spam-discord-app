@@ -1,10 +1,12 @@
 // ============================================================================
 // Cloudflare Worker — Quoc Thang Studio Backend (Anti-Crack & Anti-Tamper v4)
-// Binding: KV namespace APP_DATA
-// Environment Variables (đặt trong Cloudflare Worker Settings -> Variables & Secrets):
-//   - ADMIN_SECRET_HASH (Khuyến nghị: mã SHA-256 hex 64 ký tự của mật khẩu Admin, KHÔNG lưu mật khẩu dạng văn bản thuần!)
+// Bindings hỗ trợ (Settings -> Bindings):
+//   - KV namespace: APP_DATA (Mặc định — đã tối ưu 0 lệnh ghi KV thừa khi dùng app!)
+//   - D1 database (Khuyên dùng thêm, miễn phí 100.000 lượt ghi/ngày): đặt tên biến là DB -> chọn qt-license-db
+// Environment Variables (Settings -> Variables & Secrets):
+//   - ADMIN_SECRET_HASH (Khuyến nghị: mã SHA-256 hex 64 ký tự của mật khẩu Admin)
 //   - hoặc ADMIN_SECRET (tương thích ngược — Worker tự băm SHA-256 trước khi so sánh constant-time)
-//   - ADMIN_PIN (Tùy chọn Lớp 2: nếu đặt thêm biến này, trang Admin sẽ yêu cầu thêm Mã PIN Bảo Mật cấp 2 khi đăng nhập)
+//   - ADMIN_PIN (Tùy chọn Lớp 2: nếu đặt thêm biến này, trang Admin sẽ yêu cầu thêm Mã PIN Bảo Mật cấp 2)
 // ============================================================================
 
 const CORS = {
@@ -427,6 +429,24 @@ async function hmacSign(msg, secret) {
   return toHex(sig);
 }
 
+// Bộ nhớ RAM V8 Isolate chống Replay Nonce (0 lệnh ghi KV — không bao giờ tốn hạn mức 1.000 KV put/ngày!)
+const MEM_NONCES = new Map();
+function checkAndRecordNonce(nonce) {
+  const now = Date.now();
+  if (MEM_NONCES.size > 4000) {
+    for (const [k, exp] of MEM_NONCES) {
+      if (now > exp) MEM_NONCES.delete(k);
+    }
+    if (MEM_NONCES.size > 5000) MEM_NONCES.clear();
+  }
+  const existingExp = MEM_NONCES.get(nonce);
+  if (existingExp && now < existingExp) {
+    return false;
+  }
+  MEM_NONCES.set(nonce, now + 360000);
+  return true;
+}
+
 async function decryptClientPayload(reqBody, env, secret) {
   const { payload, nonce, ts, sig } = reqBody || {};
   if (!payload || !nonce || !ts || !sig) {
@@ -446,13 +466,10 @@ async function decryptClientPayload(reqBody, env, secret) {
     throw new Error("Invalid cryptographic signature");
   }
 
-  // Chống Replay Attack #2: Nonce 1 lần trong KV (TTL 360s, dùng tiền tố ~ để xếp sau A-Z trong KV list)
-  const nonceKey = `~NONCE:${nonce}`;
-  const seen = await env.APP_DATA.get(nonceKey);
-  if (seen) {
+  // Chống Replay Attack #2: Nonce 1 lần trong bộ nhớ Edge Isolate (0 tốn KV put!)
+  if (!checkAndRecordNonce(String(nonce))) {
     throw new Error("Replay nonce reused");
   }
-  await env.APP_DATA.put(nonceKey, "1", { expirationTtl: 360 });
 
   // Giải mã AES-256-GCM
   const key = await getAesKey(`${secret}:${nonce}:${ts}`);
@@ -516,7 +533,7 @@ async function generateFeatureToken(key, machineId, feature, secret) {
   return { token: `${bodyB64}.${sig}`, exp };
 }
 
-// ---------- KV & Security Helpers ----------
+// ---------- Dual Storage Engine: D1 SQLite (100k ghi/ngày) + KV + RAM Cache ----------
 const json = (data, status = 200, extraHeaders = {}) =>
   new Response(JSON.stringify(data), {
     status,
@@ -525,6 +542,97 @@ const json = (data, status = 200, extraHeaders = {}) =>
 
 const nowMs = () => Date.now();
 const getClientIP = (req) => req.headers.get("CF-Connecting-IP") || req.headers.get("X-Forwarded-For") || "unknown";
+
+const D1_INIT_SET = new WeakSet();
+const MEM_LIC_CACHE = new Map();
+const MEM_IMAGES = new Map();
+
+function getD1(env) {
+  const db = env && (env.DB || env.QT_DB || env.LICENSE_DB);
+  return (db && typeof db.prepare === "function") ? db : null;
+}
+
+async function ensureD1(env) {
+  const db = getD1(env);
+  if (!db) return null;
+  if (!D1_INIT_SET.has(db)) {
+    await db.batch([
+      db.prepare("CREATE TABLE IF NOT EXISTS licenses (key TEXT PRIMARY KEY, data TEXT NOT NULL, created_at INTEGER DEFAULT 0)"),
+      db.prepare("CREATE TABLE IF NOT EXISTS sys_kv (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at INTEGER DEFAULT 0)"),
+    ]);
+    D1_INIT_SET.add(db);
+  }
+  return db;
+}
+
+function isKvQuotaError(err) {
+  const msg = String((err && err.message) || err || "").toLowerCase();
+  return msg.includes("limit exceeded") || msg.includes("too many");
+}
+
+function formatKvLimitHelp() {
+  return "Đã chạm giới hạn 1.000 lượt ghi KV/ngày của gói Cloudflare Free (tự mở lại lúc 07:00 sáng). Để nâng miễn phí lên 100.000 lượt ghi/ngày ngay lập tức: vào Worker -> Settings -> Bindings -> Add binding -> D1 database -> đặt Variable name là DB và chọn qt-license-db!";
+}
+
+async function sysGetRaw(env, k) {
+  const db = await ensureD1(env);
+  if (db) {
+    const row = await db.prepare("SELECT v FROM sys_kv WHERE k = ?1").bind(k).first();
+    if (row && row.v != null) return String(row.v);
+  }
+  if (env && env.APP_DATA) {
+    try {
+      const raw = await env.APP_DATA.get(k);
+      if (raw != null && db) {
+        try {
+          await db.prepare("INSERT OR IGNORE INTO sys_kv (k, v, updated_at) VALUES (?1, ?2, ?3)").bind(k, raw, nowMs()).run();
+        } catch {}
+      }
+      return raw;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+async function sysPutRaw(env, k, valStr, { bestEffort = true, ttlSec = null } = {}) {
+  const db = await ensureD1(env);
+  if (db) {
+    await db.prepare("INSERT OR REPLACE INTO sys_kv (k, v, updated_at) VALUES (?1, ?2, ?3)").bind(k, valStr, nowMs()).run();
+    return true;
+  }
+  if (env && env.APP_DATA) {
+    try {
+      const opts = ttlSec ? { expirationTtl: ttlSec } : undefined;
+      await env.APP_DATA.put(k, valStr, opts);
+      return true;
+    } catch (err) {
+      if (bestEffort) return false;
+      if (isKvQuotaError(err)) throw new Error(formatKvLimitHelp());
+      throw err;
+    }
+  }
+  return false;
+}
+
+async function sysDeleteRaw(env, k) {
+  const db = await ensureD1(env);
+  if (db) {
+    try { await db.prepare("DELETE FROM sys_kv WHERE k = ?1").bind(k).run(); } catch {}
+  }
+  if (env && env.APP_DATA) {
+    try { await env.APP_DATA.delete(k); } catch {}
+  }
+}
+
+function setMemLicCache(key, data) {
+  if (MEM_LIC_CACHE.size > 2500) {
+    const firstKey = MEM_LIC_CACHE.keys().next().value;
+    if (firstKey) MEM_LIC_CACHE.delete(firstKey);
+  }
+  MEM_LIC_CACHE.set(key, JSON.parse(JSON.stringify(data)));
+}
 
 function buildLicenseMetadata(data) {
   const mids = Array.isArray(data.machine_ids) ? data.machine_ids : (data.machine_id ? [data.machine_id] : []);
@@ -544,18 +652,90 @@ function buildLicenseMetadata(data) {
 }
 
 const getLicense = async (env, key) => {
-  const raw = await env.APP_DATA.get(key);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return (parsed && typeof parsed === "object") ? parsed : null;
-  } catch {
-    return null;
+  const db = await ensureD1(env);
+  if (db) {
+    const row = await db.prepare("SELECT data FROM licenses WHERE key = ?1").bind(key).first();
+    if (row && row.data) {
+      try {
+        const parsed = JSON.parse(row.data);
+        if (parsed && typeof parsed === "object") {
+          setMemLicCache(key, parsed);
+          return parsed;
+        }
+      } catch {}
+    }
+  }
+
+  if (MEM_LIC_CACHE.has(key)) {
+    return JSON.parse(JSON.stringify(MEM_LIC_CACHE.get(key)));
+  }
+
+  if (env && env.APP_DATA) {
+    const raw = await env.APP_DATA.get(key);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        setMemLicCache(key, parsed);
+        if (db) {
+          try {
+            await db.prepare("INSERT OR IGNORE INTO licenses (key, data, created_at) VALUES (?1, ?2, ?3)")
+              .bind(key, raw, parsed.created_at || 0).run();
+          } catch {}
+        }
+        return parsed;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const putLicense = async (env, key, data, { allowRamFallback = false } = {}) => {
+  setMemLicCache(key, data);
+  const serialized = JSON.stringify(data);
+  const db = await ensureD1(env);
+  if (db) {
+    await db.prepare("INSERT OR REPLACE INTO licenses (key, data, created_at) VALUES (?1, ?2, ?3)")
+      .bind(key, serialized, data.created_at || 0).run();
+    return;
+  }
+  if (env && env.APP_DATA) {
+    try {
+      await env.APP_DATA.put(key, serialized, { metadata: buildLicenseMetadata(data) });
+    } catch (err) {
+      if (allowRamFallback && isKvQuotaError(err)) {
+        // Khi KV chạm trần 1.000 put/ngày, giữ trạng thái kích hoạt trong RAM để khách vẫn vào app bình thường!
+        return;
+      }
+      if (isKvQuotaError(err)) {
+        throw new Error(formatKvLimitHelp());
+      }
+      throw err;
+    }
   }
 };
-const putLicense = (env, key, data) =>
-  env.APP_DATA.put(key, JSON.stringify(data), { metadata: buildLicenseMetadata(data) });
-const deleteLicense = (env, key) => env.APP_DATA.delete(key);
+
+const deleteLicense = async (env, key) => {
+  MEM_LIC_CACHE.delete(key);
+  const db = await ensureD1(env);
+  if (db) {
+    await db.prepare("DELETE FROM licenses WHERE key = ?1").bind(key).run();
+    if (env && env.APP_DATA) {
+      try { await env.APP_DATA.delete(key); } catch {}
+    }
+    return;
+  }
+  if (env && env.APP_DATA) {
+    try {
+      await env.APP_DATA.delete(key);
+    } catch (err) {
+      if (isKvQuotaError(err)) throw new Error(formatKvLimitHelp());
+      throw err;
+    }
+  }
+};
 
 function randomChunk(len = 5) {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -570,7 +750,7 @@ function makeKey(prefix = "QT") {
   return `${cleanPrefix}-${randomChunk(5)}-${randomChunk(5)}-${randomChunk(5)}`;
 }
 
-// ---------- Security Policy & Tamper Audit (Anti-Crack App) ----------
+// ---------- Security Policy & Tamper Audit (Anti-Crack App — Zero Wasteful KV Writes!) ----------
 const DEFAULT_SEC_SETTINGS = {
   enforce_binary_hash: false,
   allowed_hashes: [],
@@ -578,50 +758,86 @@ const DEFAULT_SEC_SETTINGS = {
   allowed_source_sigs: [],
 };
 
+let MEM_SEC_SETTINGS = null;
+let MEM_SEC_SETTINGS_EXP = 0;
+let MEM_OBSERVED_LIST = null;
+let MEM_ALERTS_LIST = null;
+const MEM_ALERT_THROTTLE = new Map();
+
 async function getSecSettings(env) {
-  const raw = await env.APP_DATA.get("SEC:SETTINGS");
-  if (!raw) return { ...DEFAULT_SEC_SETTINGS };
-  try {
-    return { ...DEFAULT_SEC_SETTINGS, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_SEC_SETTINGS };
+  if (MEM_SEC_SETTINGS && nowMs() < MEM_SEC_SETTINGS_EXP) {
+    return MEM_SEC_SETTINGS;
   }
+  const raw = await sysGetRaw(env, "SEC:SETTINGS");
+  let out = { ...DEFAULT_SEC_SETTINGS };
+  if (raw) {
+    try { out = { ...DEFAULT_SEC_SETTINGS, ...JSON.parse(raw) }; } catch {}
+  }
+  MEM_SEC_SETTINGS = out;
+  MEM_SEC_SETTINGS_EXP = nowMs() + 60000;
+  return out;
+}
+
+async function getObservedBuilds(env) {
+  if (Array.isArray(MEM_OBSERVED_LIST)) return MEM_OBSERVED_LIST;
+  const raw = await sysGetRaw(env, "SEC:OBSERVED");
+  try { MEM_OBSERVED_LIST = raw ? JSON.parse(raw) : []; } catch { MEM_OBSERVED_LIST = []; }
+  if (!Array.isArray(MEM_OBSERVED_LIST)) MEM_OBSERVED_LIST = [];
+  return MEM_OBSERVED_LIST;
 }
 
 async function recordObservedBuild(env, integrity) {
   if (!integrity || (!integrity.text_hash && !integrity.source_sig)) return;
-  const raw = await env.APP_DATA.get("SEC:OBSERVED");
-  let list = [];
-  try { list = raw ? JSON.parse(raw) : []; } catch { list = []; }
+  const list = await getObservedBuilds(env);
   const textHash = String(integrity.text_hash || "");
   const sourceSig = String(integrity.source_sig || "");
   const bundleId = String(integrity.bundle_id || "");
   const idx = list.findIndex(x => x.text_hash === textHash && x.source_sig === sourceSig);
-  const entry = {
+
+  if (idx >= 0) {
+    // Đã có mã băm build này rồi -> chỉ cập nhật bộ đếm trên RAM, tốn 0 lệnh ghi KV!
+    list[idx].last_seen = nowMs();
+    list[idx].count = (list[idx].count || 1) + 1;
+    return;
+  }
+
+  list.unshift({
     text_hash: textHash,
     source_sig: sourceSig,
     bundle_id: bundleId,
     last_seen: nowMs(),
-    count: idx >= 0 ? (list[idx].count || 1) + 1 : 1,
-  };
-  if (idx >= 0) list.splice(idx, 1);
-  list.unshift(entry);
-  if (list.length > 12) list = list.slice(0, 12);
-  await env.APP_DATA.put("SEC:OBSERVED", JSON.stringify(list));
+    count: 1,
+  });
+  if (list.length > 12) list.length = 12;
+  await sysPutRaw(env, "SEC:OBSERVED", JSON.stringify(list), { bestEffort: true });
+}
+
+async function getSecurityAlerts(env) {
+  if (Array.isArray(MEM_ALERTS_LIST)) return MEM_ALERTS_LIST;
+  const raw = await sysGetRaw(env, "SEC:ALERTS");
+  try { MEM_ALERTS_LIST = raw ? JSON.parse(raw) : []; } catch { MEM_ALERTS_LIST = []; }
+  if (!Array.isArray(MEM_ALERTS_LIST)) MEM_ALERTS_LIST = [];
+  return MEM_ALERTS_LIST;
 }
 
 async function logSecurityAlert(env, req, reason, details = {}) {
-  const raw = await env.APP_DATA.get("SEC:ALERTS");
-  let alerts = [];
-  try { alerts = raw ? JSON.parse(raw) : []; } catch { alerts = []; }
+  const ip = getClientIP(req);
+  const alerts = await getSecurityAlerts(env);
   alerts.unshift({
     ts: nowMs(),
-    ip: getClientIP(req),
+    ip,
     reason,
     ...details,
   });
-  if (alerts.length > 60) alerts = alerts.slice(0, 60);
-  await env.APP_DATA.put("SEC:ALERTS", JSON.stringify(alerts));
+  if (alerts.length > 60) alerts.length = 60;
+
+  // Giới hạn lưu cảnh báo tối đa 1 lần / 5 phút mỗi IP để không bao giờ tốn hết hạn mức KV put!
+  const lastWrite = MEM_ALERT_THROTTLE.get(ip) || 0;
+  if (nowMs() - lastWrite > 300000) {
+    if (MEM_ALERT_THROTTLE.size > 1000) MEM_ALERT_THROTTLE.clear();
+    MEM_ALERT_THROTTLE.set(ip, nowMs());
+    await sysPutRaw(env, "SEC:ALERTS", JSON.stringify(alerts), { bestEffort: true });
+  }
 }
 
 async function verifyAppIntegrity(req, env, body) {
@@ -838,13 +1054,34 @@ async function verifyAdminSession(req, env, requireCsrf = true) {
   return { ok: true, csrf: payload.csrf, exp: payload.exp };
 }
 
-// Challenge-Response 1 lần cho Web Admin (Không bao giờ gửi mật khẩu chữ thuần qua mạng!)
+// Challenge-Response ký HMAC không trạng thái (0 lệnh ghi KV — đăng nhập Admin mượt ngay cả khi KV hết lượt ghi!)
+const MEM_USED_CHAL = new Map();
+const MEM_ADMIN_RL = new Map();
+
 async function handleAdminChallenge(req, env) {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const challenge = toHex(crypto.getRandomValues(new Uint8Array(16)));
-  await env.APP_DATA.put(`ADM_CHAL:${challenge}`, String(nowMs()), { expirationTtl: 90 });
+  const signKey = (await getAdminSigningSecret(env)) || SERVER_MASTER_SECRET;
+  const ts = Math.floor(Date.now() / 1000);
+  const rand = toHex(crypto.getRandomValues(new Uint8Array(12)));
+  const sig = await hmacSign(`ADM_CHAL_V4:${ts}:${rand}`, signKey);
+  const challenge = `${ts}.${rand}.${sig}`;
   const pinRequired = !!(env.ADMIN_PIN && String(env.ADMIN_PIN).trim().length > 0);
   return json({ ok: true, challenge, pin_required: pinRequired });
+}
+
+async function verifyStatelessAdminChallenge(challengeStr, signKey) {
+  const parts = String(challengeStr || "").split(".");
+  if (parts.length !== 3) return false;
+  const [tsStr, rand, sig] = parts;
+  const ts = parseInt(tsStr, 10);
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (isNaN(ts) || Math.abs(nowSec - ts) > 120) return false;
+  const expectedSig = await hmacSign(`ADM_CHAL_V4:${ts}:${rand}`, signKey);
+  if (!(await timingSafeEqualStr(sig.toLowerCase(), expectedSig.toLowerCase()))) return false;
+  if (MEM_USED_CHAL.has(rand)) return false;
+  if (MEM_USED_CHAL.size > 1000) MEM_USED_CHAL.clear();
+  MEM_USED_CHAL.set(rand, Date.now() + 130000);
+  return true;
 }
 
 async function handleAdminAuth(req, env) {
@@ -853,12 +1090,7 @@ async function handleAdminAuth(req, env) {
   if (!expectedHash) return json({ error: "Chưa cấu hình ADMIN_SECRET_HASH hoặc ADMIN_SECRET trên Cloudflare Worker" }, 500);
 
   const ip = getClientIP(req);
-  const rlKey = `ADMIN_RL:${ip}`;
-  const rawRl = await env.APP_DATA.get(rlKey);
-  let rl = { fails: 0, lockedUntil: 0 };
-  if (rawRl) {
-    try { rl = JSON.parse(rawRl); } catch {}
-  }
+  let rl = MEM_ADMIN_RL.get(ip) || { fails: 0, lockedUntil: 0 };
 
   if (rl.lockedUntil && nowMs() < rl.lockedUntil) {
     const remainSec = Math.ceil((rl.lockedUntil - nowMs()) / 1000);
@@ -869,10 +1101,8 @@ async function handleAdminAuth(req, env) {
   let valid = false;
 
   if (body.challenge && body.proof) {
-    const chalKey = `ADM_CHAL:${String(body.challenge)}`;
-    const chalSaved = await env.APP_DATA.get(chalKey);
-    await env.APP_DATA.delete(chalKey); // One-time challenge!
-    if (chalSaved) {
+    const chalOk = await verifyStatelessAdminChallenge(String(body.challenge), expectedHash);
+    if (chalOk) {
       const expectedProof = await hmacSign(String(body.challenge), expectedHash);
       valid = await timingSafeEqualStr(String(body.proof).toLowerCase(), expectedProof.toLowerCase());
     }
@@ -888,13 +1118,14 @@ async function handleAdminAuth(req, env) {
   }
 
   if (!valid) {
-    // Chống brute-force: tăng đếm lỗi & delay nhẹ
+    // Chống brute-force: tăng đếm lỗi trên RAM & delay nhẹ (0 tốn KV put!)
     rl.fails = (rl.fails || 0) + 1;
     if (rl.fails >= 5) {
       rl.lockedUntil = nowMs() + 15 * 60 * 1000; // Khóa 15 phút
       await logSecurityAlert(env, req, `Brute-force Admin bị chặn (${rl.fails} lần sai)`);
     }
-    await env.APP_DATA.put(rlKey, JSON.stringify(rl), { expirationTtl: 900 });
+    if (MEM_ADMIN_RL.size > 1000) MEM_ADMIN_RL.clear();
+    MEM_ADMIN_RL.set(ip, rl);
     await new Promise(r => setTimeout(r, 450));
     const left = Math.max(0, 5 - rl.fails);
     return json({
@@ -903,8 +1134,8 @@ async function handleAdminAuth(req, env) {
     }, 401);
   }
 
-  // Đăng nhập thành công -> xóa bộ đếm lỗi & cấp HttpOnly Cookie ký HMAC
-  await env.APP_DATA.delete(rlKey);
+  // Đăng nhập thành công -> xóa bộ đếm lỗi trên RAM & cấp HttpOnly Cookie ký HMAC
+  MEM_ADMIN_RL.delete(ip);
   const { cookie, csrf, exp } = await createAdminCookie(req, env);
   return json(
     { ok: true, csrf, exp },
@@ -1785,94 +2016,135 @@ async function handleGenerateKey(req, env) {
   });
 }
 
+function licenseObjToListItem(name, lic) {
+  const waiting = !!(lic.start_on_activate && !lic.activated_at && !lic.expires_at);
+  const mids = Array.isArray(lic.machine_ids) ? lic.machine_ids : (lic.machine_id ? [lic.machine_id] : []);
+  return {
+    key: name,
+    email: lic.email || "",
+    created_at: lic.created_at || 0,
+    activated_at: lic.activated_at || null,
+    expires_at: lic.expires_at || null,
+    duration_ms: lic.duration_ms || 0,
+    waiting_activation: waiting,
+    max_devices: Math.max(1, parseInt(lic.max_devices, 10) || 1),
+    machine_ids: mids,
+    machine_id: lic.machine_id || mids[0] || null,
+    disabled: !!lic.disabled,
+  };
+}
+
 async function handleListKeys(req, env) {
   const guard = await requireAdmin(req, env);
   if (guard.res) return guard.res;
 
-  // Quét phân trang KV bằng metadata (1000 key chỉ tốn 1 subrequest — KHÔNG bao giờ lỗi Too many subrequests!)
-  const INTERNAL_PREFIXES = ["~NONCE:", "NONCE:", "ADMIN_RL:", "SEC:", "IMG:", "ADM_CHAL:"];
-  const allEntries = [];
-  let cursor = undefined;
-  let listPages = 0;
+  const byKey = new Map();
+  const db = await ensureD1(env);
 
-  while (listPages < 5) {
-    listPages++;
-    const listed = await env.APP_DATA.list({ limit: 1000, cursor });
-    for (const entry of listed.keys) {
+  // 1. Đọc từ D1 SQLite (nếu đã gắn DB — 1 truy vấn lấy tới 5.000 key, 0 tốn KV!)
+  if (db) {
+    const { results } = await db.prepare("SELECT key, data FROM licenses ORDER BY created_at DESC LIMIT 5000").all();
+    for (const row of (results || [])) {
+      try {
+        const lic = JSON.parse(row.data);
+        if (lic && typeof lic === "object") {
+          byKey.set(row.key, licenseObjToListItem(row.key, lic));
+        }
+      } catch {}
+    }
+  }
+
+  // 2. Đồng bộ thêm từ RAM Cache (phòng trường hợp vừa kích hoạt khi KV chạm trần put)
+  for (const [k, lic] of MEM_LIC_CACHE) {
+    if (!byKey.has(k) && lic && typeof lic === "object") {
+      byKey.set(k, licenseObjToListItem(k, lic));
+    }
+  }
+
+  // 3. Quét thêm KV APP_DATA để không sót bất kỳ key cũ nào (an toàn ngay cả khi KV hết lượt put!)
+  let moreLegacy = false;
+  if (env && env.APP_DATA) {
+    const INTERNAL_PREFIXES = ["~NONCE:", "NONCE:", "ADMIN_RL:", "SEC:", "IMG:", "ADM_CHAL:"];
+    const allEntries = [];
+    let cursor = undefined;
+    let listPages = 0;
+
+    try {
+      while (listPages < 5) {
+        listPages++;
+        const listed = await env.APP_DATA.list({ limit: 1000, cursor });
+        for (const entry of listed.keys) {
+          const name = entry.name;
+          if (byKey.has(name)) continue;
+          if (INTERNAL_PREFIXES.some(p => name.startsWith(p))) continue;
+          allEntries.push(entry);
+        }
+        if (listed.list_complete || !listed.cursor) break;
+        cursor = listed.cursor;
+      }
+    } catch {}
+
+    const legacyEntries = [];
+    for (const entry of allEntries) {
       const name = entry.name;
-      if (INTERNAL_PREFIXES.some(p => name.startsWith(p))) continue;
-      allEntries.push(entry);
+      const meta = entry.metadata;
+      if (meta && typeof meta === "object" && meta.v === 1) {
+        const waiting = !!(meta.start_on_activate && !meta.activated_at && !meta.expires_at);
+        byKey.set(name, {
+          key: name,
+          email: meta.email || "",
+          created_at: meta.created_at || 0,
+          activated_at: meta.activated_at || null,
+          expires_at: meta.expires_at || null,
+          duration_ms: meta.duration_ms || 0,
+          waiting_activation: waiting,
+          max_devices: Math.max(1, parseInt(meta.max_devices, 10) || 1),
+          machine_ids: Array.from({ length: meta.used_devices || 0 }, (_, idx) => idx === 0 ? (meta.first_mid || "bound") : "bound"),
+          machine_id: meta.first_mid || null,
+          disabled: !!meta.disabled,
+        });
+      } else {
+        legacyEntries.push(entry);
+      }
     }
-    if (listed.list_complete || !listed.cursor) break;
-    cursor = listed.cursor;
-  }
 
-  const items = [];
-  const legacyEntries = [];
-
-  for (const entry of allEntries) {
-    const name = entry.name;
-    const meta = entry.metadata;
-
-    // Nhánh nhanh (0 subrequest!): đọc trực tiếp từ KV metadata
-    if (meta && typeof meta === "object" && meta.v === 1) {
-      const waiting = !!(meta.start_on_activate && !meta.activated_at && !meta.expires_at);
-      items.push({
-        key: name,
-        email: meta.email || "",
-        created_at: meta.created_at || 0,
-        activated_at: meta.activated_at || null,
-        expires_at: meta.expires_at || null,
-        duration_ms: meta.duration_ms || 0,
-        waiting_activation: waiting,
-        max_devices: Math.max(1, parseInt(meta.max_devices, 10) || 1),
-        machine_ids: Array.from({ length: meta.used_devices || 0 }, (_, idx) => idx === 0 ? (meta.first_mid || "bound") : "bound"),
-        machine_id: meta.first_mid || null,
-        disabled: !!meta.disabled,
-      });
-    } else {
-      legacyEntries.push(entry);
+    for (let i = legacyEntries.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = legacyEntries[i];
+      legacyEntries[i] = legacyEntries[j];
+      legacyEntries[j] = tmp;
     }
+
+    let kvWriteBlocked = false;
+    let subreqBudget = 36; // Dư an toàn dưới mốc 50 subrequests của Cloudflare Free
+    let processedLegacy = 0;
+
+    for (const entry of legacyEntries) {
+      if (subreqBudget < (kvWriteBlocked ? 1 : 2)) break;
+      processedLegacy++;
+      const name = entry.name;
+      subreqBudget--;
+      const lic = await getLicense(env, name); // getLicense cũng tự động lưu vào D1 nếu đã gắn DB!
+      if (!lic || typeof lic !== "object") continue;
+
+      if (!db && !kvWriteBlocked) {
+        try {
+          subreqBudget--;
+          await putLicense(env, name, lic);
+        } catch {
+          // Nếu KV đang chạm trần 1.000 put/ngày -> dừng thử put tiếp để đọc hết key bằng get()!
+          kvWriteBlocked = true;
+        }
+      }
+      byKey.set(name, licenseObjToListItem(name, lic));
+    }
+
+    moreLegacy = !kvWriteBlocked && processedLegacy < legacyEntries.length;
   }
 
-  // Xáo trộn nhẹ danh sách key cũ chưa có metadata để tránh trùng lặp trong 1s KV eventual consistency
-  for (let i = legacyEntries.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const tmp = legacyEntries[i];
-    legacyEntries[i] = legacyEntries[j];
-    legacyEntries[j] = tmp;
-  }
-
-  // Chỉ migrate tối đa 18 key cũ mỗi nhịp (18 get + 18 put = 36 < 50 subrequest limit của Cloudflare Free!)
-  const batch = legacyEntries.slice(0, 18);
-  const moreLegacy = legacyEntries.length > 18;
-
-  for (const entry of batch) {
-    const name = entry.name;
-    const lic = await getLicense(env, name);
-    if (!lic || typeof lic !== "object") continue;
-    // Lưu bù metadata để từ lần sau đọc 0 subrequest
-    await putLicense(env, name, lic);
-
-    const waiting = !!(lic.start_on_activate && !lic.activated_at && !lic.expires_at);
-    const mids = Array.isArray(lic.machine_ids) ? lic.machine_ids : (lic.machine_id ? [lic.machine_id] : []);
-    items.push({
-      key: name,
-      email: lic.email || "",
-      created_at: lic.created_at || 0,
-      activated_at: lic.activated_at || null,
-      expires_at: lic.expires_at || null,
-      duration_ms: lic.duration_ms || 0,
-      waiting_activation: waiting,
-      max_devices: Math.max(1, parseInt(lic.max_devices, 10) || 1),
-      machine_ids: mids,
-      machine_id: lic.machine_id || mids[0] || null,
-      disabled: !!lic.disabled,
-    });
-  }
-
+  const items = Array.from(byKey.values());
   items.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
-  return json({ ok: true, items, more_legacy: moreLegacy });
+  return json({ ok: true, items, more_legacy: moreLegacy, storage: db ? "d1" : "kv" });
 }
 
 async function handleKeyInfo(req, env) {
@@ -1966,11 +2238,8 @@ async function handleSecGet(req, env) {
   if (guard.res) return guard.res;
 
   const settings = await getSecSettings(env);
-  const obsRaw = await env.APP_DATA.get("SEC:OBSERVED");
-  const alertRaw = await env.APP_DATA.get("SEC:ALERTS");
-  let observed = [], alerts = [];
-  try { observed = obsRaw ? JSON.parse(obsRaw) : []; } catch { observed = []; }
-  try { alerts = alertRaw ? JSON.parse(alertRaw) : []; } catch { alerts = []; }
+  const observed = await getObservedBuilds(env);
+  const alerts = await getSecurityAlerts(env);
   return json({
     ok: true,
     settings,
@@ -1991,14 +2260,17 @@ async function handleSecSave(req, env) {
     allowed_source_sigs: Array.isArray(body.allowed_source_sigs) ? body.allowed_source_sigs : [],
     enforce_anti_proxy: !!body.enforce_anti_proxy,
   };
-  await env.APP_DATA.put("SEC:SETTINGS", JSON.stringify(next));
+  MEM_SEC_SETTINGS = next;
+  MEM_SEC_SETTINGS_EXP = nowMs() + 60000;
+  await sysPutRaw(env, "SEC:SETTINGS", JSON.stringify(next), { bestEffort: false });
   return json({ success: true, settings: next });
 }
 
 async function handleSecClearAlerts(req, env) {
   const guard = await requireAdmin(req, env);
   if (guard.res) return guard.res;
-  await env.APP_DATA.delete("SEC:ALERTS");
+  MEM_ALERTS_LIST = [];
+  await sysDeleteRaw(env, "SEC:ALERTS");
   return json({ success: true });
 }
 
@@ -2057,7 +2329,7 @@ async function evaluateLicenseForApp(req, env, body, allowBindHwid = true) {
   }
 
   if (dirty) {
-    await putLicense(env, key, lic);
+    await putLicense(env, key, lic, { allowRamFallback: true });
   }
 
   const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, SERVER_MASTER_SECRET, { v: CONFIG_VERSION });
@@ -2176,9 +2448,14 @@ async function handleGameAssetUpload(req, env) {
 
     const imgId = (await sha256Hex(rawB64)).slice(0, 28);
     const kvKey = `IMG:${imgId}`;
-    const existing = await env.APP_DATA.get(kvKey);
+    if (MEM_IMAGES.size > 30) {
+      const oldest = MEM_IMAGES.keys().next().value;
+      if (oldest) MEM_IMAGES.delete(oldest);
+    }
+    MEM_IMAGES.set(imgId, rawB64);
+    const existing = await sysGetRaw(env, kvKey);
     if (!existing) {
-      await env.APP_DATA.put(kvKey, rawB64, { expirationTtl: 2592000 }); // Cache 30 ngày
+      await sysPutRaw(env, kvKey, rawB64, { bestEffort: true, ttlSec: 2592000 });
     }
 
     const origin = new URL(req.url).origin;
@@ -2193,7 +2470,8 @@ async function handleGameAssetUpload(req, env) {
 async function handleServeGameImage(req, env, pathname) {
   const match = pathname.match(/^\/img\/([a-f0-9]{16,40})\.(?:jpg|jpeg|png)$/i);
   if (!match) return new Response("Not found", { status: 404 });
-  const b64 = await env.APP_DATA.get(`IMG:${match[1].toLowerCase()}`);
+  const imgId = match[1].toLowerCase();
+  const b64 = MEM_IMAGES.get(imgId) || (await sysGetRaw(env, `IMG:${imgId}`));
   if (!b64) return new Response("Image expired or not found", { status: 404 });
   const bytes = base64ToUint8(b64);
   return new Response(bytes, {
