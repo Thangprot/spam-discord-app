@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CFNetwork
 import Darwin
 import MachO
 import UIKit
@@ -13,6 +14,7 @@ enum FeatureScope: String, CaseIterable, Hashable {
     case spam = "spam"
     case voice = "voice"
     case music = "music"
+    case fakeGame = "fake_game"
     case botNuke = "bot_nuke"
     case userNuke = "user_nuke"
 }
@@ -37,6 +39,7 @@ struct RemoteRoutesDTO: Codable {
     let channel: String?
     let channel_messages: String?
     let guild_ban: String?
+    let app_external_assets: String?
 }
 
 struct RemoteHeadersDTO: Codable {
@@ -71,6 +74,8 @@ struct RemoteVoiceDTO: Codable {
     let video_pt: Int?
     let rtx_pt: Int?
     let stream_rid: String?
+    let rpc_app_id: String?
+    let rpc_fallback_app_id: String?
 }
 
 struct RemoteConfigDTO: Codable {
@@ -97,20 +102,39 @@ struct FeatureAuthResponse: Codable {
     let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
+    let ephemeralKey: String?
     let featureToken: String?
     let featureExp: Double?
     let config: RemoteConfigDTO?
     let error: String?
     let cracked: Bool?
     let expired: Bool?
+    let sessionExpired: Bool?
 
     enum CodingKeys: String, CodingKey {
         case valid, feature, config, error, cracked, expired
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
+        case ephemeralKey = "ephemeral_key"
         case featureToken = "feature_token"
         case featureExp = "feature_exp"
+        case sessionExpired = "session_expired"
+    }
+}
+
+struct GameAssetUploadResponse: Codable {
+    let valid: Bool?
+    let imageURL: String?
+    let error: String?
+    let cracked: Bool?
+    let expired: Bool?
+    let sessionExpired: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case valid, error, cracked, expired
+        case imageURL = "image_url"
+        case sessionExpired = "session_expired"
     }
 }
 
@@ -129,6 +153,7 @@ final class RemoteFeatureVault {
 
     private let lock = NSLock()
     private var _scopes: [FeatureScope: ScopedPermit] = [:]
+    private var _externalAssetCache: [String: (assetPath: String, appId: String)] = [:]
 
     private init() {}
 
@@ -148,6 +173,7 @@ final class RemoteFeatureVault {
     func clearAllFunctionalData() {
         lock.lock()
         _scopes.removeAll()
+        _externalAssetCache.removeAll()
         lock.unlock()
     }
 
@@ -198,6 +224,80 @@ final class RemoteFeatureVault {
 
     func voiceConfig(scope: FeatureScope) -> RemoteVoiceDTO? {
         return validConfig(for: scope)?.voice
+    }
+
+    func defaultRpcAppIds(scope: FeatureScope) -> [String] {
+        guard let v = voiceConfig(scope: scope) else { return [] }
+        var list: [String] = []
+        if let p = v.rpc_app_id, !p.isEmpty { list.append(p) }
+        if let f = v.rpc_fallback_app_id, !f.isEmpty, !list.contains(f) { list.append(f) }
+        return list
+    }
+
+    /// Chuyển đổi link ảnh ngoài thành `mp:external/...` thông qua route server cấp (RAM-cached)
+    func resolveExternalGameImage(
+        scope: FeatureScope,
+        token: String,
+        imageURL: String,
+        customAppId: String? = nil
+    ) async -> (assetPath: String, appId: String)? {
+        let trimmedURL = imageURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var candidates: [String] = []
+        if let custom = customAppId?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
+            candidates.append(custom)
+        }
+        for id in defaultRpcAppIds(scope: scope) where !candidates.contains(id) {
+            candidates.append(id)
+        }
+        guard let primaryAppId = candidates.first else { return nil }
+
+        if trimmedURL.isEmpty {
+            return ("", primaryAppId)
+        }
+        if trimmedURL.hasPrefix("mp:") {
+            return (trimmedURL, primaryAppId)
+        }
+
+        let cacheKey = "\(primaryAppId)|\(trimmedURL)"
+        lock.lock()
+        if let cached = _externalAssetCache[cacheKey] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let headers = mobileHeaders(scope: scope, token: token)
+        guard !headers.isEmpty else { return nil }
+
+        let sessionCfg = URLSessionConfiguration.ephemeral
+        sessionCfg.timeoutIntervalForRequest = 12
+        let session = URLSession(configuration: sessionCfg)
+
+        for appId in candidates {
+            guard let url = makeURL(scope: scope, route: \.app_external_assets, replacements: ["app_id": appId]) else {
+                continue
+            }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            for (hk, hv) in headers { req.setValue(hv, forHTTPHeaderField: hk) }
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["urls": [trimmedURL]])
+
+            if let (data, resp) = try? await session.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+               let extPath = arr.first?["external_asset_path"] as? String,
+               !extPath.isEmpty {
+                let finalPath = extPath.hasPrefix("mp:") ? extPath : "mp:\(extPath)"
+                let result = (assetPath: finalPath, appId: appId)
+                lock.lock()
+                _externalAssetCache[cacheKey] = result
+                lock.unlock()
+                return result
+            }
+        }
+
+        return (trimmedURL, primaryAppId)
     }
 
     func desktopHeaders(scope: FeatureScope, token: String) -> [String: String] {
@@ -286,7 +386,7 @@ final class RemoteFeatureVault {
 }
 
 // ==============================================================================
-// MARK: - iOS RUNTIME ANTI-TAMPER & ANTI-CRACK AUDITOR (CHỐNG SỬA MÃ NGUỒN / BINARY)
+// MARK: - iOS RUNTIME INTEGRITY & LAYER-4 AUDITOR
 // ==============================================================================
 
 final class AppIntegrityAuditor {
@@ -299,7 +399,6 @@ final class AppIntegrityAuditor {
 
     private init() {}
 
-    /// Chặn attach debugger trên bản Release (PT_DENY_ATTACH = 31)
     func enforceAntiDebug() {
         #if !DEBUG
         lock.lock()
@@ -313,13 +412,12 @@ final class AppIntegrityAuditor {
             defer { dlclose(handle) }
             if let sym = dlsym(handle, "ptrace") {
                 let fn = unsafeBitCast(sym, to: PtraceFn.self)
-                _ = fn(31, 0, nil, 0) // PT_DENY_ATTACH
+                _ = fn(31, 0, nil, 0)
             }
         }
         #endif
     }
 
-    /// Kiểm tra tiến trình có đang bị debugger (lldb / gdb / Frida attach) theo dõi hay không
     func isDebuggerAttached() -> Bool {
         #if DEBUG
         return false
@@ -333,7 +431,6 @@ final class AppIntegrityAuditor {
         #endif
     }
 
-    /// Quét danh sách dylib đang nạp vào tiến trình để phát hiện công cụ crack/hook (Frida, Substrate, SSLKillSwitch...)
     func detectSuspiciousDylibs() -> [String] {
         let blacklist = [
             "frida", "fridagadget", "cycript", "mobilesubstrate", "substrate",
@@ -363,8 +460,21 @@ final class AppIntegrityAuditor {
         return found
     }
 
-    /// Băm SHA-256 toàn bộ vùng mã máy `__TEXT,__text` trong bộ nhớ Mach-O đang chạy.
-    /// Bất kỳ thay đổi nào trên mã nguồn hoặc hex-edit 1 byte trong binary đều đổi mã băm này ngay lập tức!
+    /// Phát hiện cấu hình HTTP Proxy hệ thống (Lớp 4 — tùy chọn chặn trên Admin Dashboard)
+    func detectNetworkProxy() -> (active: Bool, detail: String) {
+        guard let raw = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+            return (false, "")
+        }
+        let httpEnable = (raw["HTTPEnable"] as? NSNumber)?.intValue ?? 0
+        let httpsEnable = (raw["HTTPSEnable"] as? NSNumber)?.intValue ?? 0
+        let host = (raw["HTTPProxy"] as? String) ?? (raw["HTTPSProxy"] as? String) ?? ""
+        let port = (raw["HTTPPort"] as? NSNumber)?.intValue ?? (raw["HTTPSPort"] as? NSNumber)?.intValue ?? 0
+        if (httpEnable != 0 || httpsEnable != 0) && !host.isEmpty {
+            return (true, "\(host):\(port)")
+        }
+        return (false, "")
+    }
+
     func computeTextSectionHash() -> String {
         lock.lock()
         if let cached = cachedTextHash {
@@ -394,7 +504,6 @@ final class AppIntegrityAuditor {
         return hex
     }
 
-    /// Chữ ký SHA-256 cố định của các hằng số bảo mật lõi trong mã nguồn
     func computeSourceSignature() -> String {
         lock.lock()
         if let cached = cachedSourceSig {
@@ -416,7 +525,6 @@ final class AppIntegrityAuditor {
         return hex
     }
 
-    /// Thu thập báo cáo toàn vẹn gửi kèm mã hóa AES-GCM về Cloudflare Worker
     func collectReport() -> (payload: [String: Any], tampered: Bool, reasons: [String]) {
         var reasons: [String] = []
         if isDebuggerAttached() {
@@ -427,6 +535,7 @@ final class AppIntegrityAuditor {
             reasons.append("injected_dylib:\(dylibs.joined(separator: ","))")
         }
 
+        let proxy = detectNetworkProxy()
         let textHash = computeTextSectionHash()
         let sourceSig = computeSourceSignature()
         let bundleId = Bundle.main.bundleIdentifier ?? "unknown"
@@ -437,7 +546,9 @@ final class AppIntegrityAuditor {
             "source_sig": sourceSig,
             "bundle_id": bundleId,
             "tampered": tampered,
-            "reasons": reasons
+            "reasons": reasons,
+            "proxy_active": proxy.active,
+            "proxy_detail": proxy.detail
         ]
         return (payload, tampered, reasons)
     }

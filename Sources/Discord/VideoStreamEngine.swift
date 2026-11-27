@@ -6,6 +6,7 @@ import CoreMedia
 import CoreVideo
 import CryptoKit
 import Darwin
+import UIKit
 
 // ==============================================================================
 // MARK: - NITRO STREAM PROFILE & MEDIA SOURCE (PORT TỪ room.js)
@@ -92,13 +93,31 @@ struct TreoMediaSource: Identifiable, Equatable {
     let url: URL?
     let isAudioOnly: Bool
     let isVirtualPattern: Bool
+    let isStaticImage: Bool
+
+    init(
+        id: UUID,
+        title: String,
+        url: URL?,
+        isAudioOnly: Bool,
+        isVirtualPattern: Bool,
+        isStaticImage: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.url = url
+        self.isAudioOnly = isAudioOnly
+        self.isVirtualPattern = isVirtualPattern
+        self.isStaticImage = isStaticImage
+    }
 
     static let virtualCamPattern = TreoMediaSource(
         id: UUID(uuidString: "00000000-0000-0000-0000-00000000C401") ?? UUID(),
         title: "🌈 Video Mẫu Ảo (Loop ∞)",
         url: nil,
         isAudioOnly: false,
-        isVirtualPattern: true
+        isVirtualPattern: true,
+        isStaticImage: false
     )
 
     static let virtualBlackScreen = TreoMediaSource(
@@ -106,11 +125,12 @@ struct TreoMediaSource: Identifiable, Equatable {
         title: "⬛ Màn Hình Đen 720p (Loop ∞)",
         url: nil,
         isAudioOnly: true,
-        isVirtualPattern: true
+        isVirtualPattern: true,
+        isStaticImage: false
     )
 
     static func == (lhs: TreoMediaSource, rhs: TreoMediaSource) -> Bool {
-        lhs.id == rhs.id && lhs.url == rhs.url && lhs.isVirtualPattern == rhs.isVirtualPattern
+        lhs.id == rhs.id && lhs.url == rhs.url && lhs.isVirtualPattern == rhs.isVirtualPattern && lhs.isStaticImage == rhs.isStaticImage
     }
 }
 
@@ -850,6 +870,59 @@ final class HardwareH264Encoder {
             }
         }
         return pixelBuffer
+    }
+
+    /// Tạo CVPixelBuffer từ file ảnh tĩnh (.jpg/.png/.heic/.webp), tự xoay đúng chiều EXIF và căn giữa 16:9 sắc nét
+    static func makeImagePixelBuffer(url: URL, maxWidth: Int, maxHeight: Int) -> (CVPixelBuffer, Int, Int)? {
+        guard let image = UIImage(contentsOfFile: url.path),
+              image.size.width > 1, image.size.height > 1 else {
+            return nil
+        }
+
+        let canvasW = max(320, (maxWidth / 2) * 2)
+        let canvasH = max(240, (maxHeight / 2) * 2)
+
+        let imgW = Double(image.size.width)
+        let imgH = Double(image.size.height)
+        let scale = min(Double(canvasW) / imgW, Double(canvasH) / imgH)
+        let drawW = imgW * scale
+        let drawH = imgH * scale
+        let drawX = (Double(canvasW) - drawW) / 2.0
+        let drawY = (Double(canvasH) - drawH) / 2.0
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: canvasW, height: canvasH), format: format)
+        let rendered = renderer.image { ctx in
+            UIColor(red: 0.04, green: 0.04, blue: 0.06, alpha: 1.0).setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
+            image.draw(in: CGRect(x: drawX, y: drawY, width: drawW, height: drawH))
+        }
+        guard let cgImg = rendered.cgImage else { return nil }
+
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ]
+        var pbOpt: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, canvasW, canvasH, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pbOpt) == kCVReturnSuccess,
+              let pb = pbOpt else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        let bpr = CVPixelBufferGetBytesPerRow(pb)
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+        guard let cgCtx = CGContext(data: base, width: canvasW, height: canvasH, bitsPerComponent: 8, bytesPerRow: bpr, space: cs, bitmapInfo: bitmapInfo) else {
+            return nil
+        }
+        cgCtx.draw(cgImg, in: CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
+        return (pb, canvasW, canvasH)
     }
 }
 
@@ -2431,6 +2504,95 @@ final class TreoMediaBroadcastEngine {
                                 }
                                 onVideoFrame(annexB, frameDurationMs)
                             }
+                        }
+                        frameIndex += 1
+                    }
+
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if nextTick > now {
+                        try? await Task.sleep(nanoseconds: nextTick - now)
+                    } else if now - nextTick > 200_000_000 {
+                        nextTick = now
+                    }
+                }
+            } else if source.isStaticImage, let url = source.url {
+                // Luồng phát ẢNH TĨNH từ Thư viện Ảnh / Tệp (Mã hóa 2 giây đầu vào RAM cache rồi phát lặp 0% GPU 24/7!)
+                let encFps = 15
+                guard let (staticPB, encW, encH) = HardwareH264Encoder.makeImagePixelBuffer(
+                    url: url,
+                    maxWidth: profile.width,
+                    maxHeight: profile.height
+                ) else {
+                    onLog?("❌ Không thể đọc file ảnh: \(source.title)")
+                    return
+                }
+
+                let encBitrate = max(600, min(profile.bitrateKbps, 2500))
+                let encMaxBitrate = max(1000, min(profile.maxBitrateKbps, 3500))
+                var encoder: HardwareH264Encoder? = HardwareH264Encoder(
+                    width: encW,
+                    height: encH,
+                    fps: encFps,
+                    bitrateKbps: encBitrate,
+                    maxBitrateKbps: encMaxBitrate
+                )
+                defer { encoder?.invalidate() }
+
+                let frameDurationMs = 1000.0 / Double(encFps)
+                let frameDurationNs = UInt64(frameDurationMs * 1_000_000.0)
+                let cmDuration = CMTime(value: 1, timescale: CMTimeScale(encFps))
+                var frameIndex: Int64 = 0
+                var encodedCount = 0
+                var nextTick = DispatchTime.now().uptimeNanoseconds
+                var loggedFirst = false
+                var loggedZeroGpu = false
+
+                while !Task.isCancelled {
+                    nextTick &+= frameDurationNs
+                    let wantKey = (frameIndex % Int64(encFps * 2) == 0) || self.consumeKeyFrameRequest()
+                    let inBg = self.isBackgroundMode
+
+                    if (encodedCount >= encFps * 2 || inBg || encoder == nil || encoder?.needsRebuild == true) && self.bgLoopCache.hasCachedFrames {
+                        if encoder != nil {
+                            encoder?.invalidate()
+                            encoder = nil
+                        }
+                        if !loggedZeroGpu {
+                            loggedZeroGpu = true
+                            onLog?("🖼️ Ảnh HD đã khóa vào bộ nhớ đệm 0% GPU — chạy nền 24/7 mượt tuyệt đối: \(source.title)")
+                        }
+                        if let cached = self.bgLoopCache.nextFrame(forceKey: wantKey) {
+                            onVideoFrame(cached, frameDurationMs)
+                        }
+                        frameIndex += 1
+                    } else {
+                        if !inBg && (encoder == nil || encoder?.needsRebuild == true) {
+                            encoder?.invalidate()
+                            encoder = HardwareH264Encoder(
+                                width: encW,
+                                height: encH,
+                                fps: encFps,
+                                bitrateKbps: encBitrate,
+                                maxBitrateKbps: encMaxBitrate
+                            )
+                        }
+                        if let enc = encoder {
+                            let pts = CMTime(value: frameIndex, timescale: CMTimeScale(encFps))
+                            let forceKey = (encodedCount == 0) || wantKey
+                            enc.encode(
+                                pixelBuffer: staticPB,
+                                pts: pts,
+                                duration: cmDuration,
+                                forceKeyFrame: forceKey
+                            ) { annexB, isKey in
+                                self.bgLoopCache.record(frame: annexB, isKey: isKey)
+                                if !loggedFirst {
+                                    loggedFirst = true
+                                    onLog?("🖼️ Bắt đầu phát Ảnh HD (\(encW)x\(encH)@\(encFps)fps): \(source.title)")
+                                }
+                                onVideoFrame(annexB, frameDurationMs)
+                            }
+                            encodedCount += 1
                         }
                         frameIndex += 1
                     }

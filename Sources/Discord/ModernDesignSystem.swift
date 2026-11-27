@@ -9,6 +9,7 @@ import MediaPlayer
 enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
     case music
     case treoVoice
+    case fakeGame
     case spam
     case botNuke
     case userNuke
@@ -21,6 +22,7 @@ enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .music: return "Xả Nhạc VIP"
         case .treoVoice: return "Treo Voice 24/7"
+        case .fakeGame: return "Fake Game 24/7"
         case .spam: return "Spam Tin Nhắn"
         case .botNuke: return "Bot Nuke"
         case .userNuke: return "User Nuke"
@@ -33,6 +35,7 @@ enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .music: return "flame.fill"
         case .treoVoice: return "waveform"
+        case .fakeGame: return "gamecontroller.fill"
         case .spam: return "paperplane.fill"
         case .botNuke: return "bolt.shield.fill"
         case .userNuke: return "exclamationmark.triangle.fill"
@@ -46,8 +49,9 @@ enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
         case .spam: return 0
         case .tokenCheck: return 1
         case .music, .treoVoice: return 2
-        case .botNuke, .userNuke: return 3
-        case .preview: return 4
+        case .fakeGame: return 3
+        case .botNuke, .userNuke: return 4
+        case .preview: return 5
         }
     }
 
@@ -57,6 +61,8 @@ enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
             return [Color(red: 0.95, green: 0.24, blue: 0.28), Color(red: 1.0, green: 0.50, blue: 0.14)]
         case .treoVoice:
             return [Color(red: 0.36, green: 0.34, blue: 0.96), Color(red: 0.62, green: 0.28, blue: 0.95)]
+        case .fakeGame:
+            return [Color(red: 0.08, green: 0.74, blue: 0.54), Color(red: 0.12, green: 0.62, blue: 0.96)]
         case .spam:
             return [Color(red: 0.28, green: 0.39, blue: 0.98), Color(red: 0.16, green: 0.67, blue: 0.96)]
         case .botNuke:
@@ -76,6 +82,8 @@ enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
             return (UIColor(red: 0.95, green: 0.24, blue: 0.28, alpha: 1), UIColor(red: 1.0, green: 0.50, blue: 0.14, alpha: 1))
         case .treoVoice:
             return (UIColor(red: 0.36, green: 0.34, blue: 0.96, alpha: 1), UIColor(red: 0.62, green: 0.28, blue: 0.95, alpha: 1))
+        case .fakeGame:
+            return (UIColor(red: 0.08, green: 0.74, blue: 0.54, alpha: 1), UIColor(red: 0.12, green: 0.62, blue: 0.96, alpha: 1))
         case .spam:
             return (UIColor(red: 0.28, green: 0.39, blue: 0.98, alpha: 1), UIColor(red: 0.16, green: 0.67, blue: 0.96, alpha: 1))
         case .botNuke:
@@ -94,6 +102,7 @@ enum NowPlayingFeature: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .music: return 100
         case .treoVoice: return 90
+        case .fakeGame: return 85
         case .spam: return 80
         case .botNuke: return 70
         case .userNuke: return 65
@@ -196,6 +205,59 @@ enum StudioPalette {
         colors: [Color(red: 0.36, green: 0.34, blue: 0.96), Color(red: 0.66, green: 0.30, blue: 0.96)],
         startPoint: .topLeading, endPoint: .bottomTrailing
     )
+    static let fakeGameGradient = LinearGradient(
+        colors: [Color(red: 0.08, green: 0.74, blue: 0.54), Color(red: 0.12, green: 0.62, blue: 0.96)],
+        startPoint: .topLeading, endPoint: .bottomTrailing
+    )
+}
+
+struct ModernBottomTabBar: View {
+    @Binding var selectedTab: Int
+
+    private let items: [(index: Int, title: String, icon: String, activeColor: Color)] = [
+        (0, "Spam", "paperplane.fill", Color(red: 0.28, green: 0.39, blue: 0.98)),
+        (1, "Tokens", "person.2.fill", Color(red: 0.10, green: 0.72, blue: 0.56)),
+        (2, "Voice", "waveform.circle.fill", Color(red: 0.45, green: 0.34, blue: 0.96)),
+        (3, "Fake Game", "gamecontroller.fill", Color(red: 0.08, green: 0.74, blue: 0.54)),
+        (4, "Nuke", "flame.fill", Color(red: 0.92, green: 0.24, blue: 0.28)),
+        (5, "Info", "sparkles", Color(red: 0.56, green: 0.32, blue: 0.96))
+    ]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(items, id: \.index) { item in
+                let isSelected = (selectedTab == item.index)
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.80)) {
+                        selectedTab = item.index
+                    }
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: item.icon)
+                            .font(.system(size: isSelected ? 17 : 16, weight: isSelected ? .bold : .medium))
+                            .foregroundColor(isSelected ? item.activeColor : .secondary)
+                            .frame(height: 20)
+                        Text(item.title)
+                            .font(.system(size: 9.5, weight: isSelected ? .bold : .medium, design: .rounded))
+                            .foregroundColor(isSelected ? item.activeColor : .secondary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 7)
+                    .padding(.bottom, 5)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 6)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.08))
+                .frame(height: 0.5)
+        }
+    }
 }
 
 struct StudioAmbientBackdrop: View {
@@ -542,7 +604,7 @@ struct LiveNowPlayingBar: View {
                         .buttonStyle(.plain)
                     }
 
-                    if active.feature == .music {
+                    if active.feature == .music || active.feature == .fakeGame {
                         Button {
                             nowPlaying.triggerNext()
                         } label: {

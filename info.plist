@@ -47,6 +47,8 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Cho phép chọn ảnh và video từ Thư viện Ảnh để phát Stream, Fake Cam và ảnh đại diện Fake Game.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSAppTransportSecurity</key>

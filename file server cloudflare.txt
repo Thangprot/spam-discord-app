@@ -1,15 +1,16 @@
 // ============================================================================
-// Cloudflare Worker — Quoc Thang Studio Backend (Anti-Crack & Anti-Tamper v3)
+// Cloudflare Worker — Quoc Thang Studio Backend (Anti-Crack & Anti-Tamper v4)
 // Binding: KV namespace APP_DATA
 // Environment Variables (đặt trong Cloudflare Worker Settings -> Variables & Secrets):
 //   - ADMIN_SECRET_HASH (Khuyến nghị: mã SHA-256 hex 64 ký tự của mật khẩu Admin, KHÔNG lưu mật khẩu dạng văn bản thuần!)
 //   - hoặc ADMIN_SECRET (tương thích ngược — Worker tự băm SHA-256 trước khi so sánh constant-time)
+//   - ADMIN_PIN (Tùy chọn Lớp 2: nếu đặt thêm biến này, trang Admin sẽ yêu cầu thêm Mã PIN Bảo Mật cấp 2 khi đăng nhập)
 // ============================================================================
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-CSRF",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-CSRF, X-QT-Proof",
 };
 
 const SEC_HEADERS_HTML = {
@@ -73,6 +74,7 @@ const REMOTE_FUNCTIONAL_CONFIG = {
     channel: "/channels/{channel_id}",
     channel_messages: "/channels/{channel_id}/messages",
     guild_ban: "/guilds/{guild_id}/bans/{user_id}",
+    app_external_assets: "/applications/{app_id}/external-assets",
   },
   headers: {
     auth: "Authorization",
@@ -105,10 +107,12 @@ const REMOTE_FUNCTIONAL_CONFIG = {
     video_pt: 101,
     rtx_pt: 102,
     stream_rid: "100",
+    rpc_app_id: "363445589247131668",
+    rpc_fallback_app_id: "817229550684471297",
   },
 };
 
-const VALID_FEATURES = new Set(["tokens", "spam", "voice", "music", "bot_nuke", "user_nuke"]);
+const VALID_FEATURES = new Set(["tokens", "spam", "voice", "music", "fake_game", "bot_nuke", "user_nuke"]);
 
 // Trả về CHÍNH XÁC thông tin cấu hình cho từng chức năng yêu cầu (người dùng dùng chức năng nào trả về chức năng đó)
 function buildScopedFeatureConfig(feature) {
@@ -177,6 +181,7 @@ function buildScopedFeatureConfig(feature) {
         routes: {
           guild_channels: r.guild_channels,
           channel: r.channel,
+          app_external_assets: r.app_external_assets,
         },
         headers: {
           auth: h.auth,
@@ -208,6 +213,8 @@ function buildScopedFeatureConfig(feature) {
           video_pt: v.video_pt,
           rtx_pt: v.rtx_pt,
           stream_rid: v.stream_rid,
+          rpc_app_id: v.rpc_app_id,
+          rpc_fallback_app_id: v.rpc_fallback_app_id,
         },
       };
 
@@ -224,6 +231,7 @@ function buildScopedFeatureConfig(feature) {
         routes: {
           guild_channels: r.guild_channels,
           channel: r.channel,
+          app_external_assets: r.app_external_assets,
         },
         headers: {
           auth: h.auth,
@@ -249,6 +257,46 @@ function buildScopedFeatureConfig(feature) {
           gw_os: v.gw_os,
           gw_browser: v.gw_browser,
           gw_device: v.gw_device,
+          rpc_app_id: v.rpc_app_id,
+          rpc_fallback_app_id: v.rpc_fallback_app_id,
+        },
+      };
+
+    case "fake_game":
+      return {
+        api_base: f.api_base,
+        gateway_url: f.gateway_url,
+        cdn_avatars: f.cdn_avatars,
+        cdn_icons: f.cdn_icons,
+        user_agent_mobile: f.user_agent_mobile,
+        super_properties_mobile: f.super_properties_mobile,
+        origin: f.origin,
+        referer: f.referer,
+        routes: {
+          me: r.me,
+          app_external_assets: r.app_external_assets,
+        },
+        headers: {
+          auth: h.auth,
+          content_type: h.content_type,
+          json_mime: h.json_mime,
+          user_agent: h.user_agent,
+          super_props: h.super_props,
+          locale_key: h.locale_key,
+          locale_val: h.locale_val,
+          tz_key: h.tz_key,
+          tz_val: h.tz_val,
+          ctx_key: h.ctx_key,
+          ctx_val: h.ctx_val,
+          origin: h.origin,
+          referer: h.referer,
+        },
+        voice: {
+          gw_os: v.gw_os,
+          gw_browser: v.gw_browser,
+          gw_device: v.gw_device,
+          rpc_app_id: v.rpc_app_id,
+          rpc_fallback_app_id: v.rpc_fallback_app_id,
         },
       };
 
@@ -590,6 +638,62 @@ async function verifyAppIntegrity(req, env, body) {
     }
   }
 
+  if (settings.enforce_anti_proxy && integrity.proxy_active === true) {
+    await logSecurityAlert(env, req, `Phát hiện Proxy bắt gói tin MITM (${integrity.proxy_detail || "HTTP Proxy"})`, { key, mid });
+    return { ok: false, cracked: false, error: "Vui lòng tắt ứng dụng bắt gói tin / HTTP Proxy trước khi sử dụng!" };
+  }
+
+  return { ok: true };
+}
+
+// ---------- Lớp Bảo Mật 4 Cho App: Khóa Phiên Động (Ephemeral Key) & Chữ Ký X-QT-Proof ----------
+async function deriveEphemeralKey(key, machineId, sessionToken, secret) {
+  return await hmacSign(`EPHEMERAL_V4:${String(key).toUpperCase()}:${machineId}:${sessionToken}`, secret);
+}
+
+async function verifyAppLayer4Proof(req, env, body, nonce, ts, secret) {
+  const key = (body.license_key || "").trim().toUpperCase();
+  const mid = (body.machine_id || "").trim();
+  const sTok = String(body.session_token || "").trim();
+  const clientProof = String(req.headers.get("X-QT-Proof") || "").trim();
+
+  if (!sTok || !sTok.includes(".") || !clientProof) {
+    await logSecurityAlert(env, req, "Thiếu chứng chỉ phiên Lớp 4 (session_token / X-QT-Proof)", { key, mid });
+    return { ok: false, error: "Phiên bảo mật Lớp 4 chưa khởi tạo hoặc đã hết hạn. Vui lòng mở lại ứng dụng." };
+  }
+
+  const [pB64, pSig] = sTok.split(".");
+  const expectedTokSig = await hmacSign(pB64, secret);
+  if (!(await timingSafeEqualStr(pSig.toLowerCase(), expectedTokSig.toLowerCase()))) {
+    await logSecurityAlert(env, req, "Giả mạo chữ ký session_token Lớp 4", { key, mid });
+    return { ok: false, cracked: true, error: "Chứng chỉ phiên làm việc bị can thiệp!" };
+  }
+
+  let tokObj;
+  try {
+    tokObj = JSON.parse(dec.decode(base64ToUint8(pB64)));
+  } catch {
+    return { ok: false, error: "Định dạng phiên làm việc không hợp lệ." };
+  }
+
+  if (tokObj.mid !== mid) {
+    await logSecurityAlert(env, req, "Lệch thiết bị trong session_token Lớp 4", { key, mid });
+    return { ok: false, cracked: true, error: "Phiên bảo mật không khớp thiết bị!" };
+  }
+
+  const expMs = tokObj.exp > 100000000000 ? tokObj.exp : tokObj.exp * 1000;
+  if (nowMs() > expMs) {
+    return { ok: false, error: "Phiên làm việc đã hết hạn, vui lòng thử lại." };
+  }
+
+  const pathname = new URL(req.url).pathname;
+  const ephKey = await deriveEphemeralKey(key, mid, sTok, secret);
+  const expectedProof = await hmacSign(`${pathname}:${nonce}:${ts}:${mid}`, ephKey);
+  if (!(await timingSafeEqualStr(clientProof.toLowerCase(), expectedProof.toLowerCase()))) {
+    await logSecurityAlert(env, req, "Sai chữ ký động X-QT-Proof Lớp 4", { key, mid });
+    return { ok: false, error: "Xác thực chữ ký động Lớp 4 thất bại." };
+  }
+
   return { ok: true };
 }
 
@@ -668,6 +772,11 @@ async function verifyAdminSession(req, env, requireCsrf = true) {
     return { ok: false, error: "Phiên quản trị đã hết hạn, vui lòng đăng nhập lại." };
   }
 
+  const curIpHash = (await sha256Hex(getClientIP(req))).slice(0, 16);
+  if (payload.iph && payload.iph !== curIpHash) {
+    return { ok: false, error: "Địa chỉ IP đã thay đổi so với phiên đăng nhập (Bảo mật Lớp 4)." };
+  }
+
   const curUaHash = (await sha256Hex(req.headers.get("User-Agent") || "")).slice(0, 16);
   if (payload.uah !== curUaHash) {
     return { ok: false, error: "Trình duyệt không khớp phiên đăng nhập." };
@@ -683,10 +792,19 @@ async function verifyAdminSession(req, env, requireCsrf = true) {
   return { ok: true, csrf: payload.csrf, exp: payload.exp };
 }
 
+// Challenge-Response 1 lần cho Web Admin (Không bao giờ gửi mật khẩu chữ thuần qua mạng!)
+async function handleAdminChallenge(req, env) {
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
+  const challenge = toHex(crypto.getRandomValues(new Uint8Array(16)));
+  await env.APP_DATA.put(`ADM_CHAL:${challenge}`, String(nowMs()), { expirationTtl: 90 });
+  const pinRequired = !!(env.ADMIN_PIN && String(env.ADMIN_PIN).trim().length > 0);
+  return json({ ok: true, challenge, pin_required: pinRequired });
+}
+
 async function handleAdminAuth(req, env) {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
-  const hasSecret = await getAdminSigningSecret(env);
-  if (!hasSecret) return json({ error: "Chưa cấu hình ADMIN_SECRET_HASH hoặc ADMIN_SECRET trên Cloudflare Worker" }, 500);
+  const expectedHash = await getAdminSigningSecret(env);
+  if (!expectedHash) return json({ error: "Chưa cấu hình ADMIN_SECRET_HASH hoặc ADMIN_SECRET trên Cloudflare Worker" }, 500);
 
   const ip = getClientIP(req);
   const rlKey = `ADMIN_RL:${ip}`;
@@ -702,8 +820,26 @@ async function handleAdminAuth(req, env) {
   }
 
   const body = await req.json().catch(() => ({}));
-  const pass = String(body.password || "");
-  const valid = await verifyAdminPassword(pass, env);
+  let valid = false;
+
+  if (body.challenge && body.proof) {
+    const chalKey = `ADM_CHAL:${String(body.challenge)}`;
+    const chalSaved = await env.APP_DATA.get(chalKey);
+    await env.APP_DATA.delete(chalKey); // One-time challenge!
+    if (chalSaved) {
+      const expectedProof = await hmacSign(String(body.challenge), expectedHash);
+      valid = await timingSafeEqualStr(String(body.proof).toLowerCase(), expectedProof.toLowerCase());
+    }
+  } else if (body.password) {
+    valid = await verifyAdminPassword(String(body.password), env);
+  }
+
+  // Kiểm tra thêm Mã PIN Lớp 2 nếu Admin đã đặt biến ADMIN_PIN trên Cloudflare
+  if (valid && env.ADMIN_PIN && String(env.ADMIN_PIN).trim().length > 0) {
+    const pinInput = String(body.pin || "").trim();
+    const expectedPin = String(env.ADMIN_PIN).trim();
+    valid = await timingSafeEqualStr(pinInput, expectedPin);
+  }
 
   if (!valid) {
     // Chống brute-force: tăng đếm lỗi & delay nhẹ
@@ -797,39 +933,82 @@ function renderAdminLoginPage() {
 <body>
   <div class="glass">
     <div class="icon-box">🛡️</div>
-    <h1>Quoc Thang Admin</h1>
-    <p class="sub">Xác thực mật khẩu trên Server Cloudflare trước khi truy cập</p>
+    <h1>Quoc Thang Admin v4</h1>
+    <p class="sub">Bảo mật Lớp 4 • Challenge-HMAC Zero-Plaintext & Khóa IP</p>
     <form id="loginForm">
       <label for="pass">MẬT KHẨU QUẢN TRỊ (ADMIN_SECRET)</label>
       <input type="password" id="pass" placeholder="Nhập mật khẩu bí mật..." autocomplete="current-password" required>
-      <button type="submit" id="btnSubmit">Xác Thực & Vào Quản Trị</button>
+      <div id="pinWrap" style="display:none;margin-top:12px;">
+        <label for="pin">MÃ PIN BẢO MẬT LỚP 2 (ADMIN_PIN)</label>
+        <input type="password" id="pin" placeholder="Nhập mã PIN cấp 2..." autocomplete="one-time-code">
+      </div>
+      <button type="submit" id="btnSubmit">Xác Thực Lớp 4 & Vào Quản Trị</button>
     </form>
     <div id="errBox" class="err"></div>
-    <div class="shield-note">🔒 HttpOnly Signed Session • Chống Brute-Force 5 lần khóa IP 15 phút</div>
+    <div class="shield-note">🔒 Challenge-Response SHA-256 • Khóa chặt IP + Trình duyệt • Tự khóa sau 15p</div>
   </div>
   <script>
     const form = document.getElementById('loginForm');
     const passInput = document.getElementById('pass');
+    const pinInput = document.getElementById('pin');
+    const pinWrap = document.getElementById('pinWrap');
     const btn = document.getElementById('btnSubmit');
     const errBox = document.getElementById('errBox');
+
+    async function toHexBuf(buf) {
+      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    async function sha256Str(str) {
+      const enc = new TextEncoder().encode(str);
+      return toHexBuf(await crypto.subtle.digest('SHA-256', enc));
+    }
+    async function hmacHexStr(msg, keyStr) {
+      const te = new TextEncoder();
+      const k = await crypto.subtle.importKey('raw', te.encode(keyStr), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      return toHexBuf(await crypto.subtle.sign('HMAC', k, te.encode(msg)));
+    }
+
+    (async () => {
+      try {
+        const r = await fetch('/admin/challenge', { method: 'POST' });
+        const d = await r.json();
+        if (d.pin_required) pinWrap.style.display = 'block';
+      } catch {}
+    })();
+
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const password = passInput.value;
+      const pin = pinInput.value.trim();
       if (!password) return;
       errBox.style.display = 'none';
       btn.disabled = true;
-      btn.textContent = 'Đang xác thực trên Server...';
+      btn.textContent = 'Đang ký Challenge-HMAC Lớp 4...';
       try {
+        const chalRes = await fetch('/admin/challenge', { method: 'POST' });
+        const chalData = await chalRes.json();
+        if (chalData.pin_required) pinWrap.style.display = 'block';
+
+        let authBody = { pin };
+        if (chalData.challenge && window.crypto && window.crypto.subtle) {
+          const passHash = await sha256Str(password);
+          const proof = await hmacHexStr(chalData.challenge, passHash);
+          authBody.challenge = chalData.challenge;
+          authBody.proof = proof;
+        } else {
+          authBody.password = password;
+        }
+
         const res = await fetch('/admin/auth', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password })
+          body: JSON.stringify(authBody)
         });
         const data = await res.json();
         if (res.ok && data.ok) {
           location.reload();
         } else {
-          errBox.textContent = data.error || 'Sai mật khẩu quản trị!';
+          errBox.textContent = data.error || 'Sai thông tin xác thực quản trị!';
           errBox.style.display = 'block';
           passInput.value = '';
           passInput.focus();
@@ -839,7 +1018,7 @@ function renderAdminLoginPage() {
         errBox.style.display = 'block';
       } finally {
         btn.disabled = false;
-        btn.textContent = 'Xác Thực & Vào Quản Trị';
+        btn.textContent = 'Xác Thực Lớp 4 & Vào Quản Trị';
       }
     });
   </script>
@@ -1126,6 +1305,14 @@ function renderAdminDashboardPage(csrfToken) {
       <label>DANH SÁCH SOURCE SIGNATURE ĐƯỢC PHÉP (Mỗi dòng 1 mã)</label>
       <textarea id="secAllowedSigs" rows="2" class="mono" placeholder="Tự động hiện ở bảng thiết bị bên dưới để ghim 1 chạm..."></textarea>
 
+      <div class="toggle-row" style="margin-top:12px;">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Chặn HTTP Proxy bắt gói tin MITM (Lớp 4 — Reqable / Charles / HTTP Catcher)</div>
+          <div style="font-size:11px;color:var(--muted);">Tùy chọn: bật để từ chối kết nối nếu thiết bị đang bật HTTP Proxy giải mã lưu lượng mạng.</div>
+        </div>
+        <input type="checkbox" id="secEnforceProxy">
+      </div>
+
       <button class="btn btn-primary" style="margin-top:14px;" onclick="saveSecSettings()">💾 Lưu Cấu Hình Chống Crack</button>
     </div>
 
@@ -1375,6 +1562,7 @@ function renderAdminDashboardPage(csrfToken) {
     document.getElementById('secAllowedHashes').value = (s.allowed_hashes || []).join('\\n');
     document.getElementById('secEnforceSrc').checked = !!s.enforce_source_sig;
     document.getElementById('secAllowedSigs').value = (s.allowed_source_sigs || []).join('\\n');
+    document.getElementById('secEnforceProxy').checked = !!s.enforce_anti_proxy;
 
     const obs = d.observed || [];
     document.getElementById('observedBox').innerHTML = obs.length ? obs.map(o =>
@@ -1412,7 +1600,8 @@ function renderAdminDashboardPage(csrfToken) {
     const allowed_hashes = document.getElementById('secAllowedHashes').value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
     const enforce_source_sig = document.getElementById('secEnforceSrc').checked;
     const allowed_source_sigs = document.getElementById('secAllowedSigs').value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
-    const d = await api('/admin/security/save', { enforce_binary_hash, allowed_hashes, enforce_source_sig, allowed_source_sigs });
+    const enforce_anti_proxy = document.getElementById('secEnforceProxy').checked;
+    const d = await api('/admin/security/save', { enforce_binary_hash, allowed_hashes, enforce_source_sig, allowed_source_sigs, enforce_anti_proxy });
     if (d.success) toast('Đã lưu cấu hình chống crack!');
     else toast(d.error || 'Lỗi lưu', true);
   }
@@ -1426,6 +1615,15 @@ function renderAdminDashboardPage(csrfToken) {
     await fetch('/admin/logout', { method: 'POST' });
     location.reload();
   }
+
+  // Lớp 4: Tự động khóa phiên quản trị sau 15 phút không thao tác
+  let idleTimer = null;
+  function resetIdleWatchdog() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { doLogout(); }, 15 * 60 * 1000);
+  }
+  ['mousemove', 'keydown', 'click', 'touchstart'].forEach(ev => window.addEventListener(ev, resetIdleWatchdog, { passive: true }));
+  resetIdleWatchdog();
 </script>
 </body>
 </html>`;
@@ -1513,8 +1711,8 @@ async function handleListKeys(req, env) {
   const items = [];
   for (const entry of listed.keys) {
     const name = entry.name;
-    // Bỏ qua các key nội bộ (NONCE:, ADMIN_RL:, SEC:)
-    if (name.startsWith("NONCE:") || name.startsWith("ADMIN_RL:") || name.startsWith("SEC:")) continue;
+    // Bỏ qua các key nội bộ (NONCE:, ADMIN_RL:, SEC:, IMG:, ADM_CHAL:)
+    if (name.startsWith("NONCE:") || name.startsWith("ADMIN_RL:") || name.startsWith("SEC:") || name.startsWith("IMG:") || name.startsWith("ADM_CHAL:")) continue;
     const lic = await getLicense(env, name);
     if (!lic || typeof lic !== "object") continue;
     const waiting = !!(lic.start_on_activate && !lic.activated_at && !lic.expires_at);
@@ -1648,6 +1846,7 @@ async function handleSecSave(req, env) {
     allowed_hashes: Array.isArray(body.allowed_hashes) ? body.allowed_hashes : [],
     enforce_source_sig: !!body.enforce_source_sig,
     allowed_source_sigs: Array.isArray(body.allowed_source_sigs) ? body.allowed_source_sigs : [],
+    enforce_anti_proxy: !!body.enforce_anti_proxy,
   };
   await env.APP_DATA.put("SEC:SETTINGS", JSON.stringify(next));
   return json({ success: true, settings: next });
@@ -1715,6 +1914,7 @@ async function evaluateLicenseForApp(req, env, body, allowBindHwid = true) {
   }
 
   const sessionToken = await generateSessionToken(key, machineId, lic.expires_at, SERVER_MASTER_SECRET, { v: CONFIG_VERSION });
+  const ephemeralKey = await deriveEphemeralKey(key, machineId, sessionToken, SERVER_MASTER_SECRET);
   return {
     valid: true,
     key,
@@ -1722,10 +1922,11 @@ async function evaluateLicenseForApp(req, env, body, allowBindHwid = true) {
     created_at: lic.activated_at || lic.created_at || nowMs(),
     expires_at: lic.expires_at,
     session_token: sessionToken,
+    ephemeral_key: ephemeralKey,
   };
 }
 
-// ---------- App Endpoints (100% AES-256-GCM + HMAC-SHA256 + Anti-Replay + Anti-Tamper) ----------
+// ---------- App Endpoints (100% AES-256-GCM + HMAC-SHA256 + Anti-Replay + Lớp 4 X-QT-Proof) ----------
 async function handleEncryptedAppEndpoint(req, env, processor) {
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
   let body, nonce, ts;
@@ -1738,12 +1939,12 @@ async function handleEncryptedAppEndpoint(req, env, processor) {
     await logSecurityAlert(env, req, "Lỗi giải mã / chữ ký / replay: " + err.message);
     return json({ valid: false, error: "Lỗi xác thực bảo mật: " + err.message }, 403);
   }
-  const respData = await processor(body);
+  const respData = await processor(body, nonce, ts);
   const encResp = await encryptServerResponse(respData, nonce, ts, SERVER_MASTER_SECRET);
   return json(encResp);
 }
 
-// /activate: Kích hoạt key, CHỈ trả session_token + asset CDN cơ bản (chưa trả API chức năng)
+// /activate: Kích hoạt key, cấp session_token + ephemeral_key Lớp 4 + asset CDN cơ bản
 async function handleActivate(req, env) {
   return handleEncryptedAppEndpoint(req, env, async (body) => {
     const ev = await evaluateLicenseForApp(req, env, body, true);
@@ -1753,13 +1954,14 @@ async function handleActivate(req, env) {
       created_at: ev.created_at,
       expires_at: ev.expires_at,
       session_token: ev.session_token,
+      ephemeral_key: ev.ephemeral_key,
       assets: REMOTE_PUBLIC_ASSETS,
       message: "OK",
     };
   });
 }
 
-// /config & /validate: Check key mỗi khi mở app / thoát ra vào lại / kiểm tra định kỳ
+// /config & /validate: Check key mỗi khi mở app / thoát ra vào lại / kiểm tra định kỳ + cấp khóa phiên Lớp 4
 async function handleConfig(req, env) {
   return handleEncryptedAppEndpoint(req, env, async (body) => {
     const ev = await evaluateLicenseForApp(req, env, body, true);
@@ -1769,18 +1971,24 @@ async function handleConfig(req, env) {
       created_at: ev.created_at,
       expires_at: ev.expires_at,
       session_token: ev.session_token,
+      ephemeral_key: ev.ephemeral_key,
       assets: REMOTE_PUBLIC_ASSETS,
     };
   });
 }
 
-// /feature-auth: GỌI MỖI KHI DÙNG CHỨC NĂNG — Xác thực key trực tiếp trên server rồi mới gửi thông tin Discord xuống RAM!
+// /feature-auth: GỌI MỖI KHI DÙNG CHỨC NĂNG — Kiểm tra Lớp 4 X-QT-Proof + Key trực tiếp rồi chỉ trả đúng chức năng đó!
 async function handleFeatureAuth(req, env) {
-  return handleEncryptedAppEndpoint(req, env, async (body) => {
+  return handleEncryptedAppEndpoint(req, env, async (body, nonce, ts) => {
     const feature = String(body.feature || "").trim().toLowerCase();
     if (!VALID_FEATURES.has(feature)) {
       return { valid: false, error: "Chức năng yêu cầu không hợp lệ." };
     }
+    const l4 = await verifyAppLayer4Proof(req, env, body, nonce, ts, SERVER_MASTER_SECRET);
+    if (!l4.ok) {
+      return { valid: false, cracked: !!l4.cracked, session_expired: !l4.cracked, error: l4.error };
+    }
+
     const ev = await evaluateLicenseForApp(req, env, body, false);
     if (!ev.valid) return ev;
 
@@ -1796,10 +2004,58 @@ async function handleFeatureAuth(req, env) {
       created_at: ev.created_at,
       expires_at: ev.expires_at,
       session_token: ev.session_token,
+      ephemeral_key: ev.ephemeral_key,
       feature_token: ft.token,
       feature_exp: ft.exp,
       config: scopedConfig,
     };
+  });
+}
+
+// /game-asset: Upload ảnh đại diện Fake Game từ Thư viện Ảnh iPhone lên CDN Cloudflare Worker (có kiểm tra Key + Lớp 4)
+async function handleGameAssetUpload(req, env) {
+  return handleEncryptedAppEndpoint(req, env, async (body, nonce, ts) => {
+    const l4 = await verifyAppLayer4Proof(req, env, body, nonce, ts, SERVER_MASTER_SECRET);
+    if (!l4.ok) {
+      return { valid: false, cracked: !!l4.cracked, session_expired: !l4.cracked, error: l4.error };
+    }
+    const ev = await evaluateLicenseForApp(req, env, body, false);
+    if (!ev.valid) return ev;
+
+    const rawB64 = String(body.image_b64 || "").trim();
+    if (!rawB64 || rawB64.length > 600000) {
+      return { valid: false, error: "Ảnh không hợp lệ hoặc vượt quá giới hạn dung lượng (400KB)." };
+    }
+
+    const imgId = (await sha256Hex(rawB64)).slice(0, 28);
+    const kvKey = `IMG:${imgId}`;
+    const existing = await env.APP_DATA.get(kvKey);
+    if (!existing) {
+      await env.APP_DATA.put(kvKey, rawB64, { expirationTtl: 2592000 }); // Cache 30 ngày
+    }
+
+    const origin = new URL(req.url).origin;
+    return {
+      valid: true,
+      image_url: `${origin}/img/${imgId}.jpg`,
+    };
+  });
+}
+
+// GET /img/<id>.jpg: Phục vụ ảnh đại diện Game cho Discord Media Proxy
+async function handleServeGameImage(req, env, pathname) {
+  const match = pathname.match(/^\/img\/([a-f0-9]{16,40})\.(?:jpg|jpeg|png)$/i);
+  if (!match) return new Response("Not found", { status: 404 });
+  const b64 = await env.APP_DATA.get(`IMG:${match[1].toLowerCase()}`);
+  if (!b64) return new Response("Image expired or not found", { status: 404 });
+  const bytes = base64ToUint8(b64);
+  return new Response(bytes, {
+    status: 200,
+    headers: {
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "public, max-age=2592000, immutable",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
 }
 
@@ -1809,9 +2065,13 @@ export default {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
     try {
+      if (req.method === "GET" && url.pathname.startsWith("/img/")) {
+        return await handleServeGameImage(req, env, url.pathname);
+      }
       switch (url.pathname) {
-        case "/":                           return new Response("Quoc Thang Studio — Secure Anti-Crack Server v3", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
+        case "/":                           return new Response("Quoc Thang Studio — Secure Anti-Crack Server v4", { headers: { "Content-Type": "text/plain; charset=utf-8" } });
         case "/admin":                      return await handleAdminPage(req, env);
+        case "/admin/challenge":            return await handleAdminChallenge(req, env);
         case "/admin/auth":                 return await handleAdminAuth(req, env);
         case "/admin/logout":               return await handleAdminLogout(req);
         case "/admin/generate":             return await handleGenerateKey(req, env);
@@ -1828,6 +2088,7 @@ export default {
         case "/validate":                   return await handleConfig(req, env);
         case "/config":                     return await handleConfig(req, env);
         case "/feature-auth":               return await handleFeatureAuth(req, env);
+        case "/game-asset":                 return await handleGameAssetUpload(req, env);
         default:                            return json({ error: "Not found" }, 404);
       }
     } catch (e) {

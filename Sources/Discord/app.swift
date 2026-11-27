@@ -164,15 +164,29 @@ final class SecurityGuard: @unchecked Sendable {
 
     private(set) var isCompromised = false
     private var sessionToken: String? = nil
+    private var ephemeralKey: String? = nil
     private var sessionExp: Double = 0
     private let lock = NSLock()
 
     private init() {}
 
+    var currentSessionToken: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionExp > Date().timeIntervalSince1970 ? sessionToken : nil
+    }
+
+    var currentEphemeralKey: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionExp > Date().timeIntervalSince1970 ? ephemeralKey : nil
+    }
+
     func markCompromised(reason: String) {
         lock.lock()
         isCompromised = true
         sessionToken = nil
+        ephemeralKey = nil
         sessionExp = 0
         lock.unlock()
         AppEndpoints.clear()
@@ -182,6 +196,7 @@ final class SecurityGuard: @unchecked Sendable {
     func clearSession() {
         lock.lock()
         sessionToken = nil
+        ephemeralKey = nil
         sessionExp = 0
         isCompromised = false
         lock.unlock()
@@ -207,8 +222,8 @@ final class SecurityGuard: @unchecked Sendable {
         return Data(base64Encoded: normalized)
     }
 
-    /// Xác thực và lưu Session Token từ server (CHỈ LƯU TRONG RAM)
-    func updateSessionToken(_ token: String) -> Bool {
+    /// Xác thực và lưu Session Token + Khóa động Lớp 4 từ server (CHỈ LƯU TRONG RAM)
+    func updateSessionToken(_ token: String, ephemeralKey newEph: String? = nil) -> Bool {
         let parts = token.components(separatedBy: ".")
         guard parts.count == 2,
               let payloadData = Self.decodeBase64Flexible(parts[0]),
@@ -235,6 +250,9 @@ final class SecurityGuard: @unchecked Sendable {
 
         lock.lock()
         sessionToken = token
+        if let eph = newEph, !eph.isEmpty {
+            ephemeralKey = eph
+        }
         sessionExp = expSec
         isCompromised = false
         lock.unlock()
@@ -294,12 +312,23 @@ final class SecureAPIClient {
         return SymmetricKey(data: hash)
     }
 
-    func sendEncryptedRequest<T: Decodable>(endpoint: String, bodyDict: [String: Any]) async throws -> T {
+    func sendEncryptedRequest<T: Decodable>(endpoint: String, bodyDict: [String: Any], requireLayer4Proof: Bool = false) async throws -> T {
         let ts = String(Int(Date().timeIntervalSince1970))
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
 
+        var finalBody = bodyDict
+        var layer4HeaderProof: String? = nil
+        if requireLayer4Proof {
+            let sTok = SecurityGuard.shared.currentSessionToken ?? ""
+            let ephKey = SecurityGuard.shared.currentEphemeralKey ?? ""
+            finalBody["session_token"] = sTok
+            if !ephKey.isEmpty {
+                layer4HeaderProof = SecureAPIClient.hmacHex("\(endpoint):\(nonce):\(ts):\(MachineID.get())", secret: ephKey)
+            }
+        }
+
         let clientKey = deriveKey(seed: "\(secret):\(nonce):\(ts)")
-        let jsonData = try JSONSerialization.data(withJSONObject: bodyDict)
+        let jsonData = try JSONSerialization.data(withJSONObject: finalBody)
         let sealedBox = try AES.GCM.seal(jsonData, using: clientKey)
         guard let combined = sealedBox.combined else {
             throw NSError(domain: "Security", code: 500, userInfo: [NSLocalizedDescriptionKey: "Encryption error"])
@@ -320,6 +349,9 @@ final class SecureAPIClient {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let proof = layer4HeaderProof {
+            req.setValue(proof, forHTTPHeaderField: "X-QT-Proof")
+        }
         req.httpBody = try JSONSerialization.data(withJSONObject: envelope)
 
         let (data, res) = try await session.data(for: req)
@@ -389,6 +421,7 @@ struct ConfigResponse: Codable {
     let assets: RemoteAssetsDTO?
     let config: RemoteConfigDTO?
     let sessionToken: String?
+    let ephemeralKey: String?
     let error: String?
     let cracked: Bool?
     let expired: Bool?
@@ -398,6 +431,7 @@ struct ConfigResponse: Codable {
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
+        case ephemeralKey = "ephemeral_key"
     }
 }
 
@@ -474,7 +508,22 @@ final class ConfigAPIClient {
                 "machine_id": MachineID.get(),
                 "feature": feature.rawValue,
                 "integrity": report.payload
-            ]
+            ],
+            requireLayer4Proof: true
+        )
+    }
+
+    func uploadGameAsset(key: String, imageBase64: String) async throws -> GameAssetUploadResponse {
+        let report = AppIntegrityAuditor.shared.collectReport()
+        return try await SecureAPIClient.shared.sendEncryptedRequest(
+            endpoint: "/game-asset",
+            bodyDict: [
+                "license_key": key,
+                "machine_id": MachineID.get(),
+                "image_b64": imageBase64,
+                "integrity": report.payload
+            ],
+            requireLayer4Proof: true
         )
     }
 }
@@ -2801,6 +2850,7 @@ struct LicenseActivationResponse: Codable {
     let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
+    let ephemeralKey: String?
     let assets: RemoteAssetsDTO?
     let config: RemoteConfigDTO?
     let message: String?
@@ -2813,6 +2863,7 @@ struct LicenseActivationResponse: Codable {
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
+        case ephemeralKey = "ephemeral_key"
     }
 }
 
@@ -2821,6 +2872,7 @@ struct LicenseValidationResponse: Codable {
     let createdAt: Int64?
     let expiresAt: Int64?
     let sessionToken: String?
+    let ephemeralKey: String?
     let assets: RemoteAssetsDTO?
     let error: String?
     let cracked: Bool?
@@ -2831,6 +2883,7 @@ struct LicenseValidationResponse: Codable {
         case createdAt = "created_at"
         case expiresAt = "expires_at"
         case sessionToken = "session_token"
+        case ephemeralKey = "ephemeral_key"
     }
 }
 
@@ -3013,8 +3066,19 @@ final class LicenseManager: ObservableObject {
             return false
         }
 
+        // Đảm bảo đã hoàn tất bắt tay khóa động Lớp 4 trước khi gọi /feature-auth
+        if SecurityGuard.shared.currentEphemeralKey == nil || !SecurityGuard.shared.verifyExecutionPermit() {
+            await refreshStatus(force: true)
+            guard isUnlocked else { return false }
+        }
+
         do {
-            let res = try await ConfigAPIClient.shared.authorizeFeature(key: key, feature: scope)
+            var res = try await ConfigAPIClient.shared.authorizeFeature(key: key, feature: scope)
+            if res.sessionExpired == true {
+                await refreshStatus(force: true)
+                guard isUnlocked else { return false }
+                res = try await ConfigAPIClient.shared.authorizeFeature(key: key, feature: scope)
+            }
 
             if res.cracked == true {
                 lockForTamper(reason: res.error ?? "Ứng dụng hoặc key không hợp lệ.")
@@ -3043,7 +3107,7 @@ final class LicenseManager: ObservableObject {
             }
 
             if let sTok = res.sessionToken {
-                _ = SecurityGuard.shared.updateSessionToken(sTok)
+                _ = SecurityGuard.shared.updateSessionToken(sTok, ephemeralKey: res.ephemeralKey)
             }
             AppEndpoints.applyCDN(avatars: cfg.cdn_avatars, icons: cfg.cdn_icons)
             RemoteFeatureVault.shared.applyScopedConfig(cfg, feature: scope, featureToken: fTok, featureExp: fExp)
@@ -3105,7 +3169,7 @@ final class LicenseManager: ObservableObject {
                 return status
             }
             if let token = res.sessionToken {
-                _ = SecurityGuard.shared.updateSessionToken(token)
+                _ = SecurityGuard.shared.updateSessionToken(token, ephemeralKey: res.ephemeralKey)
             }
             AppEndpoints.applyAssets(res.assets)
             let exp = Date(timeIntervalSince1970: Double(expMs) / 1000)
@@ -3191,7 +3255,7 @@ final class LicenseManager: ObservableObject {
                 return
             }
 
-            let okTok = SecurityGuard.shared.updateSessionToken(token)
+            let okTok = SecurityGuard.shared.updateSessionToken(token, ephemeralKey: res.ephemeralKey)
             if let ca = res.createdAt {
                 let actDate = Date(timeIntervalSince1970: Double(ca) / 1000)
                 activatedAt = actDate
@@ -3318,6 +3382,7 @@ struct SpamDiscordApp: App {
     @StateObject private var license = LicenseManager.shared
     @StateObject private var voiceRoom = VoiceRoomManager.shared
     @StateObject private var musicStream = MusicStreamManager.shared
+    @StateObject private var fakeGame = FakeGameManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -3334,6 +3399,7 @@ struct SpamDiscordApp: App {
                                 .environmentObject(license)
                                 .environmentObject(voiceRoom)
                                 .environmentObject(musicStream)
+                                .environmentObject(fakeGame)
 
                             if license.isRevalidatingOnResume {
                                 HStack(spacing: 8) {
@@ -3376,6 +3442,9 @@ struct SpamDiscordApp: App {
                     if musicStream.isPlaying {
                         BackgroundManager.shared.start(tag: "music")
                     }
+                    if fakeGame.isRunningStandalone {
+                        BackgroundManager.shared.start(tag: "fakeGame")
+                    }
                     if bot.isNuking {
                         BackgroundManager.shared.start(tag: "botNuke")
                     }
@@ -3384,7 +3453,7 @@ struct SpamDiscordApp: App {
                     }
                     NowPlayingHelper.shared.refreshNowPlaying()
                 case .background, .inactive:
-                    if voiceRoom.isRunning || musicStream.isPlaying || app.isSending || bot.isNuking || userNuke.isNuking || BackgroundManager.shared.isKeepAliveActive {
+                    if voiceRoom.isRunning || musicStream.isPlaying || fakeGame.isRunningStandalone || app.isSending || bot.isNuking || userNuke.isNuking || BackgroundManager.shared.isKeepAliveActive {
                         BackgroundManager.shared.ensureRunning()
                         NowPlayingHelper.shared.refreshNowPlaying()
                     }
@@ -3393,6 +3462,7 @@ struct SpamDiscordApp: App {
                         var activeScopes: Set<FeatureScope> = []
                         if voiceRoom.isRunning { activeScopes.insert(.voice) }
                         if musicStream.isPlaying { activeScopes.insert(.music) }
+                        if fakeGame.isRunningStandalone { activeScopes.insert(.fakeGame) }
                         if app.isSending { activeScopes.insert(.spam) }
                         if bot.isNuking { activeScopes.insert(.botNuke) }
                         if userNuke.isNuking { activeScopes.insert(.userNuke) }
@@ -3409,6 +3479,7 @@ struct SpamDiscordApp: App {
                     userNuke.stop()
                     voiceRoom.stopTreo()
                     musicStream.stop()
+                    fakeGame.stopStandalone()
                     BackgroundManager.shared.stopAll()
                     NowPlayingHelper.shared.stop()
                 }
@@ -4119,10 +4190,12 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
     @Published var isVoiceUDPReady = false
     @Published var isFakeCamActive = false
     @Published var isGoLiveActive = false
+    @Published var isFakeGameActive = false
     @Published var premiumType: Int = 0
     @Published var streamProfile: DiscordStreamProfile = DiscordStreamProfile.forPremiumType(0)
     @Published var pingMs: Int = 0
     @Published var lastLog = ""
+    private var customGameActivity: [String: Any]? = nil
 
     private var wsTask: URLSessionWebSocketTask?
     private var voiceWsTask: URLSessionWebSocketTask?
@@ -4331,6 +4404,9 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 DispatchQueue.main.async { self.isConnected = true }
                 log("Đã kết nối Gateway! Đang vào Voice Channel...")
                 sendVoiceStateUpdate()
+                if customGameActivity != nil {
+                    sendPresenceUpdate()
+                }
             } else if event == "VOICE_STATE_UPDATE" {
                 if let d = json["d"] as? [String: Any],
                    let uid = d["user_id"] as? String {
@@ -4427,6 +4503,7 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
         guard let ws = wsTask else { return }
         let props = RemoteFeatureVault.shared.gatewayIdentifyProperties(scope: scope)
         guard !props.isEmpty else { return }
+        let acts: [[String: Any]] = customGameActivity.map { [$0] } ?? []
         let payload: [String: Any] = [
             "op": 2,
             "d": [
@@ -4437,9 +4514,35 @@ final class VoiceGatewaySession: NSObject, Identifiable, ObservableObject, URLSe
                 "presence": [
                     "status": "online",
                     "since": 0,
-                    "activities": [],
+                    "activities": acts,
                     "afk": false
                 ]
+            ]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           let str = String(data: data, encoding: .utf8) {
+            Task { try? await ws.send(.string(str)) }
+        }
+    }
+
+    func setCustomGameActivity(_ activity: [String: Any]?) {
+        self.customGameActivity = activity
+        DispatchQueue.main.async {
+            self.isFakeGameActive = (activity != nil)
+        }
+        sendPresenceUpdate()
+    }
+
+    private func sendPresenceUpdate() {
+        guard let ws = wsTask else { return }
+        let acts: [[String: Any]] = customGameActivity.map { [$0] } ?? []
+        let payload: [String: Any] = [
+            "op": 3,
+            "d": [
+                "since": 0,
+                "activities": acts,
+                "status": "online",
+                "afk": false
             ]
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload),
@@ -5556,6 +5659,11 @@ final class VoiceRoomManager: ObservableObject {
         guard let src = media, !src.isVirtualPattern, !src.isAudioOnly, let url = src.url else {
             return
         }
+        if src.isStaticImage {
+            if forStream { self.streamCacheStatus = .directPassthrough }
+            else { self.camCacheStatus = .directPassthrough }
+            return
+        }
 
         let prof = forStream ? activeProfile : camProfile(from: activeProfile)
         let targetId = src.id
@@ -5655,30 +5763,39 @@ final class VoiceRoomManager: ObservableObject {
         }
 
         let ext = finalURL.pathExtension.lowercased()
+        let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif", "bmp"]
         let audioExts: Set<String> = ["mp3", "m4a", "wav", "flac", "aac", "ogg", "caf"]
-        let asset = AVURLAsset(url: finalURL)
-        let hasVideoTrack = !asset.tracks(withMediaType: .video).isEmpty
-        let isAudioOnly = audioExts.contains(ext) || !hasVideoTrack
+        let isStaticImage = imageExts.contains(ext)
+        let hasVideoTrack: Bool
+        if isStaticImage || audioExts.contains(ext) {
+            hasVideoTrack = false
+        } else {
+            let asset = AVURLAsset(url: finalURL)
+            hasVideoTrack = !asset.tracks(withMediaType: .video).isEmpty
+        }
+        let isAudioOnly = !isStaticImage && (audioExts.contains(ext) || !hasVideoTrack)
 
         let source = TreoMediaSource(
             id: UUID(),
             title: url.lastPathComponent,
             url: finalURL,
             isAudioOnly: isAudioOnly,
-            isVirtualPattern: false
+            isVirtualPattern: false,
+            isStaticImage: isStaticImage
         )
 
+        let mediaKindLabel = isStaticImage ? " (Ảnh HD → 0% GPU)" : (isAudioOnly ? " (Audio → Màn đen)" : "")
         if forStream {
             self.streamMedia = source
             self.isStreamEnabled = true
-            addLog("📺 Đã nạp file Stream: \(source.title)\(isAudioOnly ? " (Audio → Màn đen)" : "")")
+            addLog("📺 Đã nạp Stream: \(source.title)\(mediaKindLabel)")
             prepareBackgroundCache(forStream: true)
             if isRunning { reconcileStream() }
         } else {
             self.camMedia = source
             self.isCamEnabled = true
             self.selfVideo = true
-            addLog("🎥 Đã nạp file Fake Cam: \(source.title)\(isAudioOnly ? " (Audio → Màn đen)" : "")")
+            addLog("🎥 Đã nạp Fake Cam: \(source.title)\(mediaKindLabel)")
             prepareBackgroundCache(forStream: false)
             if isRunning { reconcileCam() }
         }
@@ -5930,6 +6047,10 @@ final class VoiceRoomManager: ObservableObject {
             }
             for (idx, session) in newSessions.enumerated() {
                 if Task.isCancelled || !self.isRunning { break }
+                if FakeGameManager.shared.enabledInTreoRoom {
+                    let act = await FakeGameManager.shared.buildActivityPayload(scope: .voice, token: session.token, resetStartTime: idx == 0)
+                    session.setCustomGameActivity(act)
+                }
                 session.start(
                     guildId: guildId,
                     channelId: channelId,
@@ -6447,8 +6568,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
 
             var createdSessions: [VoiceGatewaySession] = []
-            for token in tokensToUse {
+            let parallelGameOn = await MainActor.run { FakeGameManager.shared.enabledInMusicStream }
+            for (idx, token) in tokensToUse.enumerated() {
                 let session = VoiceGatewaySession(tokenInfo: token, scope: .music)
+                if parallelGameOn {
+                    let act = await FakeGameManager.shared.buildActivityPayload(scope: .music, token: token.token, resetStartTime: idx == 0)
+                    session.setCustomGameActivity(act)
+                }
                 session.onLog = { [weak self] msg in
                     DispatchQueue.main.async {
                         self?.addLog(msg)
@@ -6796,6 +6922,8 @@ struct VoiceRoomTabView: View {
     @State private var showDocumentPicker = false
     @State private var showStreamMediaPicker = false
     @State private var showCamMediaPicker = false
+    @State private var showStreamPhotoPicker = false
+    @State private var showCamPhotoPicker = false
     @State private var copiedMusicLog = false
     @State private var copiedRoomLog = false
     @State private var pulseLive = false
@@ -6865,12 +6993,22 @@ struct VoiceRoomTabView: View {
                 }
             }
             .sheet(isPresented: $showStreamMediaPicker) {
-                DocumentPicker(contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .audio], allowsMultipleSelection: false) { url in
+                DocumentPicker(contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .image, .audio], allowsMultipleSelection: false) { url in
                     voiceRoom.pickMediaFile(url: url, forStream: true)
                 }
             }
             .sheet(isPresented: $showCamMediaPicker) {
-                DocumentPicker(contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .audio], allowsMultipleSelection: false) { url in
+                DocumentPicker(contentTypes: [.movie, .video, .mpeg4Movie, .quickTimeMovie, .image, .audio], allowsMultipleSelection: false) { url in
+                    voiceRoom.pickMediaFile(url: url, forStream: false)
+                }
+            }
+            .sheet(isPresented: $showStreamPhotoPicker) {
+                PhotoLibraryPicker(filterMode: .imagesAndVideos) { url, _ in
+                    voiceRoom.pickMediaFile(url: url, forStream: true)
+                }
+            }
+            .sheet(isPresented: $showCamPhotoPicker) {
+                PhotoLibraryPicker(filterMode: .imagesAndVideos) { url, _ in
                     voiceRoom.pickMediaFile(url: url, forStream: false)
                 }
             }
@@ -7156,6 +7294,7 @@ struct VoiceRoomTabView: View {
             tokenAndChannelCard
             playlistQueueCard
             combatEffectsCard
+            ParallelFakeGameDeckCard(isForMusic: true)
             mainActionCard
             battleLogsCard
         }
@@ -7922,6 +8061,7 @@ struct VoiceRoomTabView: View {
             treoConfigCard
             treoGoLiveCard
             treoFakeCamCard
+            ParallelFakeGameDeckCard(isForMusic: false)
             treoActionButton
             treoSessionsCard
             treoLogsCard
@@ -8224,7 +8364,7 @@ struct VoiceRoomTabView: View {
                             .font(.system(size: 16, weight: .bold, design: .rounded))
                         microBadge(isLiveActive ? "● ĐANG LIVE" : "LOOP ∞", bg: isLiveActive ? .red : Color.red.opacity(0.14), fg: isLiveActive ? .white : .red)
                     }
-                    Text("Video .mp4/.mov (0% GPU nền) hoặc .mp3")
+                    Text("Video / Ảnh từ App Ảnh (0% GPU nền) hoặc .mp3")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -8241,7 +8381,7 @@ struct VoiceRoomTabView: View {
             if let media = voiceRoom.streamMedia {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 10) {
-                        Image(systemName: media.isAudioOnly ? "music.note" : "film.fill")
+                        Image(systemName: media.isStaticImage ? "photo.fill" : (media.isAudioOnly ? "music.note" : "film.fill"))
                             .font(.system(size: 14, weight: .bold))
                             .foregroundColor(.red)
                             .frame(width: 30, height: 30)
@@ -8252,7 +8392,7 @@ struct VoiceRoomTabView: View {
                             Text(media.title)
                                 .font(.caption.bold())
                                 .lineLimit(1)
-                            Text(media.isAudioOnly ? "Chế độ Nhạc + Màn hình đen" : "Full Video Loop ∞ • Chạy nền 0% GPU")
+                            Text(media.isStaticImage ? "Ảnh HD Loop ∞ • Chạy nền 0% GPU" : (media.isAudioOnly ? "Chế độ Nhạc + Màn hình đen" : "Full Video Loop ∞ • Chạy nền 0% GPU"))
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
@@ -8280,16 +8420,31 @@ struct VoiceRoomTabView: View {
                     .padding(.vertical, 2)
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
+                Button {
+                    showStreamPhotoPicker = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                        Text("App Ảnh")
+                    }
+                    .font(.caption.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(LinearGradient(colors: [.red, .orange], startPoint: .leading, endPoint: .trailing))
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+
                 Button {
                     showStreamMediaPicker = true
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "folder.badge.plus")
-                        Text("Chọn Video / MP3")
+                        Text("Tệp")
                     }
                     .font(.caption.bold())
-                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 12)
                     .padding(.vertical, 9)
                     .background(Color.red.opacity(0.14))
                     .foregroundColor(.red)
@@ -8355,7 +8510,7 @@ struct VoiceRoomTabView: View {
             if let media = voiceRoom.camMedia {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 10) {
-                        Image(systemName: "camera.fill")
+                        Image(systemName: media.isStaticImage ? "photo.fill" : "camera.fill")
                             .font(.system(size: 14, weight: .bold))
                             .foregroundColor(.purple)
                             .frame(width: 30, height: 30)
@@ -8366,7 +8521,7 @@ struct VoiceRoomTabView: View {
                             Text(media.title)
                                 .font(.caption.bold())
                                 .lineLimit(1)
-                            Text("Camera Ảo Full Video Loop ∞ • Chạy nền 0% GPU")
+                            Text(media.isStaticImage ? "Camera Ảo Ảnh HD Loop ∞ • Chạy nền 0% GPU" : "Camera Ảo Full Video Loop ∞ • Chạy nền 0% GPU")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
@@ -8394,16 +8549,31 @@ struct VoiceRoomTabView: View {
                     .padding(.vertical, 2)
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
+                Button {
+                    showCamPhotoPicker = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                        Text("App Ảnh")
+                    }
+                    .font(.caption.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(LinearGradient(colors: [.purple, .pink], startPoint: .leading, endPoint: .trailing))
+                    .foregroundColor(.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                }
+
                 Button {
                     showCamMediaPicker = true
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "folder.badge.plus")
-                        Text("Chọn Video Cam")
+                        Text("Tệp")
                     }
                     .font(.caption.bold())
-                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 12)
                     .padding(.vertical, 9)
                     .background(Color.purple.opacity(0.14))
                     .foregroundColor(.purple)
@@ -8553,6 +8723,9 @@ struct VoiceRoomTabView: View {
                                         }
                                         if s.isFakeCamActive {
                                             microBadge("CAM", bg: .purple)
+                                        }
+                                        if s.isFakeGameActive {
+                                            microBadge("GAME", bg: .green)
                                         }
                                     }
                                     Text(s.lastLog.isEmpty ? (s.isJoined ? "Đang trong phòng" : "Đang kết nối...") : s.lastLog)

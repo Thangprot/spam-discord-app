@@ -12,37 +12,44 @@ struct MainTabView: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            TabView(selection: $selectedTab) {
+            ZStack {
                 SpamView()
-                    .tabItem { Label("Spam", systemImage: "paperplane.fill") }
-                    .tag(0)
+                    .opacity(selectedTab == 0 ? 1 : 0)
+                    .allowsHitTesting(selectedTab == 0)
 
                 TokenListView()
-                    .tabItem { Label("Tokens", systemImage: "person.2.fill") }
-                    .tag(1)
+                    .opacity(selectedTab == 1 ? 1 : 0)
+                    .allowsHitTesting(selectedTab == 1)
 
                 VoiceRoomTabView()
-                    .tabItem { Label("Treo Voice", systemImage: "waveform.circle.fill") }
-                    .tag(2)
+                    .opacity(selectedTab == 2 ? 1 : 0)
+                    .allowsHitTesting(selectedTab == 2)
+
+                FakeGameTabView()
+                    .opacity(selectedTab == 3 ? 1 : 0)
+                    .allowsHitTesting(selectedTab == 3)
 
                 NukeTabView()
-                    .tabItem { Label("Nuke", systemImage: "flame.fill") }
-                    .tag(3)
+                    .opacity(selectedTab == 4 ? 1 : 0)
+                    .allowsHitTesting(selectedTab == 4)
 
                 AboutView()
-                    .tabItem { Label("Info", systemImage: "sparkles") }
-                    .tag(4)
+                    .opacity(selectedTab == 5 ? 1 : 0)
+                    .allowsHitTesting(selectedTab == 5)
             }
-            .tint(.indigo)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            LiveNowPlayingBar(nowPlaying: nowPlaying) { targetTab in
-                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                    selectedTab = targetTab
+            VStack(spacing: 0) {
+                LiveNowPlayingBar(nowPlaying: nowPlaying) { targetTab in
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                        selectedTab = targetTab
+                    }
                 }
+                .animation(.spring(response: 0.35, dampingFraction: 0.82), value: nowPlaying.currentSession?.feature)
+
+                ModernBottomTabBar(selectedTab: $selectedTab)
             }
-            .padding(.bottom, 52)
             .ignoresSafeArea(.keyboard, edges: .bottom)
-            .animation(.spring(response: 0.35, dampingFraction: 0.82), value: nowPlaying.currentSession?.feature)
         }
     }
 }
@@ -634,6 +641,7 @@ struct AboutView: View {
                     .foregroundStyle(.secondary)
                 nowPlayingLegendRow(icon: "flame.fill", color: .red, feature: "Xả Nhạc VIP", desc: "⏸ Câm/Sủa • ◀◀/▶▶ Đổi bài • Kéo thanh tua")
                 nowPlayingLegendRow(icon: "waveform", color: .indigo, feature: "Treo Voice", desc: "⏸ Tắt/Mở Mic • ◀◀ Bật/Tắt Cam • ▶▶ Go Live")
+                nowPlayingLegendRow(icon: "gamecontroller.fill", color: .green, feature: "Fake Game 24/7", desc: "⏸ Ẩn/Hiện Game • ◀◀/▶▶ Đổi Game mẫu")
                 nowPlayingLegendRow(icon: "paperplane.fill", color: .blue, feature: "Spam Tin Nhắn", desc: "⏸ Tạm dừng/Tiếp tục • ◀◀/▶▶ Chỉnh tốc độ")
                 nowPlayingLegendRow(icon: "bolt.shield.fill", color: .orange, feature: "Bot / User Nuke", desc: "Thanh tiến độ 0–100% • ⏸ Dừng tác vụ")
             }
