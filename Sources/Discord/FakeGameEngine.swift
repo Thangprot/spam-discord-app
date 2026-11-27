@@ -115,27 +115,385 @@ struct PhotoLibraryPicker: UIViewControllerRepresentable {
 }
 
 // ==============================================================================
-// MARK: - FAKE GAME MODELS & PRESETS (CHỌN TÊN + ẢNH TỪ APP ẢNH / LINK / MẪU)
+// MARK: - FAKE GAME MODELS & PRESETS (CÓ SẴN ID CHUẨN DISCORD + ẢNH GỐC CHÍNH CHỦ)
 // ==============================================================================
 
 struct FakeGamePreset: Identifiable, Equatable {
     let id: String
     let name: String
+    let discordAppId: String      // ID chuẩn trong kho Detectable Games của Discord ("" = Custom RPC trung lập, không mở nhầm Roblox)
+    let discordIconHash: String   // Mã icon gốc trên CDN Discord (mp:app-icons/{id}/{hash}.png)
+    let externalIconURL: String   // Ảnh gốc 512x512 HD cho các tựa game Mobile (Liên Quân, Tốc Chiến, Free Fire...)
+    let aliases: [String]
     let details: String
     let state: String
     let symbol: String
     let c1: UIColor
     let c2: UIColor
 
+    /// Đường dẫn tài nguyên nội bộ `mp:app-icons/...` chuẩn của Discord (hiển thị tức thì 0ms, nét căng 512px)
+    var nativeDiscordAssetPath: String {
+        guard !discordAppId.isEmpty, !discordIconHash.isEmpty else { return "" }
+        return "mp:app-icons/\(discordAppId)/\(discordIconHash).png"
+    }
+
+    /// URL ảnh đại diện có sẵn để hiển thị trực tiếp ngay trong giao diện App iOS
+    var previewArtworkURL: URL? {
+        if !discordAppId.isEmpty, !discordIconHash.isEmpty, !AppEndpoints.cdnAppIcons.isEmpty {
+            return URL(string: "\(AppEndpoints.cdnAppIcons)/\(discordAppId)/\(discordIconHash).png?size=512")
+        }
+        if !externalIconURL.isEmpty {
+            return URL(string: externalIconURL)
+        }
+        return nil
+    }
+
+    func matchesName(_ raw: String) -> Bool {
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return false }
+        if name.lowercased() == q { return true }
+        return aliases.contains { $0.lowercased() == q }
+    }
+
     static let all: [FakeGamePreset] = [
-        FakeGamePreset(id: "lqmb", name: "Arena of Valor", details: "Đấu Xếp Hạng • Chiến Tướng", state: "Trong trận (5v5)", symbol: "shield.lefthalf.filled", c1: UIColor(red: 0.90, green: 0.56, blue: 0.10, alpha: 1), c2: UIColor(red: 0.72, green: 0.16, blue: 0.18, alpha: 1)),
-        FakeGamePreset(id: "lol", name: "League of Legends", details: "Summoner's Rift (Ranked)", state: "Thách Đấu • 1,250 LP", symbol: "crown.fill", c1: UIColor(red: 0.08, green: 0.52, blue: 0.78, alpha: 1), c2: UIColor(red: 0.76, green: 0.60, blue: 0.20, alpha: 1)),
-        FakeGamePreset(id: "valorant", name: "VALORANT", details: "Competitive • Ascent", state: "Radiant • 11 - 7", symbol: "scope", c1: UIColor(red: 0.98, green: 0.24, blue: 0.34, alpha: 1), c2: UIColor(red: 0.12, green: 0.16, blue: 0.24, alpha: 1)),
-        FakeGamePreset(id: "wukong", name: "Black Myth: Wukong", details: "Chapter VI • Mount Huaguo", state: "Đang khiêu chiến Boss", symbol: "flame.fill", c1: UIColor(red: 0.82, green: 0.44, blue: 0.12, alpha: 1), c2: UIColor(red: 0.14, green: 0.12, blue: 0.12, alpha: 1)),
-        FakeGamePreset(id: "genshin", name: "Genshin Impact", details: "Natlan • AR 60", state: "La Hoàn Thâm Cảnh Tầng 12", symbol: "sparkles", c1: UIColor(red: 0.28, green: 0.58, blue: 0.96, alpha: 1), c2: UIColor(red: 0.56, green: 0.32, blue: 0.94, alpha: 1)),
-        FakeGamePreset(id: "gtavi", name: "Grand Theft Auto VI", details: "Vice City • Online", state: "Free Roam", symbol: "car.fill", c1: UIColor(red: 0.96, green: 0.28, blue: 0.66, alpha: 1), c2: UIColor(red: 0.98, green: 0.58, blue: 0.18, alpha: 1)),
-        FakeGamePreset(id: "pubg", name: "PUBG: BATTLEGROUNDS", details: "Erangel • Squad TPP", state: "Còn lại 8/100", symbol: "target", c1: UIColor(red: 0.92, green: 0.64, blue: 0.12, alpha: 1), c2: UIColor(red: 0.22, green: 0.24, blue: 0.20, alpha: 1)),
-        FakeGamePreset(id: "mc", name: "Minecraft", details: "Hardcore Survival", state: "Day 1,000", symbol: "cube.fill", c1: UIColor(red: 0.18, green: 0.72, blue: 0.34, alpha: 1), c2: UIColor(red: 0.36, green: 0.26, blue: 0.16, alpha: 1))
+        FakeGamePreset(
+            id: "lqmb",
+            name: "Arena of Valor",
+            discordAppId: "",
+            discordIconHash: "",
+            externalIconURL: "https://is1-ssl.mzstatic.com/image/thumb/Purple211/v4/3f/db/83/3fdb836a-2012-28e5-ef34-45ff04c15708/AppIcon-1x_U007emarketing-0-11-0-85-220-0.png/512x512bb.jpg",
+            aliases: ["lien quan", "liên quân", "lien quan mobile", "liên quân mobile", "garena liên quân mobile", "lqmb", "aov"],
+            details: "Đấu Xếp Hạng • Chiến Tướng",
+            state: "Trong trận (5v5)",
+            symbol: "shield.lefthalf.filled",
+            c1: UIColor(red: 0.90, green: 0.56, blue: 0.10, alpha: 1),
+            c2: UIColor(red: 0.72, green: 0.16, blue: 0.18, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "lol",
+            name: "League of Legends",
+            discordAppId: "1402418696126992445",
+            discordIconHash: "7c99428541032ac02ec6981d88b78fb7",
+            externalIconURL: "",
+            aliases: ["lol", "lmht", "lien minh", "liên minh", "liên minh huyền thoại"],
+            details: "Summoner's Rift (Ranked)",
+            state: "Thách Đấu • 1,250 LP",
+            symbol: "crown.fill",
+            c1: UIColor(red: 0.08, green: 0.52, blue: 0.78, alpha: 1),
+            c2: UIColor(red: 0.76, green: 0.60, blue: 0.20, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "valorant",
+            name: "VALORANT",
+            discordAppId: "700136079562375258",
+            discordIconHash: "11f81959f4fdd76ca6c39c59eac256c1",
+            externalIconURL: "",
+            aliases: ["valo"],
+            details: "Competitive • Ascent",
+            state: "Radiant • 11 - 7",
+            symbol: "scope",
+            c1: UIColor(red: 0.98, green: 0.24, blue: 0.34, alpha: 1),
+            c2: UIColor(red: 0.12, green: 0.16, blue: 0.24, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "tft",
+            name: "Teamfight Tactics",
+            discordAppId: "1544195652903247973",
+            discordIconHash: "d3565d3ac6d570e99928b1a3f1c02d04",
+            externalIconURL: "",
+            aliases: ["tft", "dtcl", "đấu trường chân lý", "dau truong chan ly"],
+            details: "Xếp Hạng • Thách Đấu",
+            state: "Vòng 5-2 • Top 1 (88 HP)",
+            symbol: "checkerboard.shield",
+            c1: UIColor(red: 0.95, green: 0.65, blue: 0.18, alpha: 1),
+            c2: UIColor(red: 0.34, green: 0.22, blue: 0.72, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "genshin",
+            name: "Genshin Impact",
+            discordAppId: "762434991303950386",
+            discordIconHash: "0a7cc00267310bf4afdd78b175a7aeea",
+            externalIconURL: "",
+            aliases: ["genshin"],
+            details: "Natlan • AR 60",
+            state: "La Hoàn Thâm Cảnh Tầng 12",
+            symbol: "sparkles",
+            c1: UIColor(red: 0.28, green: 0.58, blue: 0.96, alpha: 1),
+            c2: UIColor(red: 0.56, green: 0.32, blue: 0.94, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "wukong",
+            name: "Black Myth: Wukong",
+            discordAppId: "1272842103910699040",
+            discordIconHash: "908f3f31004652e1971c6e8a4b9d7c30",
+            externalIconURL: "",
+            aliases: ["wukong", "black myth", "ngo khong", "ngộ không"],
+            details: "Chapter VI • Mount Huaguo",
+            state: "Đang khiêu chiến Boss",
+            symbol: "flame.fill",
+            c1: UIColor(red: 0.82, green: 0.44, blue: 0.12, alpha: 1),
+            c2: UIColor(red: 0.14, green: 0.12, blue: 0.12, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "cs2",
+            name: "Counter-Strike 2",
+            discordAppId: "1158877933042143272",
+            discordIconHash: "558f5a26ecb3b17c3dea3d15c1df537a",
+            externalIconURL: "",
+            aliases: ["cs2", "csgo", "counter strike"],
+            details: "Premier Competitive • Mirage",
+            state: "26,450 CS Rating • 12 - 8",
+            symbol: "burst.fill",
+            c1: UIColor(red: 0.96, green: 0.62, blue: 0.08, alpha: 1),
+            c2: UIColor(red: 0.16, green: 0.22, blue: 0.34, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "pubg",
+            name: "PUBG: BATTLEGROUNDS",
+            discordAppId: "1402418717781921935",
+            discordIconHash: "9d616d0c960ff87c3bc6beb9475362f5",
+            externalIconURL: "",
+            aliases: ["pubg"],
+            details: "Erangel • Squad FPP",
+            state: "Còn lại 8/100",
+            symbol: "target",
+            c1: UIColor(red: 0.92, green: 0.64, blue: 0.12, alpha: 1),
+            c2: UIColor(red: 0.22, green: 0.24, blue: 0.20, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "gtavi",
+            name: "Grand Theft Auto VI",
+            discordAppId: "1445160676522856458",
+            discordIconHash: "251322eb2a778edc62ecce8d791e3701",
+            externalIconURL: "",
+            aliases: ["gta 6", "gta vi", "gtavi"],
+            details: "Vice City • Leonida",
+            state: "Story Mode",
+            symbol: "car.fill",
+            c1: UIColor(red: 0.96, green: 0.28, blue: 0.66, alpha: 1),
+            c2: UIColor(red: 0.98, green: 0.58, blue: 0.18, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "gtav",
+            name: "Grand Theft Auto V Enhanced",
+            discordAppId: "1421192030440263791",
+            discordIconHash: "419a062fd532ffb5abff6ea227d7c003",
+            externalIconURL: "",
+            aliases: ["gta 5", "gta v", "gtav", "grand theft auto v"],
+            details: "Los Santos • GTA Online",
+            state: "Heist Finale",
+            symbol: "dollarsign.circle.fill",
+            c1: UIColor(red: 0.22, green: 0.72, blue: 0.36, alpha: 1),
+            c2: UIColor(red: 0.12, green: 0.18, blue: 0.14, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "hsr",
+            name: "Honkai: Star Rail",
+            discordAppId: "1121201675240210523",
+            discordIconHash: "444d067889922e42b0af99b13e5d5c72",
+            externalIconURL: "",
+            aliases: ["hsr", "honkai", "star rail"],
+            details: "Amphoreus • Trailblaze Lv.70",
+            state: "Hồi Ức Hỗn Độn Tầng 12",
+            symbol: "moon.stars.fill",
+            c1: UIColor(red: 0.34, green: 0.42, blue: 0.95, alpha: 1),
+            c2: UIColor(red: 0.76, green: 0.54, blue: 0.24, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "wuwa",
+            name: "Wuthering Waves",
+            discordAppId: "1247227126416146462",
+            discordIconHash: "1e7d7e9ca69ea0951467994c581f70f5",
+            externalIconURL: "",
+            aliases: ["wuwa", "wuthering"],
+            details: "Rinascita • UL 80",
+            state: "Tower of Adversity",
+            symbol: "waveform.path.ecg",
+            c1: UIColor(red: 0.14, green: 0.68, blue: 0.76, alpha: 1),
+            c2: UIColor(red: 0.10, green: 0.14, blue: 0.22, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "zzz",
+            name: "Zenless Zone Zero",
+            discordAppId: "1257819671114289184",
+            discordIconHash: "fb528a20677f93d8f365fac88e3f0713",
+            externalIconURL: "",
+            aliases: ["zzz", "zenless"],
+            details: "New Eridu • Inter-Knot Lv.60",
+            state: "Hollow Zero",
+            symbol: "bolt.circle.fill",
+            c1: UIColor(red: 0.96, green: 0.52, blue: 0.12, alpha: 1),
+            c2: UIColor(red: 0.15, green: 0.15, blue: 0.18, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "mc",
+            name: "Minecraft",
+            discordAppId: "1402418491272986635",
+            discordIconHash: "166fbad351ecdd02d11a3b464748f66b",
+            externalIconURL: "",
+            aliases: ["mc"],
+            details: "Hardcore Survival",
+            state: "Day 1,000",
+            symbol: "cube.fill",
+            c1: UIColor(red: 0.18, green: 0.72, blue: 0.34, alpha: 1),
+            c2: UIColor(red: 0.36, green: 0.26, blue: 0.16, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "fc26",
+            name: "EA Sports FC 26",
+            discordAppId: "1421154726023532544",
+            discordIconHash: "e9cd3aff85473f6d4e19ba9bf1b443f7",
+            externalIconURL: "",
+            aliases: ["fc 26", "fifa", "fc online", "fco"],
+            details: "Ultimate Team • Champions",
+            state: "Hiệp 2 • 3 - 1",
+            symbol: "soccerball",
+            c1: UIColor(red: 0.10, green: 0.82, blue: 0.46, alpha: 1),
+            c2: UIColor(red: 0.08, green: 0.12, blue: 0.18, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "naraka",
+            name: "NARAKA: BLADEPOINT",
+            discordAppId: "1126956844993232987",
+            discordIconHash: "bbd66a8e473704cbbbab872127f08254",
+            externalIconURL: "",
+            aliases: ["naraka"],
+            details: "The Herald's Trial • Asura",
+            state: "Ranked Trios",
+            symbol: "wind",
+            c1: UIColor(red: 0.86, green: 0.18, blue: 0.24, alpha: 1),
+            c2: UIColor(red: 0.16, green: 0.12, blue: 0.14, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "marvel",
+            name: "Marvel Rivals",
+            discordAppId: "1314395942253756416",
+            discordIconHash: "2dd7882b887306ab5afad03452869ad8",
+            externalIconURL: "",
+            aliases: ["rivals"],
+            details: "Competitive • One Above All",
+            state: "Tokyo 2099 • Convoy",
+            symbol: "bolt.shield.fill",
+            c1: UIColor(red: 0.92, green: 0.20, blue: 0.26, alpha: 1),
+            c2: UIColor(red: 0.18, green: 0.28, blue: 0.68, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "eldenring",
+            name: "ELDEN RING",
+            discordAppId: "1402418436809953330",
+            discordIconHash: "28c674e1de18e7a100a44559d64a55b8",
+            externalIconURL: "",
+            aliases: ["elden ring"],
+            details: "Shadow of the Erdtree",
+            state: "Enir-Ilim • NG+7",
+            symbol: "sun.max.circle.fill",
+            c1: UIColor(red: 0.84, green: 0.68, blue: 0.24, alpha: 1),
+            c2: UIColor(red: 0.14, green: 0.16, blue: 0.12, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "playtogether",
+            name: "Play Together",
+            discordAppId: "1330084319661920308",
+            discordIconHash: "1e6b320419cdfb44fad8c22293afe035",
+            externalIconURL: "",
+            aliases: ["play together vng"],
+            details: "Đảo Kaia • Plaza",
+            state: "Đang câu cá hiếm",
+            symbol: "figure.socialdance",
+            c1: UIColor(red: 0.24, green: 0.74, blue: 0.98, alpha: 1),
+            c2: UIColor(red: 0.98, green: 0.52, blue: 0.72, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "freefire",
+            name: "Free Fire",
+            discordAppId: "1441993244895477830",
+            discordIconHash: "",
+            externalIconURL: "https://is1-ssl.mzstatic.com/image/thumb/Purple211/v4/ef/16/6b/ef166bba-1d69-85f5-ed84-6b7c6e73b55c/AppIcon-1788350393-0-0-1x_U007emarketing-0-8-0-85-220.png/512x512bb.jpg",
+            aliases: ["ff", "garena free fire"],
+            details: "Tử Chiến Xếp Hạng • Đại Kiện Tướng",
+            state: "Đảo Quân Sự • Booyah!",
+            symbol: "flame.circle.fill",
+            c1: UIColor(red: 0.98, green: 0.46, blue: 0.08, alpha: 1),
+            c2: UIColor(red: 0.78, green: 0.12, blue: 0.14, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "mlbb",
+            name: "Mobile Legends: Bang Bang",
+            discordAppId: "1441992389232165056",
+            discordIconHash: "",
+            externalIconURL: "https://is1-ssl.mzstatic.com/image/thumb/Purple221/v4/4a/38/b0/4a38b030-ac2f-170e-73fa-60a5232b9c1a/AppIcon-0-0-1x_U007emarketing-0-7-0-85-220.png/512x512bb.jpg",
+            aliases: ["mlbb", "mobile legends"],
+            details: "Mythical Immortal • Ranked",
+            state: "Land of Dawn (5v5)",
+            symbol: "sparkles.rectangle.stack.fill",
+            c1: UIColor(red: 0.22, green: 0.48, blue: 0.94, alpha: 1),
+            c2: UIColor(red: 0.86, green: 0.66, blue: 0.18, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "wildrift",
+            name: "LMHT: Tốc Chiến",
+            discordAppId: "",
+            discordIconHash: "",
+            externalIconURL: "https://is1-ssl.mzstatic.com/image/thumb/Purple211/v4/2d/ae/a3/2daea374-791c-2d94-8662-33b0aaf2a944/AppIcon-0-0-1x_U007emarketing-0-8-0-85-220.png/512x512bb.jpg",
+            aliases: ["toc chien", "tốc chiến", "wild rift", "league of legends: wild rift"],
+            details: "Xếp Hạng Huyền Thoại • Thách Đấu",
+            state: "Trong trận (5v5)",
+            symbol: "bolt.horizontal.circle.fill",
+            c1: UIColor(red: 0.12, green: 0.66, blue: 0.98, alpha: 1),
+            c2: UIColor(red: 0.14, green: 0.24, blue: 0.64, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "audition",
+            name: "Audition Online",
+            discordAppId: "1441994911107907585",
+            discordIconHash: "60e9ce4d9f59659f11899af5760fc98a",
+            externalIconURL: "",
+            aliases: ["au", "audition"],
+            details: "Choreography 4K • 188 BPM",
+            state: "Perfect x24",
+            symbol: "music.quarternote.3",
+            c1: UIColor(red: 0.96, green: 0.30, blue: 0.68, alpha: 1),
+            c2: UIColor(red: 0.56, green: 0.22, blue: 0.88, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "cf",
+            name: "Crossfire",
+            discordAppId: "1402416706776989886",
+            discordIconHash: "89bc82482d4f321ab8fae27247d54949",
+            externalIconURL: "",
+            aliases: ["dot kich", "đột kích", "cf"],
+            details: "Đặt Bom C4 • Trạm Phát Sóng",
+            state: "Xếp Hạng • Tổng Tư Lệnh",
+            symbol: "scope",
+            c1: UIColor(red: 0.88, green: 0.36, blue: 0.10, alpha: 1),
+            c2: UIColor(red: 0.18, green: 0.18, blue: 0.20, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "dota2",
+            name: "Dota 2",
+            discordAppId: "356875988589740042",
+            discordIconHash: "6b4b3fa4c83555d3008de69d33a60588",
+            externalIconURL: "",
+            aliases: ["dota"],
+            details: "Ranked All Pick • Immortal",
+            state: "Phút 38:20",
+            symbol: "flame.fill",
+            c1: UIColor(red: 0.86, green: 0.18, blue: 0.14, alpha: 1),
+            c2: UIColor(red: 0.14, green: 0.12, blue: 0.12, alpha: 1)
+        ),
+        FakeGamePreset(
+            id: "roblox",
+            name: "ROBLOX",
+            discordAppId: "363445589247131668",
+            discordIconHash: "f2b60e350a2097289b3b0b877495e55f",
+            externalIconURL: "",
+            aliases: ["roblox", "blox fruits"],
+            details: "Blox Fruits • Third Sea",
+            state: "Bounty 30,000,000",
+            symbol: "square.grid.2x2.fill",
+            c1: UIColor(red: 0.22, green: 0.24, blue: 0.30, alpha: 1),
+            c2: UIColor(red: 0.08, green: 0.09, blue: 0.12, alpha: 1)
+        )
     ]
 
     func renderCoverJPEG() -> (UIImage, Data)? {
@@ -170,6 +528,39 @@ struct FakeGamePreset: Identifiable, Equatable {
         }
         guard let jpg = img.jpegData(compressionQuality: 0.85) else { return nil }
         return (img, jpg)
+    }
+}
+
+/// Hiển thị ảnh gốc chính chủ của Game có sẵn (kèm nền gradient dự phòng mượt mà khi đang tải)
+struct PresetArtworkView: View {
+    let preset: FakeGamePreset
+    let size: CGFloat
+    let cornerRadius: CGFloat
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(LinearGradient(colors: [Color(preset.c1), Color(preset.c2)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                .frame(width: size, height: size)
+
+            Image(systemName: preset.symbol)
+                .font(.system(size: size * 0.44, weight: .bold))
+                .foregroundColor(.white.opacity(0.92))
+
+            if let url = preset.previewArtworkURL {
+                AsyncImage(url: url) { phase in
+                    if case .success(let image) = phase {
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    }
+                }
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
 
@@ -406,8 +797,8 @@ final class FakeGameManager: ObservableObject {
     @Published var gameName: String = "Arena of Valor" { didSet { saveSettings() } }
     @Published var detailsText: String = "Đấu Xếp Hạng • Chiến Tướng" { didSet { saveSettings() } }
     @Published var stateText: String = "Trong trận (5v5)" { didSet { saveSettings() } }
-    @Published var imageMode: ImageMode = .preset
-    @Published var selectedPreset: FakeGamePreset = FakeGamePreset.all[0]
+    @Published var imageMode: ImageMode = .preset { didSet { saveSettings() } }
+    @Published var selectedPreset: FakeGamePreset = FakeGamePreset.all[0] { didSet { saveSettings() } }
     @Published var customImageURL: String = "" { didSet { saveSettings() } }
     @Published var customAppId: String = "" { didSet { saveSettings() } }
     @Published var prePlayedMinutes: Int = 0 { didSet { saveSettings() } }
@@ -433,13 +824,38 @@ final class FakeGameManager: ObservableObject {
 
     private var timer: Timer?
     private var startEpochMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    private var isRestoringSettings = false
     private let storePrefix = "QT_FakeGame_"
 
     private init() {
         loadSettings()
     }
 
+    /// Tự động nhận diện tựa game chính thức khớp với tên game hiện tại (kể cả khi khách gõ tay hoặc đang chọn Preset)
+    var matchedPresetForCurrentName: FakeGamePreset? {
+        if selectedPreset.matchesName(gameName) {
+            return selectedPreset
+        }
+        return FakeGamePreset.all.first { $0.matchesName(gameName) }
+    }
+
+    /// Preset dùng để lấy ảnh gốc mặc định trên giao diện khi đang ở chế độ `.preset`
+    var activeArtworkPreset: FakeGamePreset {
+        return matchedPresetForCurrentName ?? selectedPreset
+    }
+
+    /// Xác định `application_id` chuẩn cho Discord (Game nào ra đúng trang Tổng quan Game đó — TUYỆT ĐỐI không dính Roblox!)
+    var resolvedOfficialAppId: String {
+        let manual = customAppId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !manual.isEmpty { return manual }
+        if let matched = matchedPresetForCurrentName, !matched.discordAppId.isEmpty {
+            return matched.discordAppId
+        }
+        return ""
+    }
+
     private func saveSettings() {
+        guard !isRestoringSettings else { return }
         let ud = UserDefaults.standard
         ud.set(gameName, forKey: storePrefix + "name")
         ud.set(detailsText, forKey: storePrefix + "details")
@@ -447,13 +863,21 @@ final class FakeGameManager: ObservableObject {
         ud.set(customImageURL, forKey: storePrefix + "url")
         ud.set(customAppId, forKey: storePrefix + "appid")
         ud.set(prePlayedMinutes, forKey: storePrefix + "mins")
+        ud.set(selectedPreset.id, forKey: storePrefix + "preset_id")
+        ud.set(imageMode.rawValue, forKey: storePrefix + "img_mode")
         if let up = uploadedPhotoWorkerURL {
             ud.set(up, forKey: storePrefix + "worker_img")
         }
     }
 
     private func loadSettings() {
+        isRestoringSettings = true
+        defer { isRestoringSettings = false }
         let ud = UserDefaults.standard
+        if let pid = ud.string(forKey: storePrefix + "preset_id"),
+           let found = FakeGamePreset.all.first(where: { $0.id == pid }) {
+            selectedPreset = found
+        }
         if let n = ud.string(forKey: storePrefix + "name"), !n.isEmpty { gameName = n }
         if let d = ud.string(forKey: storePrefix + "details") { detailsText = d }
         if let s = ud.string(forKey: storePrefix + "state") { stateText = s }
@@ -463,12 +887,18 @@ final class FakeGameManager: ObservableObject {
         if let up = ud.string(forKey: storePrefix + "worker_img"), !up.isEmpty {
             uploadedPhotoWorkerURL = up
         }
-        // Khôi phục ảnh preview nếu đã chọn từ App Ảnh trước đó
         let savedPath = localAvatarCacheURL()
         if let data = try? Data(contentsOf: savedPath), let ui = UIImage(data: data) {
             pickedImagePreview = ui
-            if uploadedPhotoWorkerURL != nil {
-                imageMode = .photoApp
+        }
+        if let rawMode = ud.string(forKey: storePrefix + "img_mode"),
+           let mode = ImageMode(rawValue: rawMode) {
+            if mode == .photoApp && pickedImagePreview == nil {
+                imageMode = .preset
+            } else if mode == .customURL && customImageURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                imageMode = .preset
+            } else {
+                imageMode = mode
             }
         }
     }
@@ -492,6 +922,13 @@ final class FakeGameManager: ObservableObject {
         gameName = preset.name
         detailsText = preset.details
         stateText = preset.state
+        uploadError = nil
+        Task { await refreshAllActivePresences() }
+    }
+
+    /// Khôi phục lại ảnh gốc có sẵn của tựa game đang chọn (sau khi người dùng đã thử thay ảnh riêng)
+    func restoreBuiltInPresetArtwork() {
+        imageMode = .preset
         uploadError = nil
         Task { await refreshAllActivePresences() }
     }
@@ -567,7 +1004,8 @@ final class FakeGameManager: ObservableObject {
         }
     }
 
-    /// Giải quyết URL ảnh thực tế (tự upload ảnh preset/photo lên CDN Worker nếu cần)
+    /// Giải quyết ảnh đại diện Game: ưu tiên ảnh gốc có sẵn chuẩn Discord (`mp:app-icons/...` / HD App Store),
+    /// đồng thời cho phép người dùng tự do thay thế bằng Ảnh từ Thư viện iPhone hoặc Link ngoài!
     private func resolveActiveImageURL() async -> String {
         switch imageMode {
         case .customURL:
@@ -582,11 +1020,21 @@ final class FakeGameManager: ObservableObject {
             }
             return ""
         case .preset:
-            let presetKey = "\(storePrefix)preset_url_\(selectedPreset.id)"
+            let preset = activeArtworkPreset
+            // 1. Có sẵn icon chính chủ trên kho Discord -> dùng thẳng `mp:app-icons/...` tức thì (0ms, nét căng 512px)
+            if !preset.nativeDiscordAssetPath.isEmpty {
+                return preset.nativeDiscordAssetPath
+            }
+            // 2. Có sẵn icon HD chính thức trên App Store (Liên Quân, Tốc Chiến, Free Fire, MLBB...)
+            if !preset.externalIconURL.isEmpty {
+                return preset.externalIconURL
+            }
+            // 3. Dự phòng render poster nếu game không có URL ảnh ngoài
+            let presetKey = "\(storePrefix)preset_url_\(preset.id)"
             if let cachedURL = UserDefaults.standard.string(forKey: presetKey), !cachedURL.isEmpty {
                 return cachedURL
             }
-            if let (_, jpg) = selectedPreset.renderCoverJPEG(),
+            if let (_, jpg) = preset.renderCoverJPEG(),
                let key = LicenseManager.shared.licenseKey, !key.isEmpty {
                 if SecurityGuard.shared.currentEphemeralKey == nil {
                     await LicenseManager.shared.refreshStatus(force: true)
@@ -601,21 +1049,28 @@ final class FakeGameManager: ObservableObject {
         }
     }
 
-    /// Tạo gói dữ liệu Activity Discord chuẩn cho bất kỳ Token & Scope nào (FakeGame riêng, Treo Room, hoặc Xả Nhạc)
+    /// Tạo gói dữ liệu Activity Discord chuẩn cho từng Game (đúng `application_id` chính chủ, KHÔNG dính Roblox!)
     func buildActivityPayload(scope: FeatureScope, token: String, resetStartTime: Bool = false) async -> [String: Any] {
         if resetStartTime {
             startEpochMs = Int64((Date().timeIntervalSince1970 - Double(prePlayedMinutes * 60)) * 1000.0)
         }
-        let cleanName = gameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "Playing a Game"
-            : gameName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Nếu người dùng tự gõ đúng tên hoặc tên viết tắt (VD: "lol", "valorant", "cs2", "dtcl"), chuẩn hóa về tên chuẩn của Game trên Discord
+        let matched = matchedPresetForCurrentName
+        let rawInputName = gameName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName: String
+        if let m = matched, m.name.lowercased() != rawInputName.lowercased(), m.aliases.contains(where: { $0.lowercased() == rawInputName.lowercased() }) {
+            cleanName = m.name
+        } else {
+            cleanName = rawInputName.isEmpty ? "Playing a Game" : rawInputName
+        }
 
+        let targetAppId = resolvedOfficialAppId
         let rawImgURL = await resolveActiveImageURL()
         let resolved = await RemoteFeatureVault.shared.resolveExternalGameImage(
             scope: scope,
             token: token,
             imageURL: rawImgURL,
-            customAppId: customAppId
+            customAppId: targetAppId
         )
 
         var activity: [String: Any] = [
@@ -638,6 +1093,8 @@ final class FakeGameManager: ObservableObject {
                     "large_text": cleanName
                 ]
             }
+        } else if !targetAppId.isEmpty {
+            activity["application_id"] = targetAppId
         }
         return activity
     }
@@ -969,20 +1426,35 @@ struct ParallelFakeGameDeckCard: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
                             ForEach(FakeGamePreset.all) { p in
-                                let sel = (fakeGame.imageMode == .preset && fakeGame.selectedPreset.id == p.id)
+                                let sel = (fakeGame.selectedPreset.id == p.id && p.matchesName(fakeGame.gameName))
                                 Button {
                                     fakeGame.applyPreset(p)
                                 } label: {
-                                    Text(p.name)
-                                        .font(.system(size: 11, weight: .bold, design: .rounded))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 6)
-                                        .background(sel ? accent : Color(UIColor.tertiarySystemGroupedBackground), in: Capsule())
-                                        .foregroundColor(sel ? .white : .primary)
+                                    HStack(spacing: 5) {
+                                        PresetArtworkView(preset: p, size: 18, cornerRadius: 5)
+                                        Text(p.name)
+                                            .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    }
+                                    .padding(.leading, 5)
+                                    .padding(.trailing, 10)
+                                    .padding(.vertical, 5)
+                                    .background(sel ? accent : Color(UIColor.tertiarySystemGroupedBackground), in: Capsule())
+                                    .foregroundColor(sel ? .white : .primary)
                                 }
                                 .buttonStyle(.plain)
                             }
                         }
+                    }
+
+                    if fakeGame.imageMode != .preset {
+                        Button {
+                            fakeGame.restoreBuiltInPresetArtwork()
+                        } label: {
+                            Label("Dùng lại ảnh gốc có sẵn của \(fakeGame.activeArtworkPreset.name)", systemImage: "arrow.counterclockwise.circle.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(accent)
+                        }
+                        .buttonStyle(.plain)
                     }
 
                     HStack(spacing: 8) {
@@ -1036,14 +1508,7 @@ struct ParallelFakeGameDeckCard: View {
             .frame(width: size, height: size)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         } else {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(LinearGradient(colors: [Color(fakeGame.selectedPreset.c1), Color(fakeGame.selectedPreset.c2)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: size, height: size)
-                Image(systemName: fakeGame.selectedPreset.symbol)
-                    .font(.system(size: size * 0.44, weight: .bold))
-                    .foregroundColor(.white)
-            }
+            PresetArtworkView(preset: fakeGame.activeArtworkPreset, size: size, cornerRadius: 10)
         }
     }
 }
@@ -1150,10 +1615,20 @@ struct FakeGameTabView: View {
                             .font(.system(size: 10, weight: .bold))
                             .foregroundColor(.green)
                     }
-                } else {
-                    Text("● LIVE RPC")
-                        .font(.system(size: 10, weight: .black, design: .rounded))
+                } else if !fakeGame.resolvedOfficialAppId.isEmpty {
+                    Text("✓ CHUẨN ID GAME DISCORD")
+                        .font(.system(size: 9, weight: .black, design: .rounded))
                         .foregroundColor(.green)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.16), in: Capsule())
+                } else {
+                    Text("✦ CUSTOM RPC (KHÔNG DÍNH ROBLOX)")
+                        .font(.system(size: 9, weight: .black, design: .rounded))
+                        .foregroundColor(.cyan)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.cyan.opacity(0.16), in: Capsule())
                 }
             }
 
@@ -1224,14 +1699,7 @@ struct FakeGameTabView: View {
             .frame(width: 68, height: 68)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         } else {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(LinearGradient(colors: [Color(fakeGame.selectedPreset.c1), Color(fakeGame.selectedPreset.c2)], startPoint: .topLeading, endPoint: .bottomTrailing))
-                    .frame(width: 68, height: 68)
-                Image(systemName: fakeGame.selectedPreset.symbol)
-                    .font(.system(size: 30, weight: .bold))
-                    .foregroundColor(.white)
-            }
+            PresetArtworkView(preset: fakeGame.activeArtworkPreset, size: 68, cornerRadius: 14)
         }
     }
 
@@ -1320,18 +1788,19 @@ struct FakeGameTabView: View {
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 7) {
+                HStack(spacing: 8) {
                     ForEach(FakeGamePreset.all) { preset in
-                        let sel = (fakeGame.imageMode == .preset && fakeGame.selectedPreset.id == preset.id)
+                        let sel = (fakeGame.selectedPreset.id == preset.id && preset.matchesName(fakeGame.gameName))
                         Button {
                             fakeGame.applyPreset(preset)
                         } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: preset.symbol).font(.system(size: 11, weight: .bold))
+                            HStack(spacing: 7) {
+                                PresetArtworkView(preset: preset, size: 24, cornerRadius: 6)
                                 Text(preset.name).font(.system(size: 12, weight: .bold, design: .rounded))
                             }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
+                            .padding(.leading, 6)
+                            .padding(.trailing, 12)
+                            .padding(.vertical, 6)
                             .background(sel ? AnyShapeStyle(StudioPalette.fakeGameGradient) : AnyShapeStyle(Color(UIColor.tertiarySystemGroupedBackground)), in: Capsule())
                             .foregroundColor(sel ? .white : .primary)
                         }
@@ -1373,11 +1842,44 @@ struct FakeGameTabView: View {
         .studioCard()
     }
 
-    // 4. Game Image Picker Card (App Ảnh / Tệp / Link / Kho Mẫu)
+    // 4. Game Image Picker Card (Có sẵn ảnh gốc theo Game + vẫn cho phép thay ảnh từ App Ảnh / Tệp / Link!)
     private var gameImagePickerCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Ảnh Đại Diện Game", systemImage: "photo.fill.on.rectangle.fill")
-                .font(.system(size: 15, weight: .bold, design: .rounded))
+            HStack {
+                Label("Ảnh Đại Diện Game", systemImage: "photo.fill.on.rectangle.fill")
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                Spacer()
+                if fakeGame.imageMode != .preset {
+                    Button {
+                        fakeGame.restoreBuiltInPresetArtwork()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.counterclockwise")
+                            Text("Dùng Ảnh Gốc Game")
+                        }
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundColor(accent)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(accent.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: fakeGame.imageMode == .preset ? "checkmark.seal.fill" : "sparkles")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(accent)
+                Text(fakeGame.imageMode == .preset
+                     ? "Đang dùng sẵn ảnh gốc chính thức của \(fakeGame.activeArtworkPreset.name). Bạn vẫn có thể chọn ảnh khác bên dưới để thay thế!"
+                     : "Đang dùng ảnh riêng của bạn (vẫn giữ chuẩn ID Game \(fakeGame.matchedPresetForCurrentName?.name ?? "Custom")).")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
 
             HStack(spacing: 8) {
                 Button {

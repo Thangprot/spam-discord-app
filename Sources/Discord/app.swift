@@ -439,21 +439,33 @@ struct ConfigResponse: Codable {
 struct AppEndpoints {
     static var cdnAvatars = ""
     static var cdnIcons = ""
+    static var cdnAppIcons = ""
 
     static func applyAssets(_ assets: RemoteAssetsDTO?) {
         guard let a = assets else { return }
         if let av = a.cdn_avatars, !av.isEmpty { cdnAvatars = av }
         if let ic = a.cdn_icons, !ic.isEmpty { cdnIcons = ic }
+        if let aic = a.cdn_app_icons, !aic.isEmpty {
+            cdnAppIcons = aic
+        } else if !cdnIcons.isEmpty && cdnAppIcons.isEmpty {
+            cdnAppIcons = cdnIcons.replacingOccurrences(of: "/icons", with: "/app-icons")
+        }
     }
 
     static func applyCDN(avatars: String?, icons: String?) {
         if let av = avatars, !av.isEmpty { cdnAvatars = av }
-        if let ic = icons, !ic.isEmpty { cdnIcons = ic }
+        if let ic = icons, !ic.isEmpty {
+            cdnIcons = ic
+            if cdnAppIcons.isEmpty {
+                cdnAppIcons = ic.replacingOccurrences(of: "/icons", with: "/app-icons")
+            }
+        }
     }
 
     static func clear() {
         cdnAvatars = ""
         cdnIcons = ""
+        cdnAppIcons = ""
         RemoteFeatureVault.shared.clearAllFunctionalData()
         UserDefaults.standard.removeObject(forKey: "QT_CachedRemoteConfig")
         UserDefaults.standard.synchronize()

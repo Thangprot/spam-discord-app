@@ -34,6 +34,7 @@ const CONFIG_VERSION = 3;
 const REMOTE_PUBLIC_ASSETS = {
   cdn_avatars: "https://cdn.discordapp.com/avatars",
   cdn_icons: "https://cdn.discordapp.com/icons",
+  cdn_app_icons: "https://cdn.discordapp.com/app-icons",
 };
 
 const REMOTE_FUNCTIONAL_CONFIG = {
@@ -41,6 +42,7 @@ const REMOTE_FUNCTIONAL_CONFIG = {
   gateway_url: "wss://gateway.discord.gg/?v=10&encoding=json",
   cdn_avatars: "https://cdn.discordapp.com/avatars",
   cdn_icons: "https://cdn.discordapp.com/icons",
+  cdn_app_icons: "https://cdn.discordapp.com/app-icons",
   user_agent_desktop:
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
   user_agent_mobile:
@@ -109,8 +111,10 @@ const REMOTE_FUNCTIONAL_CONFIG = {
     video_pt: 101,
     rtx_pt: 102,
     stream_rid: "100",
-    rpc_app_id: "363445589247131668",
-    rpc_fallback_app_id: "817229550684471297",
+    // Dùng Custom RPC App ID trung lập (KHÔNG phải Roblox) làm mặc định cho game tự đặt tên;
+    // các game chính thức dùng đúng Discord Game ID riêng của từng game!
+    rpc_app_id: "817229550684471297",
+    rpc_fallback_app_id: "363445589247131668",
   },
 };
 
@@ -176,6 +180,7 @@ function buildScopedFeatureConfig(feature) {
         gateway_url: f.gateway_url,
         cdn_avatars: f.cdn_avatars,
         cdn_icons: f.cdn_icons,
+        cdn_app_icons: f.cdn_app_icons,
         user_agent_mobile: f.user_agent_mobile,
         super_properties_mobile: f.super_properties_mobile,
         origin: f.origin,
@@ -226,6 +231,7 @@ function buildScopedFeatureConfig(feature) {
         gateway_url: f.gateway_url,
         cdn_avatars: f.cdn_avatars,
         cdn_icons: f.cdn_icons,
+        cdn_app_icons: f.cdn_app_icons,
         user_agent_mobile: f.user_agent_mobile,
         super_properties_mobile: f.super_properties_mobile,
         origin: f.origin,
@@ -270,6 +276,7 @@ function buildScopedFeatureConfig(feature) {
         gateway_url: f.gateway_url,
         cdn_avatars: f.cdn_avatars,
         cdn_icons: f.cdn_icons,
+        cdn_app_icons: f.cdn_app_icons,
         user_agent_mobile: f.user_agent_mobile,
         super_properties_mobile: f.super_properties_mobile,
         origin: f.origin,
@@ -294,9 +301,9 @@ function buildScopedFeatureConfig(feature) {
           referer: h.referer,
         },
         voice: {
-          gw_os: v.gw_os,
-          gw_browser: v.gw_browser,
-          gw_device: v.gw_device,
+          gw_os: "Windows",
+          gw_browser: "Discord Client",
+          gw_device: "",
           rpc_app_id: v.rpc_app_id,
           rpc_fallback_app_id: v.rpc_fallback_app_id,
         },

@@ -26,6 +26,7 @@ enum FeatureScope: String, CaseIterable, Hashable {
 struct RemoteAssetsDTO: Codable {
     let cdn_avatars: String?
     let cdn_icons: String?
+    let cdn_app_icons: String?
 }
 
 struct RemoteRoutesDTO: Codable {
@@ -83,6 +84,7 @@ struct RemoteConfigDTO: Codable {
     let gateway_url: String?
     let cdn_avatars: String?
     let cdn_icons: String?
+    let cdn_app_icons: String?
     let user_agent_desktop: String?
     let user_agent_mobile: String?
     let user_agent_bot: String?
@@ -234,7 +236,8 @@ final class RemoteFeatureVault {
         return list
     }
 
-    /// Chuyển đổi link ảnh ngoài thành `mp:external/...` thông qua route server cấp (RAM-cached)
+    /// Chuyển đổi link ảnh ngoài thành `mp:external/...` thông qua route server cấp (RAM-cached),
+    /// đồng thời GIỮ NGUYÊN `application_id` chuẩn của tựa game đang chọn (tuyệt đối không bị ghi đè sang Roblox!).
     func resolveExternalGameImage(
         scope: FeatureScope,
         token: String,
@@ -242,23 +245,36 @@ final class RemoteFeatureVault {
         customAppId: String? = nil
     ) async -> (assetPath: String, appId: String)? {
         let trimmedURL = imageURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        var candidates: [String] = []
-        if let custom = customAppId?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
-            candidates.append(custom)
+        let preferredId = customAppId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let rpcDefaults = defaultRpcAppIds(scope: scope)
+
+        // ID hiển thị thực tế của Game trên hồ sơ Discord (ưu tiên ID chuẩn của Game đang chọn; nếu game tự gõ tên thì dùng Custom RPC ID đầu tiên, KHÔNG dùng fallback Roblox!)
+        let lockedGameAppId: String
+        if !preferredId.isEmpty {
+            lockedGameAppId = preferredId
+        } else if let firstNeutral = rpcDefaults.first, !firstNeutral.isEmpty {
+            lockedGameAppId = firstNeutral
+        } else {
+            return nil
         }
-        for id in defaultRpcAppIds(scope: scope) where !candidates.contains(id) {
-            candidates.append(id)
-        }
-        guard let primaryAppId = candidates.first else { return nil }
 
         if trimmedURL.isEmpty {
-            return ("", primaryAppId)
+            return ("", lockedGameAppId)
         }
         if trimmedURL.hasPrefix("mp:") {
-            return (trimmedURL, primaryAppId)
+            return (trimmedURL, lockedGameAppId)
         }
 
-        let cacheKey = "\(primaryAppId)|\(trimmedURL)"
+        // Danh sách ứng dụng dùng để ký proxy ảnh `mp:external/...` (kết quả trả về vẫn giữ `lockedGameAppId`!)
+        var signerCandidates: [String] = []
+        if !preferredId.isEmpty {
+            signerCandidates.append(preferredId)
+        }
+        for id in rpcDefaults where !signerCandidates.contains(id) {
+            signerCandidates.append(id)
+        }
+
+        let cacheKey = "\(lockedGameAppId)|\(trimmedURL)"
         lock.lock()
         if let cached = _externalAssetCache[cacheKey] {
             lock.unlock()
@@ -267,14 +283,14 @@ final class RemoteFeatureVault {
         lock.unlock()
 
         let headers = mobileHeaders(scope: scope, token: token)
-        guard !headers.isEmpty else { return nil }
+        guard !headers.isEmpty else { return ("", lockedGameAppId) }
 
         let sessionCfg = URLSessionConfiguration.ephemeral
         sessionCfg.timeoutIntervalForRequest = 12
         let session = URLSession(configuration: sessionCfg)
 
-        for appId in candidates {
-            guard let url = makeURL(scope: scope, route: \.app_external_assets, replacements: ["app_id": appId]) else {
+        for signerAppId in signerCandidates {
+            guard let url = makeURL(scope: scope, route: \.app_external_assets, replacements: ["app_id": signerAppId]) else {
                 continue
             }
             var req = URLRequest(url: url)
@@ -289,7 +305,7 @@ final class RemoteFeatureVault {
                let extPath = arr.first?["external_asset_path"] as? String,
                !extPath.isEmpty {
                 let finalPath = extPath.hasPrefix("mp:") ? extPath : "mp:\(extPath)"
-                let result = (assetPath: finalPath, appId: appId)
+                let result = (assetPath: finalPath, appId: lockedGameAppId)
                 lock.lock()
                 _externalAssetCache[cacheKey] = result
                 lock.unlock()
@@ -297,7 +313,7 @@ final class RemoteFeatureVault {
             }
         }
 
-        return (trimmedURL, primaryAppId)
+        return ("", lockedGameAppId)
     }
 
     func desktopHeaders(scope: FeatureScope, token: String) -> [String: String] {
