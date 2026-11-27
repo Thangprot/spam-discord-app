@@ -446,8 +446,8 @@ async function decryptClientPayload(reqBody, env, secret) {
     throw new Error("Invalid cryptographic signature");
   }
 
-  // Chống Replay Attack #2: Nonce 1 lần trong KV (TTL 360s)
-  const nonceKey = `NONCE:${nonce}`;
+  // Chống Replay Attack #2: Nonce 1 lần trong KV (TTL 360s, dùng tiền tố ~ để xếp sau A-Z trong KV list)
+  const nonceKey = `~NONCE:${nonce}`;
   const seen = await env.APP_DATA.get(nonceKey);
   if (seen) {
     throw new Error("Replay nonce reused");
@@ -526,11 +526,35 @@ const json = (data, status = 200, extraHeaders = {}) =>
 const nowMs = () => Date.now();
 const getClientIP = (req) => req.headers.get("CF-Connecting-IP") || req.headers.get("X-Forwarded-For") || "unknown";
 
+function buildLicenseMetadata(data) {
+  const mids = Array.isArray(data.machine_ids) ? data.machine_ids : (data.machine_id ? [data.machine_id] : []);
+  return {
+    v: 1,
+    email: String(data.email || "").slice(0, 120),
+    created_at: data.created_at || 0,
+    activated_at: data.activated_at || null,
+    expires_at: data.expires_at || null,
+    duration_ms: data.duration_ms || 0,
+    start_on_activate: !!data.start_on_activate,
+    max_devices: Math.max(1, parseInt(data.max_devices, 10) || 1),
+    used_devices: mids.length,
+    first_mid: mids[0] ? String(mids[0]).slice(0, 16) : null,
+    disabled: !!data.disabled,
+  };
+}
+
 const getLicense = async (env, key) => {
   const raw = await env.APP_DATA.get(key);
-  return raw ? JSON.parse(raw) : null;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return (parsed && typeof parsed === "object") ? parsed : null;
+  } catch {
+    return null;
+  }
 };
-const putLicense = (env, key, data) => env.APP_DATA.put(key, JSON.stringify(data));
+const putLicense = (env, key, data) =>
+  env.APP_DATA.put(key, JSON.stringify(data), { metadata: buildLicenseMetadata(data) });
 const deleteLicense = (env, key) => env.APP_DATA.delete(key);
 
 function randomChunk(len = 5) {
@@ -613,22 +637,31 @@ async function verifyAppIntegrity(req, env, body) {
   // Ghi nhận hash build để Admin có thể ghim trực tiếp trên web
   await recordObservedBuild(env, integrity);
 
+  // Lọc bỏ các thư viện hệ thống hợp lệ do công cụ cài IPA (ESign / Sideloadly / Feather / AltStore / Jailbreak) tự chèn
+  const BENIGN_SIDELOAD_LIBS = [
+    "substrate", "mobilesubstrate", "substitute", "ellekit", "libhooker",
+    "tweakinject", "cynject", "alderis", "sideload", "livecontainer", "altstore"
+  ];
   if (integrity.tampered === true) {
-    const reasons = Array.isArray(integrity.reasons) ? integrity.reasons.join(", ") : "Tamper detected";
-    await logSecurityAlert(env, req, `Phát hiện công cụ bẻ khóa/can thiệp: ${reasons}`, { key, mid, text_hash: integrity.text_hash });
-    return { ok: false, cracked: true, error: "Phát hiện công cụ debug / tiêm thư viện / chỉnh sửa ứng dụng!" };
-  }
-
-  const settings = await getSecSettings(env);
-  if (settings.enforce_binary_hash && Array.isArray(settings.allowed_hashes) && settings.allowed_hashes.length > 0) {
-    const h = String(integrity.text_hash || "").toLowerCase();
-    const allowed = settings.allowed_hashes.map(x => String(x).toLowerCase());
-    if (!h || !allowed.includes(h)) {
-      await logSecurityAlert(env, req, "Sai mã băm __TEXT (Binary đã bị patch/sửa mã nguồn)", { key, mid, text_hash: h });
-      return { ok: false, cracked: true, error: "File thực thi của ứng dụng đã bị chỉnh sửa trái phép!" };
+    const rawReasons = Array.isArray(integrity.reasons) ? integrity.reasons : ["tamper"];
+    const realReasons = rawReasons.filter(r => {
+      const lower = String(r).toLowerCase();
+      if (lower.startsWith("injected_dylib:")) {
+        const libs = lower.replace("injected_dylib:", "").split(",").map(x => x.trim()).filter(Boolean);
+        const dangerous = libs.filter(lib => !BENIGN_SIDELOAD_LIBS.some(ok => lib.includes(ok)));
+        return dangerous.length > 0;
+      }
+      return true;
+    });
+    if (realReasons.length > 0) {
+      const reasonStr = realReasons.join(", ");
+      await logSecurityAlert(env, req, `Phát hiện công cụ bẻ khóa/can thiệp: ${reasonStr}`, { key, mid, text_hash: integrity.text_hash });
+      return { ok: false, cracked: true, error: "Phát hiện công cụ debug / bẻ khóa can thiệp vào ứng dụng!" };
     }
   }
 
+  const settings = await getSecSettings(env);
+  let sourceVerified = false;
   if (settings.enforce_source_sig && Array.isArray(settings.allowed_source_sigs) && settings.allowed_source_sigs.length > 0) {
     const s = String(integrity.source_sig || "").toLowerCase();
     const allowed = settings.allowed_source_sigs.map(x => String(x).toLowerCase());
@@ -636,11 +669,28 @@ async function verifyAppIntegrity(req, env, body) {
       await logSecurityAlert(env, req, "Sai chữ ký mã nguồn (Source đã bị chỉnh sửa)", { key, mid, source_sig: s });
       return { ok: false, cracked: true, error: "Mã nguồn ứng dụng đã bị thay đổi trái phép!" };
     }
+    sourceVerified = true;
+  }
+
+  // Lưu ý quan trọng trên iOS Sideload: Khi khách cài IPA qua ESign / Scarlet / Feather / Sideloadly / Cert riêng,
+  // mã __TEXT sẽ tự đổi khác nhau trên từng máy dù cùng 1 file IPA gốc, trong khi Source Signature luôn giống nhau 100%!
+  // Do đó nếu chữ ký Mã Nguồn (source_sig) đã khớp chính chủ thì cho phép máy thứ 2, thứ 3... hoạt động bình thường!
+  if (settings.enforce_binary_hash && !sourceVerified && Array.isArray(settings.allowed_hashes) && settings.allowed_hashes.length > 0) {
+    const h = String(integrity.text_hash || "").toLowerCase();
+    const allowed = settings.allowed_hashes.map(x => String(x).toLowerCase());
+    if (!h || !allowed.includes(h)) {
+      await logSecurityAlert(env, req, "Sai mã băm __TEXT và chưa xác thực Source Signature", { key, mid, text_hash: h });
+      return { ok: false, cracked: true, error: "File thực thi của ứng dụng không hợp lệ hoặc đã bị chỉnh sửa!" };
+    }
   }
 
   if (settings.enforce_anti_proxy && integrity.proxy_active === true) {
-    await logSecurityAlert(env, req, `Phát hiện Proxy bắt gói tin MITM (${integrity.proxy_detail || "HTTP Proxy"})`, { key, mid });
-    return { ok: false, cracked: false, error: "Vui lòng tắt ứng dụng bắt gói tin / HTTP Proxy trước khi sử dụng!" };
+    const proxyDetail = String(integrity.proxy_detail || "");
+    const isLocalVpnTunnel = proxyDetail.startsWith("127.0.0.1:") || proxyDetail.startsWith("localhost:") || proxyDetail.startsWith("::1:");
+    if (!isLocalVpnTunnel) {
+      await logSecurityAlert(env, req, `Phát hiện Proxy bắt gói tin MITM ngoài LAN (${proxyDetail || "HTTP Proxy"})`, { key, mid });
+      return { ok: false, cracked: false, error: "Vui lòng tắt HTTP Proxy bắt gói tin trên mạng Wi-Fi trước khi sử dụng!" };
+    }
   }
 
   return { ok: true };
@@ -772,11 +822,7 @@ async function verifyAdminSession(req, env, requireCsrf = true) {
     return { ok: false, error: "Phiên quản trị đã hết hạn, vui lòng đăng nhập lại." };
   }
 
-  const curIpHash = (await sha256Hex(getClientIP(req))).slice(0, 16);
-  if (payload.iph && payload.iph !== curIpHash) {
-    return { ok: false, error: "Địa chỉ IP đã thay đổi so với phiên đăng nhập (Bảo mật Lớp 4)." };
-  }
-
+  // Không chặn đổi IPv4 <-> IPv6 động của nhà mạng VNPT/Viettel/FPT để tránh rớt phiên khi tải Danh Sách Key
   const curUaHash = (await sha256Hex(req.headers.get("User-Agent") || "")).slice(0, 16);
   if (payload.uah !== curUaHash) {
     return { ok: false, error: "Trình duyệt không khớp phiên đăng nhập." };
@@ -1263,7 +1309,7 @@ function renderAdminDashboardPage(csrfToken) {
 
     <div class="card">
       <div class="toolbar">
-        <input type="text" id="qSearch" placeholder="Tìm theo mã Key hoặc ghi chú khách hàng..." oninput="renderKeyList()" style="flex:2;min-width:200px;">
+        <input type="search" id="qSearch" name="qt_key_filter_box" autocomplete="off" autocorrect="off" spellcheck="false" placeholder="Tìm theo mã Key hoặc ghi chú khách hàng..." oninput="renderKeyList()" style="flex:2;min-width:200px;">
         <select id="qFilter" onchange="renderKeyList()" style="flex:1;min-width:140px;">
           <option value="all">Tất cả trạng thái</option>
           <option value="active">Đang hoạt động</option>
@@ -1285,25 +1331,25 @@ function renderAdminDashboardPage(csrfToken) {
 
       <div class="toggle-row">
         <div>
-          <div style="font-size:13px;font-weight:700;">Bật kiểm tra chặt mã băm Binary (__TEXT SHA-256)</div>
-          <div style="font-size:11px;color:var(--muted);">Chỉ bật sau khi bạn đã ghim ít nhất 1 mã băm bản build chính chủ bên dưới!</div>
-        </div>
-        <input type="checkbox" id="secEnforceBin">
-      </div>
-
-      <label>DANH SÁCH BINARY __TEXT HASH ĐƯỢC PHÉP (Mỗi dòng 1 mã SHA-256)</label>
-      <textarea id="secAllowedHashes" rows="3" class="mono" placeholder="Dán mã __TEXT SHA-256 từ GitHub Actions hoặc bấm Ghim ở bảng bên dưới..."></textarea>
-
-      <div class="toggle-row">
-        <div>
-          <div style="font-size:13px;font-weight:700;">Bật kiểm tra chặt chữ ký Mã Nguồn (Source Signature)</div>
-          <div style="font-size:11px;color:var(--muted);">Chặn app nếu có người sửa hằng số bảo mật trong mã nguồn Swift.</div>
+          <div style="font-size:13px;font-weight:700;color:#34d399;">✅ Bật kiểm tra chữ ký Mã Nguồn — Source Signature (Khuyên dùng cho mọi máy!)</div>
+          <div style="font-size:11px;color:var(--muted);">Giống nhau 100% trên mọi iPhone dù khách ký IPA bằng ESign, Scarlet, Feather, Sideloadly hay Cert riêng. Chặn đứng sửa code Swift!</div>
         </div>
         <input type="checkbox" id="secEnforceSrc">
       </div>
 
       <label>DANH SÁCH SOURCE SIGNATURE ĐƯỢC PHÉP (Mỗi dòng 1 mã)</label>
-      <textarea id="secAllowedSigs" rows="2" class="mono" placeholder="Tự động hiện ở bảng thiết bị bên dưới để ghim 1 chạm..."></textarea>
+      <textarea id="secAllowedSigs" rows="2" class="mono" placeholder="Bấm nút Ghim ở bảng bên dưới để tự điền..."></textarea>
+
+      <div class="toggle-row" style="margin-top:12px;">
+        <div>
+          <div style="font-size:13px;font-weight:700;">Kiểm tra mã băm Binary (__TEXT SHA-256 — Tự động nhường nếu Source Signature đã khớp)</div>
+          <div style="font-size:11px;color:var(--muted);">Lưu ý: ESign / Sideloadly / Cert khác nhau sẽ tạo mã __TEXT khác nhau trên từng máy. Hệ thống đã tự cho phép nếu Source Signature hợp lệ.</div>
+        </div>
+        <input type="checkbox" id="secEnforceBin">
+      </div>
+
+      <label>DANH SÁCH BINARY __TEXT HASH ĐƯỢC PHÉP (Tùy chọn)</label>
+      <textarea id="secAllowedHashes" rows="2" class="mono" placeholder="Không bắt buộc nếu đã bật Source Signature ở trên..."></textarea>
 
       <div class="toggle-row" style="margin-top:12px;">
         <div>
@@ -1359,15 +1405,26 @@ function renderAdminDashboardPage(csrfToken) {
       setTimeout(() => location.reload(), 900);
       throw new Error('Unauthorized');
     }
-    return res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok && data.error) {
+      throw new Error(data.error);
+    }
+    return data;
   }
 
+  let hasClearedAutofillOnce = false;
   function switchTab(t) {
     ['gen','manage','sec'].forEach(id => {
       document.getElementById('p' + id[0].toUpperCase() + id.slice(1)).style.display = (id === t) ? 'block' : 'none';
       document.getElementById('t' + id[0].toUpperCase() + id.slice(1)).className = (id === t) ? 'tab active' : 'tab';
     });
-    if (t === 'manage') loadKeyList();
+    if (t === 'manage') {
+      if (!hasClearedAutofillOnce) {
+        hasClearedAutofillOnce = true;
+        document.getElementById('qSearch').value = '';
+      }
+      loadKeyList();
+    }
     if (t === 'sec') loadSecData();
   }
 
@@ -1398,20 +1455,32 @@ function renderAdminDashboardPage(csrfToken) {
     btn.disabled = true;
     btn.textContent = 'Đang tạo ' + quantity + ' key...';
     try {
-      const data = await api('/admin/generate', { days, hours, minutes, quantity, max_devices, prefix, email, start_on_activate });
-      if (data.valid && Array.isArray(data.keys)) {
-        lastGenerated = data.keys;
-        document.getElementById('batchTitle').textContent = '🎉 Đã tạo ' + data.keys.length + ' key (' + data.duration_label + ' • ' + max_devices + ' máy/key' + (start_on_activate ? ' • Đếm khi kích hoạt' : '') + ')';
-        document.getElementById('batchList').innerHTML = data.keys.map(k =>
-          '<div class="key-item"><span>' + k + '</span><button class="btn-sm btn-slate" onclick="copyOne(\\'' + k + '\\')">Copy</button></div>'
-        ).join('');
-        document.getElementById('batchOut').style.display = 'block';
-        toast('Đã tạo ' + data.keys.length + ' key thành công!');
-      } else {
-        toast(data.error || 'Lỗi tạo key', true);
+      // Chia lô tối đa 35 key/lượt để không bao giờ chạm giới hạn 50 KV subrequests của gói Cloudflare Free!
+      let allCreated = [];
+      let durationLabel = '';
+      let remaining = quantity;
+      let batchIndex = 0;
+      while (remaining > 0) {
+        const chunk = Math.min(35, remaining);
+        const subNote = (quantity > 35 && email) ? (email + ' (Lô ' + (batchIndex + 1) + ')') : email;
+        const data = await api('/admin/generate', { days, hours, minutes, quantity: chunk, max_devices, prefix, email: subNote, start_on_activate });
+        if (!data.valid || !Array.isArray(data.keys)) {
+          throw new Error(data.error || 'Lỗi tạo key');
+        }
+        allCreated = allCreated.concat(data.keys);
+        durationLabel = data.duration_label || durationLabel;
+        remaining -= chunk;
+        batchIndex++;
       }
+      lastGenerated = allCreated;
+      document.getElementById('batchTitle').textContent = '🎉 Đã tạo ' + allCreated.length + ' key (' + durationLabel + ' • ' + max_devices + ' máy/key' + (start_on_activate ? ' • Đếm khi kích hoạt' : '') + ')';
+      document.getElementById('batchList').innerHTML = allCreated.map(k =>
+        '<div class="key-item"><span>' + k + '</span><button class="btn-sm btn-slate" onclick="copyOne(\\'' + k + '\\')">Copy</button></div>'
+      ).join('');
+      document.getElementById('batchOut').style.display = 'block';
+      toast('Đã tạo ' + allCreated.length + ' key thành công!');
     } catch (e) {
-      if (e.message !== 'Unauthorized') toast('Lỗi kết nối server', true);
+      if (e.message !== 'Unauthorized') toast(e.message || 'Lỗi kết nối server', true);
     } finally {
       btn.disabled = false;
       btn.textContent = '⚡ Tạo License Key Ngay';
@@ -1450,11 +1519,23 @@ function renderAdminDashboardPage(csrfToken) {
     const box = document.getElementById('keysContainer');
     box.innerHTML = '<p style="color:var(--muted);text-align:center;padding:20px;">Đang tải danh sách từ Cloudflare KV...</p>';
     try {
-      const data = await api('/admin/list', {});
+      let data = await api('/admin/list', {});
       allKeys = data.items || [];
       renderKeyList();
+      // Nếu còn key cũ chưa đồng bộ metadata, tự động đồng bộ từng nhịp an toàn (<50 KV subrequests)
+      let rounds = 0;
+      while (data.more_legacy && rounds < 12) {
+        rounds++;
+        toast('Đang đồng bộ dữ liệu key cũ (' + allKeys.length + ' key)...');
+        await new Promise(r => setTimeout(r, 1100));
+        data = await api('/admin/list', {});
+        allKeys = data.items || [];
+        renderKeyList();
+      }
     } catch (e) {
-      if (e.message !== 'Unauthorized') box.innerHTML = '<p style="color:#f87171;text-align:center;">Lỗi tải danh sách key.</p>';
+      if (e.message !== 'Unauthorized') {
+        box.innerHTML = '<p style="color:#f87171;text-align:center;padding:20px;">Lỗi tải danh sách key: ' + (e.message || 'Unknown') + '</p>';
+      }
     }
   }
 
@@ -1580,19 +1661,20 @@ function renderAdminDashboardPage(csrfToken) {
   }
 
   function pinObserved(binHash, srcSig) {
+    if (srcSig) {
+      const el = document.getElementById('secAllowedSigs');
+      const set = new Set(el.value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean));
+      set.add(srcSig);
+      el.value = Array.from(set).join('\\n');
+      document.getElementById('secEnforceSrc').checked = true;
+    }
     if (binHash) {
       const el = document.getElementById('secAllowedHashes');
       const set = new Set(el.value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean));
       set.add(binHash);
       el.value = Array.from(set).join('\\n');
     }
-    if (srcSig) {
-      const el = document.getElementById('secAllowedSigs');
-      const set = new Set(el.value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean));
-      set.add(srcSig);
-      el.value = Array.from(set).join('\\n');
-    }
-    toast('Đã thêm vào danh sách ghim — nhớ bấm Lưu Cấu Hình!');
+    toast('Đã ghim chữ ký build (tương thích mọi máy) — bấm Lưu Cấu Hình để áp dụng!');
   }
 
   async function saveSecSettings() {
@@ -1707,14 +1789,71 @@ async function handleListKeys(req, env) {
   const guard = await requireAdmin(req, env);
   if (guard.res) return guard.res;
 
-  const listed = await env.APP_DATA.list({ limit: 500 });
+  // Quét phân trang KV bằng metadata (1000 key chỉ tốn 1 subrequest — KHÔNG bao giờ lỗi Too many subrequests!)
+  const INTERNAL_PREFIXES = ["~NONCE:", "NONCE:", "ADMIN_RL:", "SEC:", "IMG:", "ADM_CHAL:"];
+  const allEntries = [];
+  let cursor = undefined;
+  let listPages = 0;
+
+  while (listPages < 5) {
+    listPages++;
+    const listed = await env.APP_DATA.list({ limit: 1000, cursor });
+    for (const entry of listed.keys) {
+      const name = entry.name;
+      if (INTERNAL_PREFIXES.some(p => name.startsWith(p))) continue;
+      allEntries.push(entry);
+    }
+    if (listed.list_complete || !listed.cursor) break;
+    cursor = listed.cursor;
+  }
+
   const items = [];
-  for (const entry of listed.keys) {
+  const legacyEntries = [];
+
+  for (const entry of allEntries) {
     const name = entry.name;
-    // Bỏ qua các key nội bộ (NONCE:, ADMIN_RL:, SEC:, IMG:, ADM_CHAL:)
-    if (name.startsWith("NONCE:") || name.startsWith("ADMIN_RL:") || name.startsWith("SEC:") || name.startsWith("IMG:") || name.startsWith("ADM_CHAL:")) continue;
+    const meta = entry.metadata;
+
+    // Nhánh nhanh (0 subrequest!): đọc trực tiếp từ KV metadata
+    if (meta && typeof meta === "object" && meta.v === 1) {
+      const waiting = !!(meta.start_on_activate && !meta.activated_at && !meta.expires_at);
+      items.push({
+        key: name,
+        email: meta.email || "",
+        created_at: meta.created_at || 0,
+        activated_at: meta.activated_at || null,
+        expires_at: meta.expires_at || null,
+        duration_ms: meta.duration_ms || 0,
+        waiting_activation: waiting,
+        max_devices: Math.max(1, parseInt(meta.max_devices, 10) || 1),
+        machine_ids: Array.from({ length: meta.used_devices || 0 }, (_, idx) => idx === 0 ? (meta.first_mid || "bound") : "bound"),
+        machine_id: meta.first_mid || null,
+        disabled: !!meta.disabled,
+      });
+    } else {
+      legacyEntries.push(entry);
+    }
+  }
+
+  // Xáo trộn nhẹ danh sách key cũ chưa có metadata để tránh trùng lặp trong 1s KV eventual consistency
+  for (let i = legacyEntries.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = legacyEntries[i];
+    legacyEntries[i] = legacyEntries[j];
+    legacyEntries[j] = tmp;
+  }
+
+  // Chỉ migrate tối đa 18 key cũ mỗi nhịp (18 get + 18 put = 36 < 50 subrequest limit của Cloudflare Free!)
+  const batch = legacyEntries.slice(0, 18);
+  const moreLegacy = legacyEntries.length > 18;
+
+  for (const entry of batch) {
+    const name = entry.name;
     const lic = await getLicense(env, name);
     if (!lic || typeof lic !== "object") continue;
+    // Lưu bù metadata để từ lần sau đọc 0 subrequest
+    await putLicense(env, name, lic);
+
     const waiting = !!(lic.start_on_activate && !lic.activated_at && !lic.expires_at);
     const mids = Array.isArray(lic.machine_ids) ? lic.machine_ids : (lic.machine_id ? [lic.machine_id] : []);
     items.push({
@@ -1731,8 +1870,9 @@ async function handleListKeys(req, env) {
       disabled: !!lic.disabled,
     });
   }
+
   items.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
-  return json({ ok: true, items });
+  return json({ ok: true, items, more_legacy: moreLegacy });
 }
 
 async function handleKeyInfo(req, env) {
@@ -1828,11 +1968,14 @@ async function handleSecGet(req, env) {
   const settings = await getSecSettings(env);
   const obsRaw = await env.APP_DATA.get("SEC:OBSERVED");
   const alertRaw = await env.APP_DATA.get("SEC:ALERTS");
+  let observed = [], alerts = [];
+  try { observed = obsRaw ? JSON.parse(obsRaw) : []; } catch { observed = []; }
+  try { alerts = alertRaw ? JSON.parse(alertRaw) : []; } catch { alerts = []; }
   return json({
     ok: true,
     settings,
-    observed: obsRaw ? JSON.parse(obsRaw) : [],
-    alerts: alertRaw ? JSON.parse(alertRaw) : [],
+    observed,
+    alerts,
   });
 }
 
@@ -1863,7 +2006,7 @@ async function handleSecClearAlerts(req, env) {
 async function evaluateLicenseForApp(req, env, body, allowBindHwid = true) {
   const integ = await verifyAppIntegrity(req, env, body);
   if (!integ.ok) {
-    return { valid: false, cracked: true, error: integ.error };
+    return { valid: false, cracked: integ.cracked !== false, error: integ.error };
   }
 
   const key = (body.license_key || "").trim().toUpperCase();
@@ -1898,7 +2041,11 @@ async function evaluateLicenseForApp(req, env, body, allowBindHwid = true) {
 
   if (!mids.includes(machineId)) {
     if (mids.length >= maxDevices) {
-      return { valid: false, error: `Key đã đạt giới hạn thiết bị (${mids.length}/${maxDevices}).` };
+      return {
+        valid: false,
+        cracked: false,
+        error: `Key này chỉ cho phép ${maxDevices} thiết bị (đã gắn đủ ${mids.length}/${maxDevices} máy). Vào Admin bấm 'Reset Máy' hoặc tạo key nhiều thiết bị!`,
+      };
     }
     if (!allowBindHwid) {
       return { valid: false, error: "Thiết bị chưa được kích hoạt với key này." };

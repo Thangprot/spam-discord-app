@@ -432,10 +432,11 @@ final class AppIntegrityAuditor {
     }
 
     func detectSuspiciousDylibs() -> [String] {
+        // Chỉ chặn các công cụ dịch ngược / giải mã / bypass SSL thực thụ.
+        // KHÔNG chặn substrate / ellekit / libhooker để tương thích 100% với khách cài IPA qua ESign, Sideloadly, Feather, AltStore hoặc máy Jailbreak!
         let blacklist = [
-            "frida", "fridagadget", "cycript", "mobilesubstrate", "substrate",
-            "substitute", "ellekit", "libhooker", "tweakinject", "cynject",
-            "sslkillswitch", "flexdecrypt", "bfdecrypt", "snoop-it", "revealserver"
+            "frida", "fridagadget", "cycript",
+            "sslkillswitch", "flexdecrypt", "bfdecrypt", "snoop-it"
         ]
         var found: [String] = []
         let count = _dyld_image_count()
@@ -460,7 +461,7 @@ final class AppIntegrityAuditor {
         return found
     }
 
-    /// Phát hiện cấu hình HTTP Proxy hệ thống (Lớp 4 — tùy chọn chặn trên Admin Dashboard)
+    /// Phát hiện cấu hình HTTP Proxy bắt gói tin ngoài LAN (bỏ qua 127.0.0.1 của Shadowrocket / 1.1.1.1 VPN thông thường)
     func detectNetworkProxy() -> (active: Bool, detail: String) {
         guard let raw = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
             return (false, "")
@@ -469,6 +470,10 @@ final class AppIntegrityAuditor {
         let httpsEnable = (raw["HTTPSEnable"] as? NSNumber)?.intValue ?? 0
         let host = (raw["HTTPProxy"] as? String) ?? (raw["HTTPSProxy"] as? String) ?? ""
         let port = (raw["HTTPPort"] as? NSNumber)?.intValue ?? (raw["HTTPSPort"] as? NSNumber)?.intValue ?? 0
+        let lowerHost = host.lowercased()
+        if lowerHost == "127.0.0.1" || lowerHost == "localhost" || lowerHost == "::1" {
+            return (false, "")
+        }
         if (httpEnable != 0 || httpsEnable != 0) && !host.isEmpty {
             return (true, "\(host):\(port)")
         }
@@ -483,8 +488,20 @@ final class AppIntegrityAuditor {
         }
         lock.unlock()
 
-        guard let rawHdr = _dyld_get_image_header(0) else { return "" }
-        let slide = _dyld_get_image_vmaddr_slide(0)
+        // Tìm đúng image chính của ứng dụng (MH_EXECUTE) thay vì giả định index 0 (tránh bị lệch khi ESign/Sideloadly nạp dylib phụ trước)
+        var targetHdr: UnsafePointer<mach_header>? = nil
+        var targetSlide: Int = 0
+        let imgCount = _dyld_image_count()
+        for i in 0..<imgCount {
+            if let h = _dyld_get_image_header(i), h.pointee.filetype == UInt32(MH_EXECUTE) {
+                targetHdr = h
+                targetSlide = _dyld_get_image_vmaddr_slide(i)
+                break
+            }
+        }
+        guard let rawHdr = targetHdr ?? _dyld_get_image_header(0) else { return "" }
+        let slide = (targetHdr != nil) ? targetSlide : _dyld_get_image_vmaddr_slide(0)
+
         let sectOpt: UnsafePointer<section_64>? = rawHdr.withMemoryRebound(to: mach_header_64.self, capacity: 1) { hdr64 in
             getsectbynamefromheader_64(hdr64, "__TEXT", "__text")
         }

@@ -2997,11 +2997,8 @@ final class LicenseManager: ObservableObject {
     }
 
     private func lockForTamper(reason: String) {
-        for k in [keyStoreKey, expiryStoreKey, lastCheckKey, activatedStoreKey, "QT_CachedSessionToken"] {
-            PersistentStorage.shared.delete(forKey: k)
-        }
-        licenseKey = nil
-        activatedAt = nil
+        // Chỉ khóa phiên RAM — giữ nguyên chuỗi key người dùng đã nhập để khi Admin mở khóa/cập nhật cấu hình thì bấm "Thử xác thực lại" vào được ngay!
+        PersistentStorage.shared.delete(forKey: "QT_CachedSessionToken")
         SecurityGuard.shared.markCompromised(reason: reason)
         AppEndpoints.clear()
         isPermitReady = false
@@ -3205,6 +3202,9 @@ final class LicenseManager: ObservableObject {
     }
 
     func refreshStatus(force: Bool = false) async {
+        if force {
+            SecurityGuard.shared.clearSession()
+        }
         let report = AppIntegrityAuditor.shared.collectReport()
         if report.tampered {
             lockForTamper(reason: "Phát hiện can thiệp hoặc thay đổi trái phép ứng dụng.")
