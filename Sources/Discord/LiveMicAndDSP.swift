@@ -208,13 +208,14 @@ final class LiveMicCaptureEngine {
     }
 
     func stopCapture(restorePlaybackSession: Bool = true) {
+        isCapturing = false
         if let eng = audioEngine {
             eng.inputNode.removeTap(onBus: 0)
             eng.stop()
+            eng.reset()
         }
         audioEngine = nil
         converter = nil
-        isCapturing = false
 
         os_unfair_lock_lock(&lock)
         writeIndex = 0
@@ -225,7 +226,7 @@ final class LiveMicCaptureEngine {
         os_unfair_lock_unlock(&lock)
 
         if restorePlaybackSession {
-            BackgroundManager.shared.applyAudioSessionCategory()
+            BackgroundManager.shared.releaseMicrophoneAndSyncSession()
         }
     }
 
@@ -841,7 +842,12 @@ final class TreoRoomLiveMicManager: ObservableObject {
     static let shared = TreoRoomLiveMicManager()
 
     @Published var isEnabled: Bool = false
-    @Published var isMuted: Bool = false { didSet { syncParams() } }
+    @Published var isMuted: Bool = false {
+        didSet {
+            syncParams()
+            handleMuteHardwareSync()
+        }
+    }
     @Published var micGain: Float = 3.0 { didSet { syncParams() } }        // 100% -> 1500%
     @Published var boostMultiplier: Float = 2.0 { didSet { syncParams() } } // 100% -> 2000%
     @Published var bassAmount: Float = 20.0 { didSet { syncParams() } }
@@ -858,6 +864,7 @@ final class TreoRoomLiveMicManager: ObservableObject {
     private var workerThread: Thread?
     private var stopFlag = NSLock()
     private var _shouldStop = false
+    private var wantsEnabled = false
     private var previousRoomMute: Bool? = nil
 
     private init() {
@@ -882,6 +889,18 @@ final class TreoRoomLiveMicManager: ObservableObject {
         }
     }
 
+    private func handleMuteHardwareSync() {
+        guard isEnabled else { return }
+        if isMuted {
+            inputLevel = 0
+            if !(MusicStreamManager.shared.isPlaying && !MusicStreamManager.shared.isPaused && !MusicStreamManager.shared.isMicMuted && MusicStreamManager.shared.sourceMode.usesMicrophone) {
+                LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: true)
+            }
+        } else if VoiceRoomManager.shared.isRunning {
+            try? LiveMicCaptureEngine.shared.startCapture()
+        }
+    }
+
     func setLiveMicEnabled(_ on: Bool) {
         if on {
             startInTreoRoom()
@@ -894,28 +913,42 @@ final class TreoRoomLiveMicManager: ObservableObject {
         let room = VoiceRoomManager.shared
         guard room.isRunning, !room.sessions.isEmpty else {
             errorMessage = "Hãy bấm Bắt Đầu Treo Room trước khi bật Nói Qua Mic!"
+            wantsEnabled = false
             isEnabled = false
             return
         }
         if MusicStreamManager.shared.isPlaying && MusicStreamManager.shared.sourceMode.usesMicrophone {
             errorMessage = "Mic đang được sử dụng bên tab Xả Mic & Nhạc."
+            wantsEnabled = false
             isEnabled = false
             return
         }
 
+        wantsEnabled = true
         Task { @MainActor in
             let granted = await LiveMicCaptureEngine.requestPermission()
             guard granted else {
                 self.errorMessage = "Chưa cấp quyền Microphone trong Cài đặt iPhone!"
+                self.wantsEnabled = false
                 self.isEnabled = false
                 return
             }
-            do {
-                try LiveMicCaptureEngine.shared.startCapture()
-            } catch {
-                self.errorMessage = error.localizedDescription
+            // Kiểm tra lại phòng trường hợp người dùng đã tắt Treo Room trong lúc chờ cấp quyền!
+            guard self.wantsEnabled, room.isRunning, !room.sessions.isEmpty else {
+                self.wantsEnabled = false
                 self.isEnabled = false
+                LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: true)
                 return
+            }
+            if !self.isMuted {
+                do {
+                    try LiveMicCaptureEngine.shared.startCapture()
+                } catch {
+                    self.errorMessage = error.localizedDescription
+                    self.wantsEnabled = false
+                    self.isEnabled = false
+                    return
+                }
             }
 
             self.errorMessage = nil
@@ -930,20 +963,27 @@ final class TreoRoomLiveMicManager: ObservableObject {
         }
     }
 
-    func stopInTreoRoom() {
+    func stopInTreoRoom(restoreSession: Bool = true) {
+        wantsEnabled = false
         stopFlag.lock()
         _shouldStop = true
         stopFlag.unlock()
         workerThread?.cancel()
         workerThread = nil
 
-        if !(MusicStreamManager.shared.isPlaying && MusicStreamManager.shared.sourceMode.usesMicrophone) {
-            LiveMicCaptureEngine.shared.stopCapture()
-        }
-
         let wasEnabled = isEnabled
         isEnabled = false
+        isMuted = false
         inputLevel = 0
+
+        let musicStillUsingMic = MusicStreamManager.shared.isPlaying
+            && !MusicStreamManager.shared.isPaused
+            && !MusicStreamManager.shared.isMicMuted
+            && MusicStreamManager.shared.sourceMode.usesMicrophone
+
+        if !musicStillUsingMic {
+            LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: restoreSession)
+        }
 
         let room = VoiceRoomManager.shared
         if wasEnabled && room.isRunning {
@@ -1003,6 +1043,15 @@ final class TreoRoomLiveMicManager: ObservableObject {
                     holdoverFrames -= 1
                 }
 
+                let activeSessions = sessionBox.get()
+                if activeSessions.isEmpty {
+                    // Phòng Treo Room đã dừng -> tự tắt hoàn toàn Live Mic & giải phóng phần cứng!
+                    DispatchQueue.main.async { [weak self] in
+                        self?.stopInTreoRoom()
+                    }
+                    break
+                }
+
                 var peak: Float = 0
                 if hasVoice || holdoverFrames > 0 {
                     for i in 0..<960 {
@@ -1032,15 +1081,12 @@ final class TreoRoomLiveMicManager: ObservableObject {
                         manualPan: cfg.manualPan
                     )
                     if let opus = encoder.encode(leftChannel: left, rightChannel: right) {
-                        let sessions = sessionBox.get()
-                        for s in sessions where s.isVoiceUDPReady {
+                        for s in activeSessions where s.isVoiceUDPReady {
                             s.sendOpusPacket(opus)
                         }
                     }
                 } else {
-                    // Gửi khung im lặng chuẩn để đồng hồ RTP mượt liên tục
-                    let sessions = sessionBox.get()
-                    for s in sessions where s.isVoiceUDPReady {
+                    for s in activeSessions where s.isVoiceUDPReady {
                         s.sendOpusPacket(silenceOpus)
                     }
                 }
@@ -1068,20 +1114,26 @@ final class TreoRoomLiveMicManager: ObservableObject {
 
 struct ParallelLiveMicDeckCard: View {
     @ObservedObject var liveMic = TreoRoomLiveMicManager.shared
+    @ObservedObject var voiceRoom = VoiceRoomManager.shared
     @State private var expanded = false
 
     private let accent = Color(red: 0.96, green: 0.26, blue: 0.36)
 
     var body: some View {
+        let micOpen = liveMic.isEnabled && !liveMic.isMuted && voiceRoom.isRunning
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 11) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .fill(LinearGradient(colors: [.red, .orange], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .fill(
+                            micOpen
+                                ? LinearGradient(colors: [.red, .orange], startPoint: .topLeading, endPoint: .bottomTrailing)
+                                : LinearGradient(colors: [Color.gray.opacity(0.35), Color.gray.opacity(0.22)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
                         .frame(width: 38, height: 38)
-                    Image(systemName: liveMic.isMuted ? "mic.slash.fill" : "mic.and.signal.meter.fill")
+                    Image(systemName: micOpen ? "mic.and.signal.meter.fill" : "mic.slash.fill")
                         .font(.system(size: 16, weight: .bold))
-                        .foregroundColor(.white)
+                        .foregroundColor(micOpen ? .white : .secondary)
                 }
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -1089,12 +1141,12 @@ struct ParallelLiveMicDeckCard: View {
                         Text("Nói Qua Mic (Xả Mic Trực Tiếp)")
                             .font(.system(size: 15, weight: .bold, design: .rounded))
                             .lineLimit(1)
-                        Text(liveMic.isEnabled ? "● LIVE" : "TREO ROOM")
+                        Text(micOpen ? "● ĐANG BẬT" : "ĐÃ TẮT")
                             .font(.system(size: 9, weight: .black, design: .rounded))
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
-                            .background(liveMic.isEnabled ? accent : accent.opacity(0.14))
-                            .foregroundColor(liveMic.isEnabled ? .white : accent)
+                            .background(micOpen ? accent : Color.secondary.opacity(0.14))
+                            .foregroundColor(micOpen ? .white : .secondary)
                             .clipShape(Capsule())
                     }
                     Text("Nói vào iPhone -> cả dàn Token phát to + đổi giọng + trái/phải")
@@ -1106,11 +1158,16 @@ struct ParallelLiveMicDeckCard: View {
                 Spacer()
 
                 Toggle("", isOn: Binding(
-                    get: { liveMic.isEnabled },
+                    get: { liveMic.isEnabled && voiceRoom.isRunning },
                     set: { liveMic.setLiveMicEnabled($0) }
                 ))
                 .labelsHidden()
                 .tint(accent)
+            }
+            .onChange(of: voiceRoom.isRunning) { running in
+                if !running && (liveMic.isEnabled || LiveMicCaptureEngine.shared.isCapturing) {
+                    liveMic.stopInTreoRoom()
+                }
             }
 
             if let err = liveMic.errorMessage {

@@ -1288,6 +1288,36 @@ final class BackgroundManager {
         }
     }
 
+    /// Giải phóng dứt điểm phần cứng Microphone (tắt chấm cam iOS ngay lập tức) rồi đồng bộ lại phiên nền nếu cần
+    func releaseMicrophoneAndSyncSession() {
+        let work = {
+            // Dừng tạm engine nền cũ đang giữ route .playAndRecord để CoreAudio nhả hẳn kênh Input Mic!
+            self.silentPlayer?.stop()
+            self.silentPlayer = nil
+            if let eng = self.engine {
+                eng.stop()
+                eng.reset()
+            }
+            self.engine = nil
+            self.sourceNode = nil
+
+            let session = AVAudioSession.sharedInstance()
+            if self.isKeepAliveActive {
+                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+                try? session.setCategory(.playback, mode: .default, options: self.audioSessionOptions())
+                self.ensureRunning()
+            } else {
+                try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+            }
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
     func stopAll() {
         lock.lock()
         activeTags.removeAll()
@@ -1297,9 +1327,18 @@ final class BackgroundManager {
             self.watchdogTimer = nil
             self.silentPlayer?.stop()
             self.silentPlayer = nil
-            self.engine?.stop()
+            if let eng = self.engine {
+                eng.stop()
+                eng.reset()
+            }
             self.engine = nil
             self.sourceNode = nil
+            if LiveMicCaptureEngine.shared.isCapturing {
+                LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: false)
+            }
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+            try? session.setActive(false, options: [.notifyOthersOnDeactivation])
             if self.bgTask != .invalid {
                 UIApplication.shared.endBackgroundTask(self.bgTask)
                 self.bgTask = .invalid
@@ -6183,7 +6222,6 @@ final class VoiceRoomManager: ObservableObject {
     }
 
     func stopTreo() {
-        TreoRoomLiveMicManager.shared.stopInTreoRoom()
         joinTask?.cancel()
         joinTask = nil
         goLiveEngine.stop()
@@ -6198,9 +6236,14 @@ final class VoiceRoomManager: ObservableObject {
         }
         sessions.removeAll()
         isRunning = false
+        TreoRoomLiveMicManager.shared.stopInTreoRoom(restoreSession: false)
         NowPlayingHelper.shared.endSession(.treoVoice)
         BackgroundManager.shared.stop(tag: "treo")
-        addLog("Đã dừng treo room, Fake Cam và Go Live.")
+        if !(MusicStreamManager.shared.isPlaying && !MusicStreamManager.shared.isPaused && !MusicStreamManager.shared.isMicMuted && MusicStreamManager.shared.sourceMode.usesMicrophone) {
+            LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: false)
+            BackgroundManager.shared.releaseMicrophoneAndSyncSession()
+        }
+        addLog("Đã dừng treo room, Fake Cam, Go Live và tắt Mic.")
     }
 
     func updateToggles(mute: Bool, deaf: Bool, video: Bool) {
@@ -6281,7 +6324,10 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
     // Cấu hình Thu Mic Trực Tiếp & Đổi Giọng & Định Vị Tai Nghe Trái/Phải/8D
     @Published var isMicMuted: Bool = false {
-        didSet { rtState.update { $0.isMicMuted = isMicMuted } }
+        didSet {
+            rtState.update { $0.isMicMuted = isMicMuted }
+            syncMicHardwareState()
+        }
     }
     @Published var micGainMultiplier: Float = 3.0 { // Độ nhạy thu Mic: 100% -> 1500%
         didSet { rtState.update { $0.micGainMultiplier = micGainMultiplier } }
@@ -6365,18 +6411,44 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         super.init()
     }
 
+    private func syncMicHardwareState() {
+        let shouldCapture = isPlaying && !isPaused && !isMicMuted && sourceMode.usesMicrophone
+        if shouldCapture {
+            if !LiveMicCaptureEngine.shared.isCapturing {
+                try? LiveMicCaptureEngine.shared.startCapture()
+            }
+        } else {
+            micInputLevel = 0
+            let treoStillUsing = TreoRoomLiveMicManager.shared.isEnabled && !TreoRoomLiveMicManager.shared.isMuted && VoiceRoomManager.shared.isRunning
+            if !treoStillUsing && LiveMicCaptureEngine.shared.isCapturing {
+                LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: true)
+            }
+        }
+    }
+
     private func handleSourceModeChangeWhileRunning() {
-        guard isPlaying else { return }
+        guard isPlaying else {
+            micInputLevel = 0
+            let treoStillUsing = TreoRoomLiveMicManager.shared.isEnabled && !TreoRoomLiveMicManager.shared.isMuted && VoiceRoomManager.shared.isRunning
+            if !treoStillUsing && LiveMicCaptureEngine.shared.isCapturing {
+                LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: true)
+            }
+            return
+        }
         if sourceMode.usesMicrophone {
             Task { @MainActor in
                 if TreoRoomLiveMicManager.shared.isEnabled {
-                    TreoRoomLiveMicManager.shared.stopInTreoRoom()
+                    TreoRoomLiveMicManager.shared.stopInTreoRoom(restoreSession: false)
                 }
                 let granted = await LiveMicCaptureEngine.requestPermission()
                 guard granted else {
                     self.addLog("❌ Chưa cấp quyền Microphone trong Cài đặt iPhone!")
                     self.statusText = "❌ Cần bật quyền Microphone cho ứng dụng"
                     self.sourceMode = .musicOnly
+                    return
+                }
+                guard self.isPlaying, !self.isPaused, !self.isMicMuted, self.sourceMode.usesMicrophone else {
+                    self.syncMicHardwareState()
                     return
                 }
                 do {
@@ -6388,9 +6460,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 }
             }
         } else {
-            if !TreoRoomLiveMicManager.shared.isEnabled {
-                LiveMicCaptureEngine.shared.stopCapture()
-            }
+            syncMicHardwareState()
             statusText = "🔥 Đang xả: \(currentSongTitle)"
         }
     }
@@ -6710,24 +6780,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
             if self.sourceMode.usesMicrophone {
                 if TreoRoomLiveMicManager.shared.isEnabled {
-                    await MainActor.run { TreoRoomLiveMicManager.shared.stopInTreoRoom() }
+                    await MainActor.run { TreoRoomLiveMicManager.shared.stopInTreoRoom(restoreSession: false) }
                 }
                 let granted = await LiveMicCaptureEngine.requestPermission()
                 guard granted else {
                     await MainActor.run {
                         self.statusText = "❌ Chưa cấp quyền Microphone trong Cài đặt iPhone!"
                         self.addLog("❌ Vui lòng bật quyền Microphone cho ứng dụng trong Cài đặt iOS")
-                        self.stopSpam()
-                    }
-                    return
-                }
-                do {
-                    try await MainActor.run {
-                        try LiveMicCaptureEngine.shared.startCapture()
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.statusText = "❌ Lỗi khởi tạo Mic: \(error.localizedDescription)"
                         self.stopSpam()
                     }
                     return
@@ -6815,6 +6874,20 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
 
             await MainActor.run {
+                guard self.isPlaying else {
+                    self.syncMicHardwareState()
+                    return
+                }
+                if self.sourceMode.usesMicrophone && !self.isMicMuted && !self.isPaused {
+                    do {
+                        try LiveMicCaptureEngine.shared.startCapture()
+                    } catch {
+                        self.statusText = "❌ Lỗi khởi tạo Mic: \(error.localizedDescription)"
+                        self.stopSpam()
+                        return
+                    }
+                }
+
                 let modeLabel = self.sourceMode == .liveMicOnly ? "🎙️ Đang Nói Qua Mic" : "🔥 Đang xả: \(self.currentSongTitle)"
                 self.statusText = "\(modeLabel) (\(readySessions.count) Token)"
                 self.addLog("🔥 Đã vào phòng thành công! \(readySessions.count)/\(createdSessions.count) Token bắt đầu phát đồng loạt siêu mượt!")
@@ -6859,12 +6932,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         guard isPlaying else { return }
         isPaused = true
         rtState.update { $0.isPaused = true }
+        syncMicHardwareState()
         for s in activeSessions {
             s.setSpeaking(false)
         }
         localPlayer?.pause()
-        statusText = "🔇 Đã tạm ngắt âm thanh (Giữ Token trong phòng)"
-        addLog("🔇 Đã tạm ngắt âm thanh. Giữ nguyên toàn bộ Token trong phòng.")
+        statusText = "🔇 Đã tạm ngắt âm thanh & tắt Mic (Giữ Token trong phòng)"
+        addLog("🔇 Đã tạm ngắt âm thanh & tắt Mic. Giữ nguyên toàn bộ Token trong phòng.")
         syncMusicNowPlaying()
     }
 
@@ -6872,6 +6946,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         guard isPlaying else { return }
         isPaused = false
         rtState.update { $0.isPaused = false }
+        syncMicHardwareState()
         for s in activeSessions where s.isVoiceUDPReady {
             s.setSpeaking(true)
         }
@@ -6889,13 +6964,10 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     func stopSpam() {
         isPlaying = false
         isPaused = false
+        isMicMuted = false
         rtState.requestStop()
         realtimeThread?.cancel()
         realtimeThread = nil
-
-        if !TreoRoomLiveMicManager.shared.isEnabled {
-            LiveMicCaptureEngine.shared.stopCapture()
-        }
         micInputLevel = 0
 
         let silence = Data([0xF8, 0xFF, 0xFE])
@@ -6914,7 +6986,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         NowPlayingHelper.shared.endSession(.music)
         BackgroundManager.shared.stop(tag: "music")
 
-        statusText = "⛩️ Đã dừng phát (Chưa hoạt động)"
+        let treoStillUsingMic = TreoRoomLiveMicManager.shared.isEnabled && !TreoRoomLiveMicManager.shared.isMuted && VoiceRoomManager.shared.isRunning
+        if !treoStillUsingMic {
+            LiveMicCaptureEngine.shared.stopCapture(restorePlaybackSession: false)
+            BackgroundManager.shared.releaseMicrophoneAndSyncSession()
+        }
+
+        statusText = "⛩️ Đã dừng phát & tắt Mic (Chưa hoạt động)"
         currentTime = 0
         streamFrameIndex = 0
     }
@@ -7779,27 +7857,35 @@ struct VoiceRoomTabView: View {
                 Spacer(minLength: 0)
             }
 
-            // 4. Bảng điều khiển nhanh Thu Mic Trực Tiếp (hiện khi chọn Nói Qua Mic hoặc Nhạc + Mic)
+            // 4. Bảng điều khiển nhanh Thu Mic Trực Tiếp (hiện rõ trạng thái TẮT khi chưa chạy!)
             if musicStream.sourceMode.usesMicrophone {
+                let micActuallyOpen = isLive && !musicStream.isPaused && !musicStream.isMicMuted
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
-                        Image(systemName: musicStream.isMicMuted ? "mic.slash.fill" : "mic.and.signal.meter.fill")
+                        Image(systemName: micActuallyOpen ? "mic.and.signal.meter.fill" : "mic.slash.fill")
                             .font(.system(size: 13, weight: .bold))
-                            .foregroundColor(musicStream.isMicMuted ? .orange : .green)
-                        Text(musicStream.isMicMuted ? "Mic đang tạm tắt" : "Độ nhạy thu Mic: \(Int(musicStream.micGainMultiplier * 100))%")
+                            .foregroundColor(micActuallyOpen ? .green : .secondary)
+                        Text(micActuallyOpen
+                             ? "Mic đang thu • Độ nhạy: \(Int(musicStream.micGainMultiplier * 100))%"
+                             : (isLive ? "Mic đang tạm tắt" : "Mic đang TẮT • Độ nhạy cài sẵn: \(Int(musicStream.micGainMultiplier * 100))%"))
                             .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundColor(micActuallyOpen ? .primary : .secondary)
                         Spacer()
-                        Button {
-                            musicStream.isMicMuted.toggle()
-                        } label: {
-                            Text(musicStream.isMicMuted ? "Mở Mic" : "Tắt Tiếng Mic")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(musicStream.isMicMuted ? .green : .orange)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background((musicStream.isMicMuted ? Color.green : Color.orange).opacity(0.16), in: Capsule())
+                        if isLive {
+                            Button {
+                                musicStream.isMicMuted.toggle()
+                            } label: {
+                                Text(musicStream.isMicMuted ? "Mở Mic" : "Tắt Tiếng Mic")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(musicStream.isMicMuted ? .green : .orange)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background((musicStream.isMicMuted ? Color.green : Color.orange).opacity(0.16), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            microBadge("ĐÃ TẮT MIC", bg: Color.secondary.opacity(0.14), fg: .secondary)
                         }
-                        .buttonStyle(.plain)
                     }
 
                     // Thanh đo cường độ giọng nói Mic trực tiếp
