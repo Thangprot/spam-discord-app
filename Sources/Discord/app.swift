@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import Security
 import AVFoundation
+import CoreMedia
 import AudioToolbox
 import UniformTypeIdentifiers
 import UIKit
@@ -1164,7 +1165,15 @@ final class BackgroundManager {
     func applyAudioSessionCategory() {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: audioSessionOptions())
+            if LiveMicCaptureEngine.shared.isCapturing {
+                try session.setCategory(
+                    .playAndRecord,
+                    mode: .default,
+                    options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .allowAirPlay, .mixWithOthers]
+                )
+            } else {
+                try session.setCategory(.playback, mode: .default, options: audioSessionOptions())
+            }
             try session.setActive(true, options: [])
         } catch {
             print("[BG] AVAudioSession WARN: \(error)")
@@ -3968,7 +3977,7 @@ final class DaveE2EESession {
 final class NativeOpusEncoder {
     private var handle: OpaquePointer?
 
-    init?(sampleRate: Int32 = 48000, channels: Int32 = 2, bitRate: Int32 = 96000) {
+    init?(sampleRate: Int32 = 48000, channels: Int32 = 2, bitRate: Int32 = 128000) {
         guard let h = dave_opus_encoder_new(sampleRate, channels, bitRate) else {
             return nil
         }
@@ -3996,11 +4005,11 @@ final class NativeOpusEncoder {
     }
 }
 
-// MARK: - AUDIO TRACK DECODER (Giải mã mp3, wav, m4a, flac sang 48kHz Float32 Stereo)
+// MARK: - AUDIO TRACK DECODER (Giải mã mp3, wav, m4a, flac & cả video mp4/mov sang 48kHz Float32 Stereo bất biến)
 final class AudioTrackDecoder {
-    var leftSamples: [Float] = []
-    var rightSamples: [Float] = []
-    var durationSeconds: Double = 0
+    let leftSamples: [Float]
+    let rightSamples: [Float]
+    let durationSeconds: Double
     var totalFrames: Int {
         return leftSamples.count / 960
     }
@@ -4011,6 +4020,16 @@ final class AudioTrackDecoder {
             if accessed { url.stopAccessingSecurityScopedResource() }
         }
 
+        if let decoded = AudioTrackDecoder.decodeViaAudioFile(url: url) ?? AudioTrackDecoder.decodeViaAssetReader(url: url) {
+            self.leftSamples = decoded.left
+            self.rightSamples = decoded.right
+            self.durationSeconds = Double(decoded.left.count) / 48000.0
+        } else {
+            return nil
+        }
+    }
+
+    private static func decodeViaAudioFile(url: URL) -> (left: [Float], right: [Float])? {
         guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
         let processingFormat = audioFile.processingFormat
         let fileLength = audioFile.length
@@ -4028,7 +4047,7 @@ final class AudioTrackDecoder {
             converter.channelMap = [0, 0]
         }
 
-        let readCapacity: AVAudioFrameCount = 4096
+        let readCapacity: AVAudioFrameCount = 8192
         let ratio = 48000.0 / max(1.0, processingFormat.sampleRate)
         let outCapacity: AVAudioFrameCount = AVAudioFrameCount(ceil(Double(readCapacity) * ratio)) + 2048
 
@@ -4069,29 +4088,63 @@ final class AudioTrackDecoder {
             var error: NSError?
             outputBuffer.frameLength = outCapacity
             let status = converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
-
-            if status == .error || error != nil {
-                break
-            }
+            if status == .error || error != nil { break }
 
             let count = Int(outputBuffer.frameLength)
             if count > 0, let ch = outputBuffer.floatChannelData {
                 allL.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: count))
                 allR.append(contentsOf: UnsafeBufferPointer(start: ch[1], count: count))
             }
-
-            if status == .endOfStream {
-                break
-            }
-            if status == .inputRanDry && reachedEOF {
-                break
-            }
+            if status == .endOfStream || (status == .inputRanDry && reachedEOF) { break }
         }
 
         guard !allL.isEmpty else { return nil }
-        self.leftSamples = allL
-        self.rightSamples = allR
-        self.durationSeconds = Double(allL.count) / 48000.0
+        return (allL, allR)
+    }
+
+    /// Giải mã âm thanh trực tiếp từ file Video (.mp4 / .mov) chọn từ App Ảnh iPhone
+    private static func decodeViaAssetReader(url: URL) -> (left: [Float], right: [Float])? {
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .audio).first,
+              let reader = try? AVAssetReader(asset: asset) else { return nil }
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 48000.0,
+            AVNumberOfChannelsKey: 2,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        guard reader.startReading() else { return nil }
+
+        var allL: [Float] = []
+        var allR: [Float] = []
+        while reader.status == .reading, let sb = output.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(sb) else { continue }
+            var length = 0
+            var dataPtr: UnsafeMutablePointer<Int8>?
+            if CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPtr) == kCMBlockBufferNoErr,
+               let rawPtr = dataPtr, length >= 8 {
+                let floatCount = length / MemoryLayout<Float>.size
+                let stereoPairs = floatCount / 2
+                rawPtr.withMemoryRebound(to: Float.self, capacity: floatCount) { fPtr in
+                    allL.reserveCapacity(allL.count + stereoPairs)
+                    allR.reserveCapacity(allR.count + stereoPairs)
+                    for i in 0..<stereoPairs {
+                        allL.append(fPtr[i * 2])
+                        allR.append(fPtr[i * 2 + 1])
+                    }
+                }
+            }
+        }
+        guard !allL.isEmpty else { return nil }
+        return (allL, allR)
     }
 
     init(left: [Float], right: [Float], durationSeconds: Double) {
@@ -5627,9 +5680,18 @@ final class VoiceRoomManager: ObservableObject {
     @Published var streamCacheStatus: H264CacheStatus = .none
     @Published var camCacheStatus: H264CacheStatus = .none
 
-    @Published var sessions: [VoiceGatewaySession] = []
+    @Published var sessions: [VoiceGatewaySession] = [] {
+        didSet {
+            audioSessionsBox.set(sessions)
+        }
+    }
     @Published var elapsedSeconds: Int = 0
     @Published var logs: [VoiceLogEntry] = []
+
+    nonisolated let audioSessionsBox = ThreadSafeVoiceSessionBox()
+    nonisolated func sessionsSnapshotForAudio() -> [VoiceGatewaySession] {
+        audioSessionsBox.get()
+    }
 
     private var timer: Timer?
     private var joinTask: Task<Void, Never>?
@@ -6121,12 +6183,15 @@ final class VoiceRoomManager: ObservableObject {
     }
 
     func stopTreo() {
+        TreoRoomLiveMicManager.shared.stopInTreoRoom()
         joinTask?.cancel()
         joinTask = nil
         goLiveEngine.stop()
         fakeCamEngine.stop()
         timer?.invalidate()
         timer = nil
+
+        audioSessionsBox.set([])
 
         for s in sessions {
             s.stop()
@@ -6206,38 +6271,128 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     @Published var duration: Double = 0
     @Published var visualizerLevels: [CGFloat] = [0.2, 0.4, 0.7, 0.3, 0.9, 0.5, 0.8, 0.4]
 
-    // Cấu hình âm thanh & Sát chiêu chiến đấu Make Super VIP
-    @Published var volume: Float = 1.0 { // Chân hỏa: 0.0 to 2.0 (0% - 200%)
-        didSet { localPlayer?.volume = min(1.0, volume) }
+    // Chế độ Nguồn Phát: Xả Nhạc / Nói Qua Mic Trực Tiếp / Nhạc + Mic
+    @Published var sourceMode: AudioSourceMode = .musicOnly {
+        didSet {
+            rtState.update { $0.sourceMode = sourceMode }
+            handleSourceModeChangeWhileRunning()
+        }
     }
-    @Published var boostMultiplier: Float = 1.0 // Ép xung: 1.0 to 5.0 (100% - 500%)
-    @Published var bassAmount: Float = 0.0 // Trọng lực Bass: 0 to 100
-    @Published var isCleanMode: Bool = false // !xoatapam: Lọc ồn chủ động (Highpass 150Hz + Lowpass 10kHz)
-    @Published var isMaxMode: Bool = false // !max: Sát chiêu V9 Tối Thượng (EQ 80Hz + 3500Hz + Boost 2.5x)
-    @Published var playbackSpeed: Float = 1.0 // Tốc độ phát: 0.75, 1.0, 1.25, 1.5
-    @Published var audioFX: SpamAudioFX = .normal
-    @Published var loopMode: PlaylistLoopMode = .loopAll // Vòng lặp vô hạn
-    @Published var playLocalSpeaker: Bool = false // Loa ngoài (Mặc định tắt)
 
-    // Dàn phiên âm thanh (Đa phân thân)
-    @Published var activeSessions: [VoiceGatewaySession] = []
-    private var streamTask: Task<Void, Never>?
-    var currentDecoder: AudioTrackDecoder?
+    // Cấu hình Thu Mic Trực Tiếp & Đổi Giọng & Định Vị Tai Nghe Trái/Phải/8D
+    @Published var isMicMuted: Bool = false {
+        didSet { rtState.update { $0.isMicMuted = isMicMuted } }
+    }
+    @Published var micGainMultiplier: Float = 3.0 { // Độ nhạy thu Mic: 100% -> 1500%
+        didSet { rtState.update { $0.micGainMultiplier = micGainMultiplier } }
+    }
+    @Published var micNoiseGate: Float = 0.0035 {
+        didSet { rtState.update { $0.micNoiseGate = micNoiseGate } }
+    }
+    @Published var autoDuckMusic: Bool = true {
+        didSet { rtState.update { $0.autoDuckMusic = autoDuckMusic } }
+    }
+    @Published var micInputLevel: Float = 0.0
+
+    @Published var voicePreset: VoiceChangerPreset = .normal {
+        didSet { rtState.update { $0.voicePreset = voicePreset } }
+    }
+    @Published var pitchSemitones: Float = 0.0 { // -12 ... +12 bán cung
+        didSet { rtState.update { $0.pitchSemitones = pitchSemitones } }
+    }
+    @Published var echoAmount: Float = 0.0 { // 0.0 ... 1.0
+        didSet { rtState.update { $0.echoAmount = echoAmount } }
+    }
+    @Published var earMode: StereoEarMode = .center {
+        didSet { rtState.update { $0.earMode = earMode } }
+    }
+    @Published var manualPan: Float = 0.0 { // -1.0 (100% Trái) ... +1.0 (100% Phải)
+        didSet { rtState.update { $0.manualPan = manualPan } }
+    }
+    @Published var isUserScrubbing: Bool = false
+
+    // Cấu hình âm thanh & Sát chiêu chiến đấu Make Super VIP (Volume tới 300%, Boost tới 2000%!)
+    @Published var volume: Float = 1.0 {
+        didSet {
+            localPlayer?.volume = min(1.0, volume)
+            rtState.update { $0.volume = volume }
+        }
+    }
+    @Published var boostMultiplier: Float = 1.0 { // Ép xung Xả Mic: 1.0 -> 20.0 (100% -> 2000%)
+        didSet { rtState.update { $0.boostMultiplier = boostMultiplier } }
+    }
+    @Published var bassAmount: Float = 0.0 {
+        didSet { rtState.update { $0.bassAmount = bassAmount } }
+    }
+    @Published var isCleanMode: Bool = false {
+        didSet { rtState.update { $0.isCleanMode = isCleanMode } }
+    }
+    @Published var isMaxMode: Bool = false {
+        didSet { rtState.update { $0.isMaxMode = isMaxMode } }
+    }
+    @Published var playbackSpeed: Float = 1.0 {
+        didSet { rtState.update { $0.playbackSpeed = playbackSpeed } }
+    }
+    @Published var audioFX: SpamAudioFX = .normal {
+        didSet { rtState.update { $0.audioFX = audioFX } }
+    }
+    @Published var loopMode: PlaylistLoopMode = .loopAll
+    @Published var playLocalSpeaker: Bool = false
+
+    // Dàn phiên âm thanh & Luồng Thời Gian Thực Mach 20.000ms (0% giật lag!)
+    @Published var activeSessions: [VoiceGatewaySession] = [] {
+        didSet { rtState.update { $0.sessions = activeSessions } }
+    }
+    private let rtState = RealtimeMusicEngineState()
+    private var realtimeThread: Thread?
+    private var trackGenCounter: UInt64 = 0
+    var currentDecoder: AudioTrackDecoder? {
+        didSet {
+            trackGenCounter &+= 1
+            let dec = currentDecoder
+            let gen = trackGenCounter
+            rtState.update {
+                $0.decoder = dec
+                $0.trackGeneration = gen
+            }
+            rtState.requestSeek(sampleIndex: 0)
+        }
+    }
     private var streamFrameIndex = 0
     private var localPlayer: AVAudioPlayer?
 
-    // DSP Filter States
-    private var bassStateL: Float = 0
-    private var bassStateR: Float = 0
-    private var hpStateL: Float = 0
-    private var hpStateR: Float = 0
-    private var prevInL: Float = 0
-    private var prevInR: Float = 0
-    private var lpStateL: Float = 0
-    private var lpStateR: Float = 0
-
     private override init() {
         super.init()
+    }
+
+    private func handleSourceModeChangeWhileRunning() {
+        guard isPlaying else { return }
+        if sourceMode.usesMicrophone {
+            Task { @MainActor in
+                if TreoRoomLiveMicManager.shared.isEnabled {
+                    TreoRoomLiveMicManager.shared.stopInTreoRoom()
+                }
+                let granted = await LiveMicCaptureEngine.requestPermission()
+                guard granted else {
+                    self.addLog("❌ Chưa cấp quyền Microphone trong Cài đặt iPhone!")
+                    self.statusText = "❌ Cần bật quyền Microphone cho ứng dụng"
+                    self.sourceMode = .musicOnly
+                    return
+                }
+                do {
+                    try LiveMicCaptureEngine.shared.startCapture()
+                    self.addLog("🎙️ Đã bật thu giọng trực tiếp qua Mic iPhone (\(self.sourceMode.rawValue))!")
+                    self.statusText = "🎙️ Đang phát trực tiếp: \(self.sourceMode.rawValue)"
+                } catch {
+                    self.addLog("⚠️ Không mở được Mic: \(error.localizedDescription)")
+                }
+            }
+        } else {
+            if !TreoRoomLiveMicManager.shared.isEnabled {
+                LiveMicCaptureEngine.shared.stopCapture()
+            }
+            statusText = "🔥 Đang xả: \(currentSongTitle)"
+        }
     }
 
     var currentTrack: PlaylistItem? {
@@ -6475,17 +6630,19 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         } catch {}
     }
 
-    // MARK: - BẮT ĐẦU XẢ ROOM TIÊN NGHỊCH (ĐA TOKEN ĐỒNG LOẠT MAKE SUPER VIP)
+    // MARK: - BẮT ĐẦU XẢ NHẠC & NÓI QUA MIC (ĐA TOKEN ĐỒNG LOẠT SIÊU MƯỢT)
     func startSpam(app: AppState) {
-        guard let decoder = currentDecoder, !decoder.leftSamples.isEmpty else {
-            statusText = "❌ Chưa nạp pháp bảo nhạc vào hàng đợi"
-            return
+        if sourceMode != .liveMicOnly {
+            guard let decoder = currentDecoder, !decoder.leftSamples.isEmpty else {
+                statusText = "❌ Chưa chọn bài nhạc (hoặc chuyển sang chế độ Nói Qua Mic)"
+                return
+            }
         }
 
         let inputCID = targetChannelId.trimmingCharacters(in: .whitespacesAndNewlines)
         let channelId = !inputCID.isEmpty ? inputCID : (selectedChannel?.id ?? "")
         guard !channelId.isEmpty else {
-            statusText = "❌ Vui lòng nhập Channel ID hoặc chọn phòng xả"
+            statusText = "❌ Vui lòng nhập Channel ID hoặc chọn phòng Voice"
             return
         }
 
@@ -6519,22 +6676,25 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         isPlaying = true
         isPaused = false
-        statusText = "⚡ Triệu tập \(tokensToUse.count) Đạo hữu xuất thủ..."
+        rtState.update { $0.isPaused = false }
+        statusText = "⚡ Đang kết nối \(tokensToUse.count) Token vào phòng..."
         streamFrameIndex = 0
         currentTime = 0
-        addLog("⚡ Khởi động HỆ THỐNG TIÊN NGHỊCH: Triệu tập \(tokensToUse.count) Đạo hữu vào phòng [\(channelId)]")
+        rtState.requestSeek(sampleIndex: 0)
+        addLog("⚡ Khởi động [\(sourceMode.rawValue)]: Kết nối \(tokensToUse.count) Token vào phòng [\(channelId)]")
 
+        let displayTitle = (sourceMode == .liveMicOnly) ? "🎙️ Nói Qua Mic Trực Tiếp" : currentSongTitle
         BackgroundManager.shared.start(tag: "music")
         NowPlayingHelper.shared.registerSession(
             NowPlayingSessionState(
                 feature: .music,
-                title: currentSongTitle,
-                detail: "Xả Nhạc VIP • Triệu tập \(tokensToUse.count) token",
-                controlsHint: "⏸ Câm/Sủa • ◀◀/▶▶ Chuyển bài • Kéo tua",
+                title: displayTitle,
+                detail: "\(sourceMode.rawValue) • \(tokensToUse.count) token",
+                controlsHint: "⏸ Tạm dừng/Phát • ◀◀/▶▶ Chuyển bài • Kéo tua",
                 isPaused: false,
                 elapsedTime: 0,
-                duration: duration,
-                isLiveStream: duration <= 0,
+                duration: sourceMode == .liveMicOnly ? 0 : duration,
+                isLiveStream: sourceMode == .liveMicOnly || duration <= 0,
                 onPlay: { [weak self] in self?.resumeSpam() },
                 onPause: { [weak self] in self?.pauseSpam() },
                 onStop: { [weak self] in self?.stopSpam() },
@@ -6547,6 +6707,32 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         Task { [weak self] in
             guard let self = self else { return }
+
+            if self.sourceMode.usesMicrophone {
+                if TreoRoomLiveMicManager.shared.isEnabled {
+                    await MainActor.run { TreoRoomLiveMicManager.shared.stopInTreoRoom() }
+                }
+                let granted = await LiveMicCaptureEngine.requestPermission()
+                guard granted else {
+                    await MainActor.run {
+                        self.statusText = "❌ Chưa cấp quyền Microphone trong Cài đặt iPhone!"
+                        self.addLog("❌ Vui lòng bật quyền Microphone cho ứng dụng trong Cài đặt iOS")
+                        self.stopSpam()
+                    }
+                    return
+                }
+                do {
+                    try await MainActor.run {
+                        try LiveMicCaptureEngine.shared.startCapture()
+                    }
+                } catch {
+                    await MainActor.run {
+                        self.statusText = "❌ Lỗi khởi tạo Mic: \(error.localizedDescription)"
+                        self.stopSpam()
+                    }
+                    return
+                }
+            }
 
             let authorized = await LicenseManager.shared.authorizeFeature(.music)
             guard authorized else {
@@ -6570,13 +6756,13 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 await MainActor.run {
                     self.statusText = "❌ Không tìm thấy Server (Kiểm tra Channel ID hoặc quyền token)"
                     self.addLog("❌ Không tra cứu được Guild ID cho phòng \(channelId)")
-                    self.isPlaying = false
+                    self.stopSpam()
                 }
                 return
             }
 
             await MainActor.run {
-                self.statusText = "Đang kết nối toàn bộ \(tokensToUse.count) phân thân vào Voice UDP..."
+                self.statusText = "Đang kết nối \(tokensToUse.count) Token vào kênh Voice UDP..."
             }
 
             var createdSessions: [VoiceGatewaySession] = []
@@ -6612,7 +6798,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 if readyCount > 0 && (readyCount == createdSessions.count || waited > 15) {
                     break
                 }
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                try? await Task.sleep(nanoseconds: 400_000_000)
                 waited += 1
             }
 
@@ -6621,7 +6807,7 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 await MainActor.run {
                     if self.isPlaying {
                         self.statusText = "❌ Kết nối Voice thất bại (Hết thời gian chờ UDP)"
-                        self.addLog("❌ Không thể thiết lập kênh UDP cho các phân thân")
+                        self.addLog("❌ Không thể thiết lập kênh UDP cho các Token")
                         self.stopSpam()
                     }
                 }
@@ -6629,19 +6815,19 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
 
             await MainActor.run {
-                self.statusText = "🔥 Đang xả hỏa lực: \(self.currentSongTitle) (\(readySessions.count) Đạo hữu)"
-                self.addLog("🔥 Trận pháp đã kết thành! \(readySessions.count)/\(createdSessions.count) phân thân bắt đầu xả nhạc đồng loạt!")
+                let modeLabel = self.sourceMode == .liveMicOnly ? "🎙️ Đang Nói Qua Mic" : "🔥 Đang xả: \(self.currentSongTitle)"
+                self.statusText = "\(modeLabel) (\(readySessions.count) Token)"
+                self.addLog("🔥 Đã vào phòng thành công! \(readySessions.count)/\(createdSessions.count) Token bắt đầu phát đồng loạt siêu mượt!")
 
                 let silence = Data([0xF8, 0xFF, 0xFE])
                 for s in readySessions {
                     s.setSpeaking(true)
-                    // Gửi 5 gói im lặng mở luồng SSRC để Discord kích hoạt bộ giải mã thoại ngay lập tức
                     for _ in 0..<5 {
                         s.sendOpusPacket(silence)
                     }
                 }
 
-                if self.playLocalSpeaker, let url = self.audioFileURL {
+                if self.playLocalSpeaker, self.sourceMode != .liveMicOnly, let url = self.audioFileURL {
                     self.setupLocalPlayer(url: url)
                     self.localPlayer?.play()
                 }
@@ -6655,44 +6841,47 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     func syncMusicNowPlaying() {
         guard isPlaying else { return }
         let readyCount = activeSessions.filter { $0.isVoiceUDPReady }.count
-        let countLabel = readyCount > 0 ? "\(readyCount) phân thân" : "Đang kết nối..."
+        let countLabel = readyCount > 0 ? "\(readyCount) token" : "Đang kết nối..."
+        let titleLabel = sourceMode == .liveMicOnly ? "🎙️ Nói Qua Mic • \(voicePreset.rawValue)" : currentSongTitle
         NowPlayingHelper.shared.updateSession(
             .music,
-            title: currentSongTitle,
-            detail: "Xả Nhạc VIP • \(countLabel) • \(audioFX.rawValue)",
+            title: titleLabel,
+            detail: "\(sourceMode.rawValue) • \(countLabel) • \(earMode.rawValue)",
             isPaused: isPaused,
             elapsedTime: currentTime,
-            duration: duration,
-            isLiveStream: duration <= 0
+            duration: sourceMode == .liveMicOnly ? 0 : duration,
+            isLiveStream: sourceMode == .liveMicOnly || duration <= 0
         )
     }
 
-    // MARK: - SÁT CHIÊU CÂM MỒM (!cam) & SỦA TIẾP (!sua)
+    // MARK: - TẠM DỪNG (!cam) & TIẾP TỤC (!sua)
     func pauseSpam() {
         guard isPlaying else { return }
         isPaused = true
+        rtState.update { $0.isPaused = true }
         for s in activeSessions {
             s.setSpeaking(false)
         }
         localPlayer?.pause()
-        statusText = "🔇 Đã phong ấn âm thanh (Câm mồm)"
-        addLog("🔇 Đã phong ấn âm thanh (Câm mồm). Giữ nguyên toàn bộ phân thân trong phòng.")
+        statusText = "🔇 Đã tạm ngắt âm thanh (Giữ Token trong phòng)"
+        addLog("🔇 Đã tạm ngắt âm thanh. Giữ nguyên toàn bộ Token trong phòng.")
         syncMusicNowPlaying()
     }
 
     func resumeSpam() {
         guard isPlaying else { return }
         isPaused = false
+        rtState.update { $0.isPaused = false }
         for s in activeSessions where s.isVoiceUDPReady {
             s.setSpeaking(true)
         }
         localPlayer?.play()
-        statusText = "🔊 Đã giải ấn! Tiếp tục xả hỏa lực"
-        addLog("🔊 Đã giải ấn! Tiếp tục xả hỏa lực y như lúc ban đầu.")
+        statusText = sourceMode == .liveMicOnly ? "🎙️ Đang Nói Qua Mic trực tiếp!" : "🔊 Tiếp tục xả: \(currentSongTitle)"
+        addLog("🔊 Đã mở lại âm thanh trực tiếp!")
         syncMusicNowPlaying()
     }
 
-    // MARK: - BẾ QUAN / THU HỒI PHÂN THÂN (!exit)
+    // MARK: - DỪNG PHÁT & THU HỒI TOKEN
     func stop() {
         stopSpam()
     }
@@ -6700,8 +6889,14 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     func stopSpam() {
         isPlaying = false
         isPaused = false
-        streamTask?.cancel()
-        streamTask = nil
+        rtState.requestStop()
+        realtimeThread?.cancel()
+        realtimeThread = nil
+
+        if !TreoRoomLiveMicManager.shared.isEnabled {
+            LiveMicCaptureEngine.shared.stopCapture()
+        }
+        micInputLevel = 0
 
         let silence = Data([0xF8, 0xFF, 0xFE])
         for session in activeSessions {
@@ -6719,192 +6914,331 @@ final class MusicStreamManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         NowPlayingHelper.shared.endSession(.music)
         BackgroundManager.shared.stop(tag: "music")
 
-        statusText = "⛩️ Bế quan (Đã thu hồi toàn bộ phân thân)"
-        addLog("⛩️ Đã bế quan, giải tán hàng đợi nhạc và thu hồi toàn bộ phân thân.")
+        statusText = "⛩️ Đã dừng phát (Chưa hoạt động)"
         currentTime = 0
         streamFrameIndex = 0
     }
 
     func seek(to seconds: Double) {
         guard let decoder = currentDecoder, decoder.durationSeconds > 0 else { return }
-        let fraction = min(1.0, max(0.0, seconds / decoder.durationSeconds))
-        streamFrameIndex = Int(Double(decoder.totalFrames) * fraction)
-        currentTime = seconds
-        localPlayer?.currentTime = seconds
+        let clampedSec = min(decoder.durationSeconds, max(0.0, seconds))
+        let targetSample = clampedSec * 48000.0
+        rtState.requestSeek(sampleIndex: targetSample)
+        streamFrameIndex = Int(targetSample / 960.0)
+        currentTime = clampedSec
+        localPlayer?.currentTime = clampedSec
         if isPlaying { syncMusicNowPlaying() }
     }
 
-    // MARK: - STREAMING ENGINE ĐA PHÂN THÂN MAKE SUPER VIP
-    private func startStreamingTask() {
-        streamTask?.cancel()
+    func skip(by deltaSeconds: Double) {
+        guard let decoder = currentDecoder, decoder.durationSeconds > 0 else { return }
+        seek(to: currentTime + deltaSeconds)
+    }
 
-        streamTask = Task.detached { [weak self] in
-            guard let self = self else { return }
-            var speedAccumulator: Float = 0
-            guard let encoder = NativeOpusEncoder() else {
-                await MainActor.run {
-                    self.addLog("❌ Lỗi nghiêm trọng: Không thể khởi tạo bộ mã hóa Opus!")
-                    self.statusText = "❌ Lỗi bộ mã hóa Opus"
+    private func handleRealtimeTrackEnded(generation: UInt64) {
+        guard isPlaying, generation == trackGenCounter else { return }
+        if loopMode == .loopOne || playlist.count <= 1 {
+            rtState.requestSeek(sampleIndex: 0)
+            currentTime = 0
+            streamFrameIndex = 0
+            localPlayer?.currentTime = 0
+        } else {
+            playNext()
+        }
+    }
+
+    // MARK: - REAL-TIME 20.000ms MACH PACED AUDIO ENGINE (0% MAINACTOR STALL — HẾT SẠCH GIẬT TIẾNG!)
+    private func startStreamingTask() {
+        rtState.requestStop()
+        realtimeThread?.cancel()
+        realtimeThread = nil
+
+        let curMode = sourceMode
+        let curPaused = isPaused
+        let curMicMuted = isMicMuted
+        let curDuck = autoDuckMusic
+        let curVol = volume
+        let curBoost = boostMultiplier
+        let curMicGain = micGainMultiplier
+        let curGate = micNoiseGate
+        let curBass = bassAmount
+        let curClean = isCleanMode
+        let curMax = isMaxMode
+        let curSpd = playbackSpeed
+        let curFX = audioFX
+        let curVoice = voicePreset
+        let curPitch = pitchSemitones
+        let curEcho = echoAmount
+        let curEar = earMode
+        let curPan = manualPan
+        let curDec = currentDecoder
+        let curGen = trackGenCounter
+        let curSess = activeSessions
+        let initialSample = currentTime * 48000.0
+
+        rtState.resetForStart { s in
+            s.sourceMode = curMode
+            s.isPaused = curPaused
+            s.isMicMuted = curMicMuted
+            s.autoDuckMusic = curDuck
+            s.volume = curVol
+            s.boostMultiplier = curBoost
+            s.micGainMultiplier = curMicGain
+            s.micNoiseGate = curGate
+            s.bassAmount = curBass
+            s.isCleanMode = curClean
+            s.isMaxMode = curMax
+            s.playbackSpeed = curSpd
+            s.audioFX = curFX
+            s.voicePreset = curVoice
+            s.pitchSemitones = curPitch
+            s.echoAmount = curEcho
+            s.earMode = curEar
+            s.manualPan = curPan
+            s.decoder = curDec
+            s.trackGeneration = curGen
+            s.sessions = curSess
+        }
+        if initialSample > 0 {
+            rtState.requestSeek(sampleIndex: initialSample)
+        }
+
+        let stateRef = self.rtState
+        let thread = Thread { [weak self] in
+            Thread.current.name = "QT.AudioRTP.Realtime20ms"
+            Thread.current.qualityOfService = .userInteractive
+            Thread.current.threadPriority = 1.0
+
+            guard let encoder = NativeOpusEncoder(sampleRate: 48000, channels: 2, bitRate: 128000) else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.addLog("❌ Lỗi nghiêm trọng: Không thể khởi tạo bộ mã hóa Opus!")
+                    self?.statusText = "❌ Lỗi bộ mã hóa Opus"
                 }
                 return
             }
 
-            var hpStateL: Float = 0
-            var hpStateR: Float = 0
-            var prevInL: Float = 0
-            var prevInR: Float = 0
-            var lpStateL: Float = 0
-            var lpStateR: Float = 0
-            var bassStateL: Float = 0
-            var bassStateR: Float = 0
-            var nextTickNanos = DispatchTime.now().uptimeNanoseconds
+            let voiceDSP = RealtimeAudioDSPProcessor()
+            let masterDSP = RealtimeAudioDSPProcessor()
 
-            while !Task.isCancelled {
-                nextTickNanos &+= 20_000_000
+            var musicL = [Float](repeating: 0, count: 960)
+            var musicR = [Float](repeating: 0, count: 960)
+            var micMono = [Float](repeating: 0, count: 960)
+            var micL = [Float](repeating: 0, count: 960)
+            var micR = [Float](repeating: 0, count: 960)
+            var mixL = [Float](repeating: 0, count: 960)
+            var mixR = [Float](repeating: 0, count: 960)
+            let silenceOpus = Data([0xF8, 0xFF, 0xFE])
 
-                let snapshot = await MainActor.run { () -> (curIdx: Int, currentVol: Float, currentBoost: Float, bassAmt: Float, isClean: Bool, isMax: Bool, isPaused: Bool, currentFX: SpamAudioFX, currentSpeed: Float, decoder: AudioTrackDecoder?, readySessions: [VoiceGatewaySession]) in
-                    return (
-                        self.streamFrameIndex,
-                        self.volume,
-                        self.boostMultiplier,
-                        self.bassAmount,
-                        self.isCleanMode,
-                        self.isMaxMode,
-                        self.isPaused,
-                        self.audioFX,
-                        self.playbackSpeed,
-                        self.currentDecoder,
-                        self.activeSessions.filter { $0.isVoiceUDPReady }
+            var sampleCursor: Double = initialSample
+            var activeGen: UInt64 = curGen
+            var notifiedEndGen: UInt64 = UInt64.max
+            var duckGain: Float = 1.0
+            var micHoldoverFrames: Int = 0
+            var tickCount: Int = 0
+
+            let stepTicks = MachRealtimeClock.nanosToAbs(20_000_000) // Chính xác 20.000ms mỗi gói RTP
+            let maxCatchupTicks = MachRealtimeClock.nanosToAbs(60_000_000)
+            var nextDeadline = mach_absolute_time()
+
+            while !Thread.current.isCancelled {
+                nextDeadline &+= stepTicks
+                let poll = stateRef.pollTick()
+                if poll.shouldStop { break }
+
+                let cfg = poll.config
+                if cfg.trackGeneration != activeGen {
+                    activeGen = cfg.trackGeneration
+                    sampleCursor = 0
+                    notifiedEndGen = UInt64.max
+                    masterDSP.triggerSeekMicroFade()
+                }
+                if let seekSample = poll.seekSample {
+                    sampleCursor = seekSample
+                    notifiedEndGen = UInt64.max
+                    masterDSP.triggerSeekMicroFade()
+                }
+
+                if cfg.isPaused {
+                    let now = mach_absolute_time()
+                    if nextDeadline > now { mach_wait_until(nextDeadline) }
+                    else { nextDeadline = now }
+                    continue
+                }
+
+                // 1. Nhánh Giải Mã Nhạc Nội Suy Mẫu Mượt (Không bao giờ nhảy cóc khung 20ms gây giật tiếng!)
+                var hasMusicAudio = false
+                if cfg.sourceMode == .musicOnly || cfg.sourceMode == .musicAndMic {
+                    if let dec = cfg.decoder, !dec.leftSamples.isEmpty {
+                        let lArr = dec.leftSamples
+                        let rArr = dec.rightSamples
+                        let total = lArr.count
+                        var effSpeed = Double(cfg.playbackSpeed)
+                        if cfg.audioFX == .nightcore { effSpeed = 1.25 }
+                        else if cfg.audioFX == .slowed { effSpeed = 0.85 }
+                        effSpeed = max(0.4, min(2.2, effSpeed))
+
+                        if Int(sampleCursor) + 2 >= total {
+                            for i in 0..<960 { musicL[i] = 0; musicR[i] = 0 }
+                            if notifiedEndGen != activeGen {
+                                notifiedEndGen = activeGen
+                                let endedGen = activeGen
+                                DispatchQueue.main.async { [weak self] in
+                                    self?.handleRealtimeTrackEnded(generation: endedGen)
+                                }
+                            }
+                        } else {
+                            hasMusicAudio = true
+                            let maxIdx = total - 1
+                            for i in 0..<960 {
+                                let i0 = min(maxIdx, max(0, Int(sampleCursor)))
+                                let i1 = min(maxIdx, i0 + 1)
+                                let frac = Float(sampleCursor - Double(i0))
+                                musicL[i] = lArr[i0] * (1.0 - frac) + lArr[i1] * frac
+                                musicR[i] = rArr[i0] * (1.0 - frac) + rArr[i1] * frac
+                                sampleCursor += effSpeed
+                            }
+                        }
+                    } else {
+                        for i in 0..<960 { musicL[i] = 0; musicR[i] = 0 }
+                    }
+                }
+
+                // 2. Nhánh Thu Giọng Trực Tiếp Từ Mic iPhone + Bộ Đổi Giọng
+                var hasMicVoice = false
+                var micPeakRaw: Float = 0
+                if cfg.sourceMode == .liveMicOnly || cfg.sourceMode == .musicAndMic {
+                    let voiced = !cfg.isMicMuted && LiveMicCaptureEngine.shared.popFrame960(into: &micMono, noiseGateThreshold: cfg.micNoiseGate)
+                    if voiced {
+                        micHoldoverFrames = 12 // giữ 240ms đuôi câu
+                    } else if micHoldoverFrames > 0 {
+                        micHoldoverFrames -= 1
+                    }
+                    if voiced || micHoldoverFrames > 0 {
+                        hasMicVoice = true
+                        for i in 0..<960 {
+                            let v = micMono[i] * cfg.micGainMultiplier
+                            micL[i] = v
+                            micR[i] = v
+                            let av = abs(v)
+                            if av > micPeakRaw { micPeakRaw = av }
+                        }
+                        if cfg.voicePreset != .normal || abs(cfg.pitchSemitones) > 0.08 || cfg.echoAmount > 0.01 {
+                            voiceDSP.applyVoiceChanger(
+                                left: &micL,
+                                right: &micR,
+                                preset: cfg.voicePreset,
+                                pitchOffsetSemitones: cfg.pitchSemitones,
+                                echoAmount: cfg.echoAmount
+                            )
+                        }
+                    } else {
+                        for i in 0..<960 { micL[i] = 0; micR[i] = 0 }
+                    }
+                }
+
+                // 3. Hòa Trộn (Mix) + Đổi Giọng Cho Nhạc (khi ở chế độ Xả Nhạc đơn) + Auto-Duck
+                var shouldSendSilence = false
+                switch cfg.sourceMode {
+                case .musicOnly:
+                    if hasMusicAudio {
+                        for i in 0..<960 { mixL[i] = musicL[i]; mixR[i] = musicR[i] }
+                        if cfg.voicePreset != .normal || abs(cfg.pitchSemitones) > 0.08 || cfg.echoAmount > 0.01 {
+                            voiceDSP.applyVoiceChanger(
+                                left: &mixL,
+                                right: &mixR,
+                                preset: cfg.voicePreset,
+                                pitchOffsetSemitones: cfg.pitchSemitones,
+                                echoAmount: cfg.echoAmount
+                            )
+                        }
+                    } else {
+                        shouldSendSilence = true
+                    }
+                case .liveMicOnly:
+                    if hasMicVoice {
+                        for i in 0..<960 { mixL[i] = micL[i]; mixR[i] = micR[i] }
+                    } else {
+                        shouldSendSilence = true
+                    }
+                case .musicAndMic:
+                    if !hasMusicAudio && !hasMicVoice {
+                        shouldSendSilence = true
+                    } else {
+                        let targetDuck: Float = (cfg.autoDuckMusic && hasMicVoice) ? 0.34 : 1.0
+                        for i in 0..<960 {
+                            duckGain += 0.008 * (targetDuck - duckGain)
+                            mixL[i] = (hasMusicAudio ? musicL[i] * duckGain : 0) + (hasMicVoice ? micL[i] : 0)
+                            mixR[i] = (hasMusicAudio ? musicR[i] * duckGain : 0) + (hasMicVoice ? micR[i] : 0)
+                        }
+                    }
+                }
+
+                // 4. Nén Công Suất Cực Đại (Xả Mic tới 2000%!) + Chỉnh Tai Trái / Phải / Giữa / 8D + Gửi Opus
+                var outPeak: Float = 0
+                if shouldSendSilence {
+                    for s in cfg.sessions where s.isVoiceUDPReady {
+                        s.sendOpusPacket(silenceOpus)
+                    }
+                } else {
+                    outPeak = masterDSP.applyMasterLoudnessAndStereoPan(
+                        left: &mixL,
+                        right: &mixR,
+                        volume: cfg.volume,
+                        boostMultiplier: cfg.boostMultiplier,
+                        bassAmount: cfg.bassAmount,
+                        isCleanMode: cfg.isCleanMode,
+                        isMaxMode: cfg.isMaxMode,
+                        audioFX: cfg.audioFX,
+                        earMode: cfg.earMode,
+                        manualPan: cfg.manualPan
                     )
-                }
-
-                if snapshot.isPaused {
-                    try? await Task.sleep(nanoseconds: 20_000_000)
-                    nextTickNanos = DispatchTime.now().uptimeNanoseconds
-                    continue
-                }
-
-                guard let decoder = snapshot.decoder, !decoder.leftSamples.isEmpty else {
-                    try? await Task.sleep(nanoseconds: 20_000_000)
-                    nextTickNanos = DispatchTime.now().uptimeNanoseconds
-                    continue
-                }
-
-                let leftSamples = decoder.leftSamples
-                let rightSamples = decoder.rightSamples
-                let totalSamples = leftSamples.count
-
-                let startSample = snapshot.curIdx * 960
-                let endSample = startSample + 960
-
-                if endSample > totalSamples {
-                    await MainActor.run {
-                        self.playNext()
-                    }
-                    try? await Task.sleep(nanoseconds: 20_000_000)
-                    nextTickNanos = DispatchTime.now().uptimeNanoseconds
-                    continue
-                }
-
-                var chunkL = Array(leftSamples[startSample..<endSample])
-                var chunkR = Array(rightSamples[startSample..<endSample])
-
-                // 1. Lọc ồn chủ động (Highpass 150Hz + Lowpass 10kHz)
-                if snapshot.isClean {
-                    for i in 0..<960 {
-                        hpStateL = 0.98 * (hpStateL + chunkL[i] - prevInL)
-                        prevInL = chunkL[i]
-                        chunkL[i] = hpStateL
-
-                        hpStateR = 0.98 * (hpStateR + chunkR[i] - prevInR)
-                        prevInR = chunkR[i]
-                        chunkR[i] = hpStateR
-
-                        lpStateL += 0.75 * (chunkL[i] - lpStateL)
-                        chunkL[i] = lpStateL
-                        lpStateR += 0.75 * (chunkR[i] - lpStateR)
-                        chunkR[i] = lpStateR
+                    if let opus = encoder.encode(leftChannel: mixL, rightChannel: mixR) {
+                        for s in cfg.sessions where s.isVoiceUDPReady {
+                            s.sendOpusPacket(opus)
+                        }
                     }
                 }
 
-                // 2. Sát chiêu V9 Tối Thượng hoặc Trọng Lực Bass
-                if snapshot.isMax {
-                    for i in 0..<960 {
-                        bassStateL += 0.35 * (chunkL[i] - bassStateL)
-                        chunkL[i] = chunkL[i] + bassStateL * 2.2
-                        bassStateR += 0.35 * (chunkR[i] - bassStateR)
-                        chunkR[i] = chunkR[i] + bassStateR * 2.2
-
-                        let biteL = chunkL[i] - bassStateL
-                        chunkL[i] += biteL * 1.6
-                        let biteR = chunkR[i] - bassStateR
-                        chunkR[i] += biteR * 1.6
-
-                        chunkL[i] = tanh(chunkL[i] * 2.5)
-                        chunkR[i] = tanh(chunkR[i] * 2.5)
-                    }
-                } else if snapshot.bassAmt > 0 || snapshot.currentFX == .bassBoost {
-                    let factor = (snapshot.bassAmt / 50.0) + (snapshot.currentFX == .bassBoost ? 1.0 : 0.0)
-                    for i in 0..<960 {
-                        bassStateL += 0.28 * (chunkL[i] - bassStateL)
-                        chunkL[i] = max(-1.0, min(1.0, chunkL[i] + bassStateL * (1.2 * factor)))
-                        bassStateR += 0.28 * (chunkR[i] - bassStateR)
-                        chunkR[i] = max(-1.0, min(1.0, chunkR[i] + bassStateR * (1.2 * factor)))
-                    }
-                }
-
-                // 3. Earrape FX
-                if snapshot.currentFX == .earrape {
-                    for i in 0..<960 {
-                        chunkL[i] = tanh(chunkL[i] * 4.0)
-                        chunkR[i] = tanh(chunkR[i] * 4.0)
+                // 5. Cập nhật thanh thời gian & Visualizer nhẹ nhàng 8 lần/giây (KHÔNG khóa luồng âm thanh!)
+                tickCount &+= 1
+                if tickCount % 6 == 0 {
+                    let curSec = sampleCursor / 48000.0
+                    let lvlBase = max(0.08, min(0.98, CGFloat(outPeak)))
+                    let mLvl = min(1.0, micPeakRaw)
+                    let syncNP = (tickCount % 60 == 0)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self, self.isPlaying else { return }
+                        if !self.isUserScrubbing && self.sourceMode != .liveMicOnly {
+                            self.currentTime = curSec
+                        }
+                        self.micInputLevel = mLvl
+                        self.visualizerLevels = [
+                            max(0.15, lvlBase * 0.72),
+                            max(0.18, min(0.98, lvlBase * 0.95)),
+                            max(0.15, min(0.98, lvlBase * 1.05)),
+                            max(0.16, lvlBase * 0.80),
+                            max(0.20, min(0.98, lvlBase * 1.08)),
+                            max(0.15, lvlBase * 0.86),
+                            max(0.18, min(0.98, lvlBase * 0.92)),
+                            max(0.14, lvlBase * 0.68)
+                        ]
+                        if syncNP {
+                            self.syncMusicNowPlaying()
+                        }
                     }
                 }
 
-                // 4. Chân hỏa Volume & Ép xung Boost (Volume * Boost)
-                let totalGain = snapshot.currentVol * snapshot.currentBoost
-                if totalGain != 1.0 {
-                    for i in 0..<960 {
-                        chunkL[i] = tanh(chunkL[i] * totalGain)
-                        chunkR[i] = tanh(chunkR[i] * totalGain)
-                    }
-                }
-
-                // 5. Mã hóa Opus bằng lõi Xiph Opus thuần Rust và xả tới toàn bộ phân thân Đạo Hữu
-                if let opus = encoder.encode(leftChannel: chunkL, rightChannel: chunkR) {
-                    for s in snapshot.readySessions {
-                        s.sendOpusPacket(opus)
-                    }
-                }
-
-                // 6. Cập nhật tiến độ & visualizer
-                var effSpeed = snapshot.currentSpeed
-                if snapshot.currentFX == .nightcore { effSpeed = 1.25 }
-                else if snapshot.currentFX == .slowed { effSpeed = 0.85 }
-
-                speedAccumulator += effSpeed
-                let advance = max(1, Int(speedAccumulator))
-                speedAccumulator -= Float(advance)
-
-                await MainActor.run {
-                    self.streamFrameIndex += advance
-                    if self.streamFrameIndex % 5 == 0 {
-                        self.currentTime = Double(self.streamFrameIndex * 960) / 48000.0
-                        self.visualizerLevels = (0..<8).map { _ in CGFloat.random(in: 0.2...0.95) }
-                    }
-                    if self.streamFrameIndex % 50 == 0 {
-                        self.syncMusicNowPlaying()
-                    }
-                }
-
-                let nowNanos = DispatchTime.now().uptimeNanoseconds
-                if nextTickNanos > nowNanos {
-                    try? await Task.sleep(nanoseconds: nextTickNanos - nowNanos)
-                } else if nowNanos - nextTickNanos > 100_000_000 {
-                    nextTickNanos = nowNanos
+                // 6. Ngủ chính xác theo đồng hồ phần cứng Mach (sai số < 0.1ms)
+                let now = mach_absolute_time()
+                if nextDeadline > now {
+                    mach_wait_until(nextDeadline)
+                } else if now - nextDeadline > maxCatchupTicks {
+                    nextDeadline = now
                 }
             }
         }
+        self.realtimeThread = thread
+        thread.start()
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -6925,13 +7259,14 @@ struct VoiceRoomTabView: View {
 
     @State private var mode: TabMode = .xaMic
     enum TabMode: String, CaseIterable, Identifiable {
-        case xaMic = "Xả Nhạc VIP"
+        case xaMic = "Xả Mic & Nhạc"
         case treoRoom = "Treo Room 24/7"
         var id: String { rawValue }
     }
 
     @State private var showGuildPicker = false
     @State private var showDocumentPicker = false
+    @State private var showMusicPhotoPicker = false
     @State private var showStreamMediaPicker = false
     @State private var showCamMediaPicker = false
     @State private var showStreamPhotoPicker = false
@@ -6939,6 +7274,8 @@ struct VoiceRoomTabView: View {
     @State private var copiedMusicLog = false
     @State private var copiedRoomLog = false
     @State private var pulseLive = false
+    @State private var isDraggingTimeline = false
+    @State private var dragTimelineSeconds: Double = 0
 
     private var accentStart: Color {
         mode == .xaMic ? Color(red: 0.95, green: 0.24, blue: 0.28) : Color(red: 0.36, green: 0.34, blue: 0.96)
@@ -7000,8 +7337,13 @@ struct VoiceRoomTabView: View {
                 VoiceGuildPickerSheet(isForSpam: mode == .xaMic)
             }
             .sheet(isPresented: $showDocumentPicker) {
-                DocumentPicker(contentTypes: [.audio], allowsMultipleSelection: true) { _ in } onPickMultiple: { urls in
+                DocumentPicker(contentTypes: [.audio, .movie, .video, .mpeg4Movie, .quickTimeMovie], allowsMultipleSelection: true) { _ in } onPickMultiple: { urls in
                     musicStream.addFiles(urls: urls)
+                }
+            }
+            .sheet(isPresented: $showMusicPhotoPicker) {
+                PhotoLibraryPicker(filterMode: .videosOnly) { url, _ in
+                    musicStream.addFiles(urls: [url])
                 }
             }
             .sheet(isPresented: $showStreamMediaPicker) {
@@ -7312,7 +7654,7 @@ struct VoiceRoomTabView: View {
         }
     }
 
-    // Card 1: Hero Now Playing Audio Deck
+    // Card 1: Hero Now Playing + Chế Độ Nói Qua Mic + Thanh Tua Thời Gian Siêu Mượt
     private var nowPlayingCard: some View {
         let isLive = musicStream.isPlaying
         let readyCount = musicStream.activeSessions.filter { $0.isVoiceUDPReady }.count
@@ -7321,6 +7663,41 @@ struct VoiceRoomTabView: View {
             borderColor: isLive ? Color.red.opacity(0.35) : Color.primary.opacity(0.07),
             borderWidth: isLive ? 1.5 : 1
         ) {
+            // 1. Chuyển nhanh Nguồn Phát: Xả Nhạc / Nói Qua Mic / Nhạc + Mic (đổi trực tiếp ngay cả khi đang chạy!)
+            HStack(spacing: 6) {
+                ForEach(AudioSourceMode.allCases) { sm in
+                    let sel = (musicStream.sourceMode == sm)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            musicStream.sourceMode = sm
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: sm.icon)
+                                .font(.system(size: 11, weight: .bold))
+                            Text(sm.rawValue)
+                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(
+                            Group {
+                                if sel {
+                                    LinearGradient(colors: [.red, .orange], startPoint: .leading, endPoint: .trailing)
+                                } else {
+                                    Color(UIColor.tertiarySystemGroupedBackground)
+                                }
+                            }
+                        )
+                        .foregroundColor(sel ? .white : .primary)
+                        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            // 2. Dòng trạng thái trực tiếp
             HStack(spacing: 8) {
                 ZStack {
                     if isLive && !musicStream.isPaused {
@@ -7343,12 +7720,13 @@ struct VoiceRoomTabView: View {
                 Spacer()
 
                 if isLive {
-                    microBadge("⚡ \(readyCount) ĐẠO HỮU", bg: Color.red.opacity(0.16), fg: .red)
+                    microBadge("⚡ \(readyCount) TOKEN", bg: Color.red.opacity(0.16), fg: .red)
                 } else {
-                    microBadge("STANDBY", bg: Color(UIColor.tertiarySystemGroupedBackground), fg: .secondary)
+                    microBadge("SẴN SÀNG", bg: Color(UIColor.tertiarySystemGroupedBackground), fg: .secondary)
                 }
             }
 
+            // 3. Thông tin Bài Hát / Mic & Visualizer
             HStack(spacing: 14) {
                 ZStack {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -7370,30 +7748,30 @@ struct VoiceRoomTabView: View {
                                 Capsule()
                                     .fill(Color.white)
                                     .frame(width: 4, height: max(8, lvl * 28))
-                                    .animation(.spring(response: 0.16, dampingFraction: 0.55), value: lvl)
                             }
                         }
                         .frame(height: 30)
                     } else {
-                        Image(systemName: "music.note")
+                        Image(systemName: musicStream.sourceMode == .liveMicOnly ? "mic.fill" : "music.note")
                             .font(.system(size: 22, weight: .bold))
                             .foregroundColor(isLive ? .white : .red)
                     }
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(musicStream.currentSongTitle)
+                    Text(musicStream.sourceMode == .liveMicOnly ? "🎙️ Nói Qua Mic Trực Tiếp" : musicStream.currentSongTitle)
                         .font(.system(size: 16, weight: .bold, design: .rounded))
                         .foregroundColor(.primary)
                         .lineLimit(1)
 
-                    HStack(spacing: 6) {
-                        microBadge(musicStream.audioFX.rawValue, bg: Color.red.opacity(0.12), fg: .red)
-                        if musicStream.isMaxMode {
-                            microBadge("V9 MAX", bg: Color.orange.opacity(0.18), fg: .orange)
-                        }
-                        if musicStream.isCleanMode {
-                            microBadge("CLEAN", bg: Color.teal.opacity(0.18), fg: .teal)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            microBadge(musicStream.voicePreset.rawValue, bg: Color.purple.opacity(0.15), fg: .purple)
+                            microBadge(musicStream.earMode.rawValue, bg: Color.indigo.opacity(0.15), fg: .indigo)
+                            microBadge(musicStream.audioFX.rawValue, bg: Color.red.opacity(0.12), fg: .red)
+                            if musicStream.isMaxMode {
+                                microBadge("V9 MAX", bg: Color.orange.opacity(0.18), fg: .orange)
+                            }
                         }
                     }
                 }
@@ -7401,53 +7779,145 @@ struct VoiceRoomTabView: View {
                 Spacer(minLength: 0)
             }
 
-            if isLive && !musicStream.isPaused {
-                HStack(alignment: .bottom, spacing: 6) {
-                    ForEach(0..<8, id: \.self) { i in
-                        let lvl = i < musicStream.visualizerLevels.count ? musicStream.visualizerLevels[i] : 0.3
-                        Capsule()
-                            .fill(
-                                LinearGradient(
-                                    colors: [Color(red: 0.96, green: 0.24, blue: 0.30), Color.orange, Color.purple],
-                                    startPoint: .bottom,
-                                    endPoint: .top
-                                )
-                            )
-                            .frame(maxWidth: .infinity)
-                            .frame(height: max(8, lvl * 30))
-                            .animation(.spring(response: 0.15, dampingFraction: 0.52), value: lvl)
+            // 4. Bảng điều khiển nhanh Thu Mic Trực Tiếp (hiện khi chọn Nói Qua Mic hoặc Nhạc + Mic)
+            if musicStream.sourceMode.usesMicrophone {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: musicStream.isMicMuted ? "mic.slash.fill" : "mic.and.signal.meter.fill")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(musicStream.isMicMuted ? .orange : .green)
+                        Text(musicStream.isMicMuted ? "Mic đang tạm tắt" : "Độ nhạy thu Mic: \(Int(musicStream.micGainMultiplier * 100))%")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                        Spacer()
+                        Button {
+                            musicStream.isMicMuted.toggle()
+                        } label: {
+                            Text(musicStream.isMicMuted ? "Mở Mic" : "Tắt Tiếng Mic")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(musicStream.isMicMuted ? .green : .orange)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background((musicStream.isMicMuted ? Color.green : Color.orange).opacity(0.16), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Thanh đo cường độ giọng nói Mic trực tiếp
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.primary.opacity(0.08))
+                            Capsule()
+                                .fill(LinearGradient(colors: [.green, .orange, .red], startPoint: .leading, endPoint: .trailing))
+                                .frame(width: max(6, geo.size.width * CGFloat(min(1.0, musicStream.micInputLevel))))
+                        }
+                    }
+                    .frame(height: 8)
+
+                    Slider(value: $musicStream.micGainMultiplier, in: 1.0...15.0, step: 0.5)
+                        .tint(.green)
+
+                    if musicStream.sourceMode == .musicAndMic {
+                        Toggle(isOn: $musicStream.autoDuckMusic) {
+                            Text("Tự giảm nhỏ nhạc nền khi bạn nói (Auto-Duck MC)")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .tint(.green)
                     }
                 }
-                .frame(height: 32)
-                .padding(.horizontal, 12)
+                .padding(11)
+                .background(Color(UIColor.tertiarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+            }
+
+            // 5. Thanh Thời Gian & Kéo Tua Nhạc Mượt Mà (Seek Scrubbing + Tua Nhanh -10s / +10s)
+            if musicStream.sourceMode != .liveMicOnly {
+                let totalDur = max(musicStream.duration, 0.1)
+                let shownTime = isDraggingTimeline ? dragTimelineSeconds : min(musicStream.currentTime, totalDur)
+                let remainTime = max(0, musicStream.duration - shownTime)
+
+                VStack(spacing: 6) {
+                    if musicStream.duration > 0 {
+                        Slider(
+                            value: Binding(
+                                get: { isDraggingTimeline ? dragTimelineSeconds : min(musicStream.currentTime, totalDur) },
+                                set: { newVal in
+                                    dragTimelineSeconds = newVal
+                                    if !isDraggingTimeline {
+                                        musicStream.seek(to: newVal)
+                                    }
+                                }
+                            ),
+                            in: 0...totalDur,
+                            onEditingChanged: { editing in
+                                if editing {
+                                    dragTimelineSeconds = musicStream.currentTime
+                                    isDraggingTimeline = true
+                                    musicStream.isUserScrubbing = true
+                                } else {
+                                    let target = dragTimelineSeconds
+                                    isDraggingTimeline = false
+                                    musicStream.isUserScrubbing = false
+                                    musicStream.seek(to: target)
+                                }
+                            }
+                        )
+                        .tint(.red)
+
+                        HStack(spacing: 8) {
+                            Text(formatSeconds(shownTime))
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundColor(isDraggingTimeline ? .red : .primary)
+
+                            Button {
+                                musicStream.skip(by: -10)
+                            } label: {
+                                Label("10s", systemImage: "gobackward.10")
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.red.opacity(0.12), in: Capsule())
+                                    .foregroundColor(.red)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                musicStream.skip(by: 10)
+                            } label: {
+                                Label("10s", systemImage: "goforward.10")
+                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.red.opacity(0.12), in: Capsule())
+                                    .foregroundColor(.red)
+                            }
+                            .buttonStyle(.plain)
+
+                            Spacer()
+
+                            Text("-\(formatSeconds(remainTime)) / \(formatSeconds(musicStream.duration))")
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        HStack {
+                            Image(systemName: "clock")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text("Chọn bài nhạc bên dưới để hiện thanh thời gian & tua nhạc")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .background(Color(UIColor.tertiarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
 
-            if musicStream.duration > 0 {
-                VStack(spacing: 4) {
-                    Slider(
-                        value: Binding(
-                            get: { musicStream.currentTime },
-                            set: { val in musicStream.seek(to: val) }
-                        ),
-                        in: 0...max(musicStream.duration, 1.0)
-                    )
-                    .tint(.red)
-
-                    HStack {
-                        Text(formatSeconds(musicStream.currentTime))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text(formatSeconds(musicStream.duration))
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
+            // 6. Các nút chuyển bài / Tạm dừng / Vòng lặp
             HStack(spacing: 10) {
                 Button {
                     musicStream.playPrevious()
@@ -7472,7 +7942,7 @@ struct VoiceRoomTabView: View {
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: musicStream.isPaused ? "speaker.wave.3.fill" : "speaker.slash.fill")
-                            Text(musicStream.isPaused ? "Sủa Tiếp" : "Câm Mồm")
+                            Text(musicStream.isPaused ? "Phát Tiếp" : "Tạm Ngắt")
                         }
                         .font(.system(size: 13, weight: .bold, design: .rounded))
                         .padding(.horizontal, 14)
@@ -7700,6 +8170,20 @@ struct VoiceRoomTabView: View {
 
             HStack(spacing: 8) {
                 Button {
+                    showMusicPhotoPicker = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "photo.on.rectangle.angled").font(.caption2)
+                        Text("Lấy Từ Video Ảnh").font(.caption.bold())
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .background(Color.purple.opacity(0.14))
+                    .foregroundColor(.purple)
+                    .clipShape(Capsule())
+                }
+
+                Button {
                     musicStream.addAllPresets()
                 } label: {
                     HStack(spacing: 5) {
@@ -7817,15 +8301,15 @@ struct VoiceRoomTabView: View {
         }
     }
 
-    // Card 4: Bộ Xử Lý DSP & Sát Chiêu Âm Thanh
+    // Card 4: Bộ Đổi Giọng + Định Vị Tai Trái/Phải/8D + Khuếch Đại Xả Mic Tới 2000%
     private var combatEffectsCard: some View {
         studioCard {
             HStack(spacing: 10) {
                 iconSquircle(systemName: "slider.horizontal.3", colors: [Color.orange, Color.red])
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Bộ Xử Lý Âm Thanh & DSP")
+                    Text("Đổi Giọng, Tai Trái/Phải & Khuếch Đại")
                         .font(.system(size: 16, weight: .bold, design: .rounded))
-                    Text("Tinh chỉnh trực tiếp theo thời gian thực")
+                    Text("Áp dụng thời gian thực cho cả Mic nói & Nhạc đang phát")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -7835,7 +8319,7 @@ struct VoiceRoomTabView: View {
             HStack(spacing: 10) {
                 tactileFeatureTile(
                     title: "MAX GAIN V9",
-                    subtitle: "EQ + 2.5x Boost",
+                    subtitle: "Presence + Xả Cực Căng",
                     icon: "bolt.fill",
                     isOn: musicStream.isMaxMode,
                     activeColor: .red
@@ -7847,7 +8331,7 @@ struct VoiceRoomTabView: View {
 
                 tactileFeatureTile(
                     title: "LỌC ỒN DSP",
-                    subtitle: "150Hz – 10kHz",
+                    subtitle: "Khử tạp âm 150Hz–10kHz",
                     icon: "sparkles",
                     isOn: musicStream.isCleanMode,
                     activeColor: .teal
@@ -7858,9 +8342,151 @@ struct VoiceRoomTabView: View {
                 }
             }
 
-            // Horizontal Scrollable Audio FX Chips (không bao giờ bị cắt chữ)
+            // 1. BỘ ĐỔI GIỌNG NÓI THỜI GIAN THỰC (TRẦM, ROBOT, NỮ, ÁC QUỶ, LOA PHƯỜNG...)
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Label("Chỉnh Giọng (Voice Changer)", systemImage: "person.wave.2.fill")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    if musicStream.voicePreset != .normal || musicStream.pitchSemitones != 0 || musicStream.echoAmount > 0 {
+                        Button("Về Gốc") {
+                            musicStream.voicePreset = .normal
+                            musicStream.pitchSemitones = 0
+                            musicStream.echoAmount = 0
+                        }
+                        .font(.caption2.bold())
+                        .foregroundColor(.purple)
+                    }
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        ForEach(VoiceChangerPreset.allCases) { vp in
+                            let selected = (musicStream.voicePreset == vp)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    musicStream.voicePreset = vp
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: vp.icon)
+                                        .font(.system(size: 11, weight: .bold))
+                                    Text(vp.rawValue)
+                                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(
+                                    Group {
+                                        if selected {
+                                            LinearGradient(colors: [.purple, .indigo], startPoint: .leading, endPoint: .trailing)
+                                        } else {
+                                            Color(UIColor.secondarySystemGroupedBackground)
+                                        }
+                                    }
+                                )
+                                .foregroundColor(selected ? .white : .primary)
+                                .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                HStack {
+                    Text("Độ cao giọng (Pitch)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(musicStream.pitchSemitones == 0 ? "0 (Mặc định)" : String(format: "%+.1f bán cung", musicStream.pitchSemitones))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.purple)
+                }
+                Slider(value: $musicStream.pitchSemitones, in: -12.0...12.0, step: 0.5).tint(.purple)
+
+                HStack {
+                    Text("Độ vang phòng thu (Echo)")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(Int(musicStream.echoAmount * 100))%")
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.indigo)
+                }
+                Slider(value: $musicStream.echoAmount, in: 0.0...1.0, step: 0.05).tint(.indigo)
+            }
+            .padding(12)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            // 2. CHỈNH NGHE TAI TRÁI / Ở GIỮA / TAI PHẢI / ĐẢO 8D STEREO
             VStack(alignment: .leading, spacing: 8) {
-                Text("Hiệu ứng âm thanh")
+                HStack {
+                    Label("Vị Trí Nghe (Tai Trái / Phải / Giữa)", systemImage: "headphones")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text(musicStream.earMode == .custom
+                         ? (musicStream.manualPan < 0 ? "Trái \(Int(abs(musicStream.manualPan) * 100))%" : (musicStream.manualPan > 0 ? "Phải \(Int(musicStream.manualPan * 100))%" : "Giữa"))
+                         : musicStream.earMode.rawValue)
+                        .font(.system(size: 12, weight: .heavy, design: .rounded))
+                        .foregroundColor(.indigo)
+                }
+
+                HStack(spacing: 6) {
+                    ForEach([StereoEarMode.left, .center, .right, .auto8D]) { em in
+                        let sel = (musicStream.earMode == em)
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                musicStream.earMode = em
+                                if em == .left { musicStream.manualPan = -1.0 }
+                                else if em == .center { musicStream.manualPan = 0.0 }
+                                else if em == .right { musicStream.manualPan = 1.0 }
+                            }
+                        } label: {
+                            Text(em == .left ? "◀ Tai Trái" : (em == .right ? "Tai Phải ▶" : (em == .center ? "● Ở Giữa" : "🎧 Đảo 8D")))
+                                .font(.system(size: 11, weight: .bold, design: .rounded))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(sel ? Color.indigo : Color(UIColor.secondarySystemGroupedBackground), in: Capsule())
+                                .foregroundColor(sel ? .white : .primary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Slider(
+                    value: Binding(
+                        get: { musicStream.manualPan },
+                        set: { val in
+                            musicStream.manualPan = val
+                            if abs(val) < 0.04 { musicStream.earMode = .center }
+                            else if val <= -0.96 { musicStream.earMode = .left }
+                            else if val >= 0.96 { musicStream.earMode = .right }
+                            else { musicStream.earMode = .custom }
+                        }
+                    ),
+                    in: -1.0...1.0,
+                    step: 0.05
+                )
+                .tint(.indigo)
+
+                HStack {
+                    Text("100% Tai Trái")
+                    Spacer()
+                    Text("Cân Bằng Giữa")
+                    Spacer()
+                    Text("100% Tai Phải")
+                }
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(Color(UIColor.tertiarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            // 3. Hiệu ứng nhạc nhanh
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Chế độ hiệu ứng âm thanh")
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
 
@@ -7899,24 +8525,72 @@ struct VoiceRoomTabView: View {
                 }
             }
 
-            // Volume Slider
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Label("Âm lượng (Volume)", systemImage: "speaker.wave.2.fill")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text("\(Int(musicStream.volume * 100))%")
-                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
-                        .foregroundColor(.red)
+            // 4. Volume & Siêu Khuếch Đại Xả Mic (lên tới 2000%!)
+            VStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Âm lượng gốc (Volume)", systemImage: "speaker.wave.2.fill")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(Int(musicStream.volume * 100))%")
+                            .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                            .foregroundColor(.red)
+                    }
+                    Slider(value: $musicStream.volume, in: 0.0...3.0, step: 0.05).tint(.red)
+                    HStack(spacing: 6) {
+                        ForEach([0.5, 1.0, 2.0, 3.0], id: \.self) { v in
+                            presetChip(
+                                label: v == 3.0 ? "300% TO" : "\(Int(v * 100))%",
+                                isSelected: musicStream.volume == Float(v),
+                                color: .red
+                            ) { musicStream.volume = Float(v) }
+                        }
+                    }
                 }
-                Slider(value: $musicStream.volume, in: 0.0...2.0, step: 0.05).tint(.red)
-                HStack(spacing: 6) {
-                    ForEach([0.5, 1.0, 1.5, 2.0], id: \.self) { v in
-                        presetChip(
-                            label: v == 2.0 ? "200% MAX" : "\(Int(v * 100))%",
-                            isSelected: musicStream.volume == Float(v),
-                            color: .red
-                        ) { musicStream.volume = Float(v) }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Độ To Xả Mic (Boost Khuếch Đại)", systemImage: "bolt.circle.fill")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(Int(musicStream.boostMultiplier * 100))%")
+                            .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                            .foregroundColor(.orange)
+                    }
+                    Slider(value: $musicStream.boostMultiplier, in: 1.0...20.0, step: 0.5).tint(.orange)
+                    HStack(spacing: 6) {
+                        ForEach([1.0, 3.0, 6.0, 12.0, 20.0], id: \.self) { b in
+                            presetChip(
+                                label: b == 20.0 ? "2000% MAX" : "\(Int(b * 100))%",
+                                isSelected: musicStream.boostMultiplier == Float(b),
+                                color: .orange
+                            ) { musicStream.boostMultiplier = Float(b) }
+                        }
+                    }
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Tăng cường âm trầm (Bass)", systemImage: "waveform")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("+\(Int(musicStream.bassAmount))")
+                            .font(.system(size: 14, weight: .heavy, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $musicStream.bassAmount, in: 0...100, step: 5).tint(.purple)
+                    HStack(spacing: 6) {
+                        ForEach([0, 25, 50, 100], id: \.self) { b in
+                            presetChip(
+                                label: b == 0 ? "Gốc" : "+\(b)",
+                                isSelected: musicStream.bassAmount == Float(b),
+                                color: .purple
+                            ) { musicStream.bassAmount = Float(b) }
+                        }
                     }
                 }
             }
@@ -7924,57 +8598,7 @@ struct VoiceRoomTabView: View {
             .background(Color(UIColor.tertiarySystemGroupedBackground))
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            // Boost Slider
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Label("Ép xung khuếch đại (Boost)", systemImage: "bolt.circle.fill")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text("\(Int(musicStream.boostMultiplier * 100))%")
-                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
-                        .foregroundColor(.orange)
-                }
-                Slider(value: $musicStream.boostMultiplier, in: 1.0...5.0, step: 0.25).tint(.orange)
-                HStack(spacing: 6) {
-                    ForEach([1.0, 2.0, 3.0, 5.0], id: \.self) { b in
-                        presetChip(
-                            label: b == 5.0 ? "500% MAX" : "\(Int(b * 100))%",
-                            isSelected: musicStream.boostMultiplier == Float(b),
-                            color: .orange
-                        ) { musicStream.boostMultiplier = Float(b) }
-                    }
-                }
-            }
-            .padding(12)
-            .background(Color(UIColor.tertiarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-            // Bass Slider
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Label("Tăng cường âm trầm (Bass)", systemImage: "waveform")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Text("+\(Int(musicStream.bassAmount))")
-                        .font(.system(size: 14, weight: .heavy, design: .monospaced))
-                        .foregroundColor(.purple)
-                }
-                Slider(value: $musicStream.bassAmount, in: 0...100, step: 5).tint(.purple)
-                HStack(spacing: 6) {
-                    ForEach([0, 25, 50, 100], id: \.self) { b in
-                        presetChip(
-                            label: b == 0 ? "Gốc" : "+\(b)",
-                            isSelected: musicStream.bassAmount == Float(b),
-                            color: .purple
-                        ) { musicStream.bassAmount = Float(b) }
-                    }
-                }
-            }
-            .padding(12)
-            .background(Color(UIColor.tertiarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-            // Local Monitor Row
+            // 5. Local Monitor Row
             HStack(spacing: 12) {
                 Image(systemName: "headphones")
                     .font(.system(size: 16, weight: .semibold))
@@ -7986,7 +8610,7 @@ struct VoiceRoomTabView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Nghe loa ngoài (Monitor)")
                         .font(.subheadline.weight(.semibold))
-                    Text("Mặc định TẮT để phát thẳng vào Discord Voice.")
+                    Text("Mặc định TẮT để phát thẳng vào Discord Voice không bị vọng mic.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -8001,7 +8625,7 @@ struct VoiceRoomTabView: View {
         }
     }
 
-    // Card 5: Primary CTA Button (Xả Nhạc)
+    // Card 5: Primary CTA Button (Xả Mic Trực Tiếp / Xả Nhạc)
     private var mainActionCard: some View {
         Group {
             if musicStream.isPlaying {
@@ -8011,7 +8635,7 @@ struct VoiceRoomTabView: View {
                     HStack(spacing: 10) {
                         Image(systemName: "stop.circle.fill")
                             .font(.system(size: 20, weight: .bold))
-                        Text("DỪNG XẢ NHẠC & THU HỒI PHÂN THÂN")
+                        Text("DỪNG PHÁT & RỜI PHÒNG VOICE")
                             .font(.system(size: 15, weight: .heavy, design: .rounded))
                     }
                     .foregroundColor(.white)
@@ -8022,14 +8646,16 @@ struct VoiceRoomTabView: View {
                     .shadow(color: Color.red.opacity(0.35), radius: 10, y: 5)
                 }
             } else {
-                let canStart = (musicStream.currentDecoder != nil)
+                let canStart = (musicStream.sourceMode == .liveMicOnly || musicStream.currentDecoder != nil)
                 Button {
                     musicStream.startSpam(app: app)
                 } label: {
                     HStack(spacing: 10) {
-                        Image(systemName: "flame.fill")
+                        Image(systemName: musicStream.sourceMode == .liveMicOnly ? "mic.fill" : "flame.fill")
                             .font(.system(size: 18, weight: .bold))
-                        Text("XUẤT THỦ XẢ NHẠC BẤT TỬ")
+                        Text(musicStream.sourceMode == .liveMicOnly
+                             ? "BẮT ĐẦU NÓI QUA MIC VÀO PHÒNG"
+                             : (musicStream.sourceMode == .musicAndMic ? "BẮT ĐẦU XẢ NHẠC + NÓI QUA MIC" : "BẮT ĐẦU XẢ NHẠC SIÊU MƯỢT"))
                             .font(.system(size: 15, weight: .heavy, design: .rounded))
                     }
                     .foregroundColor(.white)
@@ -8073,7 +8699,10 @@ struct VoiceRoomTabView: View {
             treoConfigCard
             treoGoLiveCard
             treoFakeCamCard
-            ParallelFakeGameDeckCard(isForMusic: false)
+            Group {
+                ParallelLiveMicDeckCard()
+                ParallelFakeGameDeckCard(isForMusic: false)
+            }
             treoActionButton
             treoSessionsCard
             treoLogsCard

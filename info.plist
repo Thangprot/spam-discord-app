@@ -49,6 +49,8 @@
 	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Cho phép chọn ảnh và video từ Thư viện Ảnh để phát Stream, Fake Cam và ảnh đại diện Fake Game.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Cho phép thu giọng nói trực tiếp từ Mic iPhone để phát qua dàn Token vào phòng Voice và đổi giọng thời gian thực.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSAppTransportSecurity</key>
